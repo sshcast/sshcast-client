@@ -32,3 +32,38 @@ sockcast-client grant-relay --node server-x.infra.local --server https://sockcas
 # 4. Run the workstation client daemon
 sockcast-client run
 ```
+
+## Platform Installation & Background Daemon
+
+### Linux (Fedora / RHEL / systemd)
+```bash
+# Build RPM via tito:
+tito build --test --rpm -o /tmp/tito-sockcast-client
+
+# Enable and start user systemd service:
+systemctl --user enable --now sockcast-client.service
+```
+
+### macOS (`launchd` User Agent)
+- Connects automatically to `$SSH_AUTH_SOCK` (Apple `ssh-agent`, 1Password, Secretive, YubiKey) and reports idle time via `IOHIDSystem` (`HIDIdleTime`).
+```bash
+cargo build --release --frozen --offline
+sudo cp target/release/sockcast-client /usr/local/bin/
+./macos/install-macos-agent.sh
+```
+
+### Windows (OpenSSH Named Pipe & Scheduled Task)
+- Connects automatically to `\\.\pipe\openssh-ssh-agent` (Windows OpenSSH Agent, 1Password for Windows, KeePassXC) and tracks workstation activity via Win32 `GetLastInputInfo`.
+```powershell
+cargo build --release --frozen --offline
+New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\Programs\Sockcast"
+Copy-Item target\release\sockcast-client.exe "$env:LOCALAPPDATA\Programs\Sockcast\sockcast-client.exe"
+.\windows\install-windows-task.ps1
+```
+
+### Automated Cross-Platform Builds (GitHub Actions)
+- [`.github/workflows/build-and-release.yml`](.github/workflows/build-and-release.yml) automatically builds and tests release archives for:
+  - `x86_64-unknown-linux-gnu` (`sockcast-client-linux-x86_64.tar.gz`)
+  - `aarch64-apple-darwin` (`sockcast-client-macos-arm64.tar.gz`)
+  - `x86_64-apple-darwin` (`sockcast-client-macos-x86_64.tar.gz`)
+  - `x86_64-pc-windows-msvc` (`sockcast-client-windows-x86_64.zip`)

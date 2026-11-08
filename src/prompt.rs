@@ -137,21 +137,37 @@ impl ApprovalPrompter for InteractivePrompter {
             return ApprovalDecision::Deny;
         }
 
-        // Best-effort desktop notification on Linux
-        let _ = Command::new("notify-send")
-            .args([
-                "-u",
-                "critical",
-                "-t",
-                "10000",
-                "Sockcast SSH Signature Request",
-                &format!(
-                    "Host: {}\nTarget User: {}\nCommand: {}",
-                    details.verified_host, details.target_ssh_user, details.primary_command
-                ),
-            ])
-            .status()
-            .await;
+        // Best-effort desktop notification on Linux / macOS
+        #[cfg(target_os = "linux")]
+        {
+            let _ = Command::new("notify-send")
+                .args([
+                    "-u",
+                    "critical",
+                    "-t",
+                    "10000",
+                    "Sockcast SSH Signature Request",
+                    &format!(
+                        "Host: {}\nTarget User: {}\nCommand: {}",
+                        details.verified_host, details.target_ssh_user, details.primary_command
+                    ),
+                ])
+                .status()
+                .await;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let notif_script = format!(
+                "display notification \"Host: {} | User: {} | Cmd: {}\" with title \"Sockcast SSH Signature Request\"",
+                details.verified_host.replace('"', "'"),
+                details.target_ssh_user.replace('"', "'"),
+                details.primary_command.replace('"', "'")
+            );
+            let _ = Command::new("osascript")
+                .args(["-e", &notif_script])
+                .status()
+                .await;
+        }
 
         if let Some(decision) = try_native_gui_dialog(&details, &mut cancel_rx).await {
             return decision;
@@ -176,13 +192,17 @@ async fn try_native_gui_dialog(
         if has_display {
             if let Ok(exe) = std::env::current_exe() {
                 if let Ok(json_str) = serde_json::to_string(details) {
-                    if let Ok(mut child) = Command::new(exe)
-                        .args(["internal-gui-prompt", "--payload-json", &json_str])
+                    let mut cmd = Command::new(exe);
+                    cmd.args(["internal-gui-prompt", "--payload-json", &json_str])
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::null())
-                        .kill_on_drop(true)
-                        .spawn()
+                        .kill_on_drop(true);
+                    #[cfg(target_os = "windows")]
                     {
+                        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                        cmd.creation_flags(CREATE_NO_WINDOW);
+                    }
+                    if let Ok(mut child) = cmd.spawn() {
                         if let Some(mut stdout) = child.stdout.take() {
                             let egui_res = tokio::select! {
                                 _ = cancel_rx.changed() => {
@@ -346,7 +366,59 @@ async fn try_native_gui_dialog(
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        let body = format!(
+            "Verified Source Host: {}\\nTarget SSH User: {}\\nPrimary Command: {}\\nProcess Ancestry: {}\\nWorking Directory: {}\\nSSH Key: {}\\n\\n[Yes] = Approve Once\\n[No] = Approve '{}' on '{}' for 15m\\n[Cancel] = Deny",
+            details.verified_host.replace('\'', "''"),
+            details.target_ssh_user.replace('\'', "''"),
+            details.primary_command.replace('\'', "''"),
+            details.ancestry_chain.replace('\'', "''"),
+            details.cwd.replace('\'', "''"),
+            details.key_summary.replace('\'', "''"),
+            details.primary_tool.replace('\'', "''"),
+            details.verified_host.replace('\'', "''"),
+        );
+        let ps_script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $msg = '{}' -replace '\\\\n', \"`r`n\"; \
+             $res = [System.Windows.Forms.MessageBox]::Show($msg, 'Sockcast SSH Agent Approval', 'YesNoCancel', 'Warning'); \
+             Write-Output $res",
+            body
+        );
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().ok()?;
+        let mut stdout = child.stdout.take()?;
+
+        tokio::select! {
+            _ = cancel_rx.changed() => {
+                let _ = child.kill().await;
+                return Some(ApprovalDecision::Deny);
+            }
+            status_res = child.wait() => {
+                let status = status_res.ok()?;
+                if !status.success() {
+                    return Some(ApprovalDecision::Deny);
+                }
+                let mut out_bytes = Vec::new();
+                let _ = stdout.read_to_end(&mut out_bytes).await;
+                let choice = String::from_utf8_lossy(&out_bytes).trim().to_string();
+                return match choice.as_str() {
+                    "Yes" => Some(ApprovalDecision::ApproveOnce),
+                    "No" => Some(ApprovalDecision::ApproveToolOnHost15m),
+                    _ => Some(ApprovalDecision::Deny),
+                };
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (details, cancel_rx);
         None

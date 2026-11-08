@@ -44,7 +44,7 @@ pub fn query_os_idle_ms() -> Option<u64> {
     }
     #[cfg(target_os = "windows")]
     {
-        Some(0)
+        query_windows_idle_ms()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -118,4 +118,36 @@ fn query_macos_ioreg_idle() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_idle_ms() -> Option<u64> {
+    #[repr(C)]
+    struct LastInputInfo {
+        cb_size: u32,
+        dw_time: u32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetLastInputInfo(plii: *mut LastInputInfo) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetTickCount() -> u32;
+    }
+
+    unsafe {
+        let mut lii = LastInputInfo {
+            cb_size: std::mem::size_of::<LastInputInfo>() as u32,
+            dw_time: 0,
+        };
+        if GetLastInputInfo(&mut lii as *mut LastInputInfo) != 0 {
+            let now_ticks = GetTickCount();
+            let elapsed_ms = now_ticks.wrapping_sub(lii.dw_time);
+            return Some(elapsed_ms as u64);
+        }
+    }
+    Some(0)
 }

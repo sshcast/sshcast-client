@@ -1,0 +1,89 @@
+name: Cross-Platform Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*", "sockcast-client-*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_name: sockcast-client-linux-x86_64.tar.gz
+            bin_name: sockcast-client
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_name: sockcast-client-macos-arm64.tar.gz
+            bin_name: sockcast-client
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_name: sockcast-client-macos-x86_64.tar.gz
+            bin_name: sockcast-client
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_name: sockcast-client-windows-x86_64.zip
+            bin_name: sockcast-client.exe
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary (offline vendored)
+        run: cargo build --release --frozen --offline --target ${{ matrix.target }}
+
+      - name: Run integration tests
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --release --frozen --offline --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" dist/
+          cp README.md dist/
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cp -r macos dist/
+          else
+            cp -r systemd dist/
+          fi
+          tar -C dist -czf "${{ matrix.archive_name }}" .
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination dist/
+          Copy-Item README.md -Destination dist/
+          Copy-Item -Recurse windows -Destination dist/
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive_name }}" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive_name }}
+          path: ${{ matrix.archive_name }}
+
+      - name: Attach to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive_name }}
