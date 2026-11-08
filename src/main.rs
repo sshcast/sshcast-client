@@ -5,9 +5,10 @@ use sockcast_client::coordinator::WorkstationManager;
 use sockcast_client::enroll::{
     load_user_signing_key, mint_enrollment_bundle, run_keygen, write_client_config_from_bundle,
 };
+use sockcast_client::gui::run_egui_modal_process;
 use sockcast_client::local_agent::LocalAgentConnector;
 use sockcast_client::policy::{ApprovalDecision, PolicyEngine};
-use sockcast_client::prompt::{ApprovalPrompter, InteractivePrompter, StaticPrompter};
+use sockcast_client::prompt::{ApprovalPrompter, InteractivePrompter, PromptDetails, StaticPrompter};
 use sockcast_proto::bundle::EnrollmentBundle;
 use sockcast_proto::v1::NodeRole;
 use std::path::PathBuf;
@@ -119,6 +120,12 @@ enum Commands {
         /// Automatically approve all verified requests without interactive prompting (useful for testing)
         #[arg(long, default_value_t = false)]
         auto_approve: bool,
+    },
+    /// Internal helper subcommand that renders the native `eframe`/`egui` approval modal window
+    #[command(hide = true)]
+    InternalGuiPrompt {
+        #[arg(long)]
+        payload_json: String,
     },
 }
 
@@ -255,6 +262,19 @@ async fn main() -> Result<()> {
 
             let manager = WorkstationManager::new(cfg, local_agent, policy, prompter);
             manager.run(shutdown_rx).await
+        }
+        Commands::InternalGuiPrompt { payload_json } => {
+            let details: PromptDetails = serde_json::from_str(&payload_json)
+                .context("failed to deserialize PromptDetails JSON")?;
+            let decision = run_egui_modal_process(details)?;
+            let token = match decision {
+                ApprovalDecision::ApproveOnce => "ONCE",
+                ApprovalDecision::ApproveToolOnHost15m => "TOOL_15M",
+                ApprovalDecision::ApproveAllOnHost15m => "HOST_15M",
+                ApprovalDecision::Deny => "DENY",
+            };
+            println!("{token}");
+            Ok(())
         }
     }
 }

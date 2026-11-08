@@ -1,0 +1,14 @@
+[Unit]
+Description=Sockcast Roaming SSH Agent Workstation Client
+Documentation=https://github.com/theraphim/sockcast-client
+After=graphical-session.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sockcast-client run
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

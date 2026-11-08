@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use sockcast_proto::ssh::{extract_key_type, fingerprint_sha256};
 use sockcast_proto::v1::{PublicKey, SignRequest};
 use std::io::Write;
@@ -11,7 +12,7 @@ use crate::policy::{
     extract_verified_host, ApprovalDecision,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptDetails {
     pub request_id: String,
     pub verified_host: String,
@@ -164,6 +165,58 @@ async fn try_native_gui_dialog(
     details: &PromptDetails,
     cancel_rx: &mut watch::Receiver<Option<String>>,
 ) -> Option<ApprovalDecision> {
+    // 1. Try native eframe/egui modal window first if compiled with `gui` feature and a display is available
+    #[cfg(feature = "gui")]
+    {
+        let has_display = if cfg!(target_os = "linux") {
+            std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        } else {
+            true
+        };
+        if has_display {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Ok(json_str) = serde_json::to_string(details) {
+                    if let Ok(mut child) = Command::new(exe)
+                        .args(["internal-gui-prompt", "--payload-json", &json_str])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .kill_on_drop(true)
+                        .spawn()
+                    {
+                        if let Some(mut stdout) = child.stdout.take() {
+                            let egui_res = tokio::select! {
+                                _ = cancel_rx.changed() => {
+                                    let _ = child.kill().await;
+                                    Some(ApprovalDecision::Deny)
+                                }
+                                status_res = child.wait() => {
+                                    match status_res {
+                                        Ok(st) if st.success() => {
+                                            let mut out_bytes = Vec::new();
+                                            let _ = stdout.read_to_end(&mut out_bytes).await;
+                                            let token = String::from_utf8_lossy(&out_bytes);
+                                            match token.trim() {
+                                                "ONCE" => Some(ApprovalDecision::ApproveOnce),
+                                                "TOOL_15M" => Some(ApprovalDecision::ApproveToolOnHost15m),
+                                                "HOST_15M" => Some(ApprovalDecision::ApproveAllOnHost15m),
+                                                "DENY" => Some(ApprovalDecision::Deny),
+                                                _ => None,
+                                            }
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                            };
+                            if let Some(decision) = egui_res {
+                                return Some(decision);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         let script = format!(
