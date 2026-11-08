@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 

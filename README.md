@@ -47,7 +47,7 @@ systemctl --user enable --now sockcast-client.service
 ### macOS (`launchd` User Agent)
 - Connects automatically to `$SSH_AUTH_SOCK` (Apple `ssh-agent`, 1Password, Secretive, YubiKey) and reports idle time via `IOHIDSystem` (`HIDIdleTime`).
 ```bash
-cargo build --release --frozen --offline
+cargo build --release --locked
 sudo cp target/release/sockcast-client /usr/local/bin/
 ./macos/install-macos-agent.sh
 ```
@@ -55,7 +55,7 @@ sudo cp target/release/sockcast-client /usr/local/bin/
 ### Windows (OpenSSH Named Pipe & Scheduled Task)
 - Connects automatically to `\\.\pipe\openssh-ssh-agent` (Windows OpenSSH Agent, 1Password for Windows, KeePassXC) and tracks workstation activity via Win32 `GetLastInputInfo`.
 ```powershell
-cargo build --release --frozen --offline
+cargo build --release --locked
 New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\Programs\Sockcast"
 Copy-Item target\release\sockcast-client.exe "$env:LOCALAPPDATA\Programs\Sockcast\sockcast-client.exe"
 .\windows\install-windows-task.ps1

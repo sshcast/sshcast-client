@@ -23,14 +23,12 @@ use sockcast_proto::v1::{
     ProcessAncestor, ProcessContext, ServerStreamMessage, SignAck, SignRequest, SignResponse,
     SshAuthContext, WorkstationStatus,
 };
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status, Streaming};
@@ -40,56 +38,83 @@ fn write_ssh_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
-/// Spawns a mock local OS SSH agent on a Unix socket inside `tmp`.
-async fn spawn_mock_local_ssh_agent(sock_path: PathBuf) {
-    let listener = UnixListener::bind(&sock_path).unwrap();
+async fn handle_mock_agent_stream<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        if stream.read_exact(&mut body).await.is_err() {
+            break;
+        }
+        let msg_type = body[0];
+        let mut reply = Vec::new();
+        if msg_type == SSH2_AGENTC_REQUEST_IDENTITIES {
+            reply.push(SSH2_AGENT_IDENTITIES_ANSWER);
+            reply.extend_from_slice(&2u32.to_be_bytes());
+
+            // Key 1: work key
+            let mut k1 = Vec::new();
+            write_ssh_bytes(&mut k1, b"ssh-ed25519");
+            write_ssh_bytes(&mut k1, &[0x11; 32]);
+            write_ssh_bytes(&mut reply, &k1);
+            write_ssh_bytes(&mut reply, b"pavel@workstation");
+
+            // Key 2: personal key (to test filtering)
+            let mut k2 = Vec::new();
+            write_ssh_bytes(&mut k2, b"ssh-ed25519");
+            write_ssh_bytes(&mut k2, &[0x22; 32]);
+            write_ssh_bytes(&mut reply, &k2);
+            write_ssh_bytes(&mut reply, b"personal@github");
+        } else if msg_type == SSH2_AGENTC_SIGN_REQUEST {
+            reply.push(SSH2_AGENT_SIGN_RESPONSE);
+            write_ssh_bytes(&mut reply, b"local-os-agent-ed25519-sig");
+        } else {
+            reply.push(5); // SSH_AGENT_FAILURE
+        }
+
+        let out_len = (reply.len() as u32).to_be_bytes();
+        let _ = stream.write_all(&out_len).await;
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.flush().await;
+    }
+}
+
+/// Spawns a mock local OS SSH agent on a Unix socket (Unix) or Named Pipe (Windows).
+#[cfg(unix)]
+async fn spawn_mock_local_ssh_agent(tmp: &TempDir) -> String {
+    let sock_path = tmp.path().join("mock-agent.sock");
+    let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
     tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                loop {
-                    let mut len_buf = [0u8; 4];
-                    if stream.read_exact(&mut len_buf).await.is_err() {
-                        break;
-                    }
-                    let len = u32::from_be_bytes(len_buf) as usize;
-                    let mut body = vec![0u8; len];
-                    if stream.read_exact(&mut body).await.is_err() {
-                        break;
-                    }
-                    let msg_type = body[0];
-                    let mut reply = Vec::new();
-                    if msg_type == SSH2_AGENTC_REQUEST_IDENTITIES {
-                        reply.push(SSH2_AGENT_IDENTITIES_ANSWER);
-                        reply.extend_from_slice(&2u32.to_be_bytes());
-
-                        // Key 1: work key
-                        let mut k1 = Vec::new();
-                        write_ssh_bytes(&mut k1, b"ssh-ed25519");
-                        write_ssh_bytes(&mut k1, &[0x11; 32]);
-                        write_ssh_bytes(&mut reply, &k1);
-                        write_ssh_bytes(&mut reply, b"pavel@workstation");
-
-                        // Key 2: personal key (to test filtering)
-                        let mut k2 = Vec::new();
-                        write_ssh_bytes(&mut k2, b"ssh-ed25519");
-                        write_ssh_bytes(&mut k2, &[0x22; 32]);
-                        write_ssh_bytes(&mut reply, &k2);
-                        write_ssh_bytes(&mut reply, b"personal@github");
-                    } else if msg_type == SSH2_AGENTC_SIGN_REQUEST {
-                        reply.push(SSH2_AGENT_SIGN_RESPONSE);
-                        write_ssh_bytes(&mut reply, b"local-os-agent-ed25519-sig");
-                    } else {
-                        reply.push(5); // SSH_AGENT_FAILURE
-                    }
-
-                    let out_len = (reply.len() as u32).to_be_bytes();
-                    let _ = stream.write_all(&out_len).await;
-                    let _ = stream.write_all(&reply).await;
-                    let _ = stream.flush().await;
-                }
-            });
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(handle_mock_agent_stream(stream));
         }
     });
+    sock_path.to_string_lossy().into_owned()
+}
+
+#[cfg(windows)]
+async fn spawn_mock_local_ssh_agent(_tmp: &TempDir) -> String {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let pipe_name = format!(r"\\.\pipe\sockcast-mock-agent-{}", std::process::id());
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+        .unwrap();
+    let pipe_name_clone = pipe_name.clone();
+    tokio::spawn(async move {
+        while server.connect().await.is_ok() {
+            let connected = server;
+            server = match ServerOptions::new().create(&pipe_name_clone) {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            tokio::spawn(handle_mock_agent_stream(connected));
+        }
+    });
+    pipe_name
 }
 
 #[test]
@@ -331,8 +356,7 @@ impl SockcastService for MockCoordinatorStreamServer {
 #[tokio::test]
 async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agent_bridge() {
     let tmp = TempDir::new().unwrap();
-    let agent_sock = tmp.path().join("mock-agent.sock");
-    spawn_mock_local_ssh_agent(agent_sock.clone()).await;
+    let agent_endpoint = spawn_mock_local_ssh_agent(&tmp).await;
 
     let user_sk = SigningKey::from_bytes(&[0x10; 32]);
     let relay_sk = SigningKey::from_bytes(&[0x20; 32]);
@@ -405,7 +429,7 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
     tampered_req.data = b"attacker-tampered-challenge".to_vec();
 
     let connector = Arc::new(LocalAgentConnector::new(
-        Some(agent_sock.to_string_lossy().into_owned()),
+        Some(agent_endpoint.clone()),
         KeyFilterConfig {
             allowed_fingerprints: Vec::new(),
             allowed_comment_substrings: vec!["workstation".to_string()],
@@ -420,7 +444,7 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         servers: vec!["http://127.0.0.1:1".to_string()],
         node_signing_key: client_sk.clone(),
         grant: client_grant.clone(),
-        local_agent_socket: Some(agent_sock.to_string_lossy().into_owned()),
+        local_agent_socket: Some(agent_endpoint.clone()),
         heartbeat_interval_secs: 25,
         force_active: true,
         key_filter: KeyFilterConfig::default(),
@@ -466,7 +490,7 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         servers: vec![format!("http://{}", addr)],
         node_signing_key: client_sk,
         grant: client_grant,
-        local_agent_socket: Some(agent_sock.to_string_lossy().into_owned()),
+        local_agent_socket: Some(agent_endpoint),
         heartbeat_interval_secs: 25,
         force_active: true,
         key_filter: KeyFilterConfig {

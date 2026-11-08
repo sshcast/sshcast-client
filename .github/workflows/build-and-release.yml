@@ -45,12 +45,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binary (offline vendored)
-        run: cargo build --release --frozen --offline --target ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Run integration tests
         if: matrix.target != 'x86_64-apple-darwin'
-        run: cargo test --release --frozen --offline --target ${{ matrix.target }}
+        run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Package Unix archive
         if: runner.os != 'Windows'
