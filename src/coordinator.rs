@@ -86,7 +86,7 @@ impl WorkstationManager {
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Coordinator stream {} disconnected ({}); reconnecting in {:?}",
+                                "Coordinator stream {} disconnected ({:#}); reconnecting in {:?}",
                                 url,
                                 e,
                                 backoff
@@ -123,7 +123,7 @@ async fn run_single_coordinator_stream(
     cancellations: &Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let endpoint = Endpoint::from_shared(server_url.to_string())
+    let endpoint = Endpoint::new(server_url.to_string())
         .with_context(|| format!("invalid coordinator URL {server_url}"))?
         .connect_timeout(Duration::from_secs(5))
         .tcp_keepalive(Some(Duration::from_secs(30)))
