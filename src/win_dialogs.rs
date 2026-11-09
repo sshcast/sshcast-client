@@ -1343,7 +1343,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                             }
                         }
                     }
-                    ID_ENROLL_BTN_CLOSE => {
+                    2 | ID_ENROLL_BTN_CLOSE => {
                         DestroyWindow(hwnd);
                     }
                     _ => {}
@@ -1965,7 +1965,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                             );
                         }
                     }
-                    ID_BUNDLE_BTN_CLOSE => {
+                    2 | ID_BUNDLE_BTN_CLOSE => {
                         DestroyWindow(hwnd);
                     }
                     _ => {}
@@ -2328,7 +2328,7 @@ unsafe extern "system" fn backends_wnd_proc(
                             }
                         }
                     }
-                    ID_BACKENDS_BTN_CLOSE => {
+                    2 | ID_BACKENDS_BTN_CLOSE => {
                         DestroyWindow(hwnd);
                     }
                     _ => {}
