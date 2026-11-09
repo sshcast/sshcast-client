@@ -55,6 +55,7 @@ const IDM_ENROLL_WINDOW: u32 = 1004;
 const IDM_TOGGLE_FORCE_ACTIVE: u32 = 1005;
 const IDM_OPEN_CONFIG_DIR: u32 = 1006;
 const IDM_QUIT: u32 = 1007;
+const IDM_ZELLIJ_DASHBOARD: u32 = 1008;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -540,6 +541,7 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
 
     let header_label = to_wide(&header_str);
     let conn_label = to_wide(&conn_str);
+    let zellij_label = to_wide("Open Zellij Web Dashboard...");
     let status_label = to_wide("Workstation Status & SSH Keys...");
     let backends_label = to_wide("Coordinator Backends (Servers)...");
     let bundle_label = to_wide("Generate Enrollment Bundle (Relay / Client)...");
@@ -566,6 +568,12 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
         MF_STRING | MF_GRAYED
     };
 
+    AppendMenuW(
+        hmenu,
+        enrolled_flags,
+        IDM_ZELLIJ_DASHBOARD as usize,
+        zellij_label.as_ptr(),
+    );
     AppendMenuW(
         hmenu,
         enrolled_flags,
@@ -632,6 +640,13 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     DestroyMenu(hmenu);
 
     match cmd {
+        IDM_ZELLIJ_DASHBOARD => {
+            let port = maybe_cfg
+                .as_ref()
+                .map(|c| c.zellij_listen_port)
+                .unwrap_or(18080);
+            crate::zellij_proxy::open_zellij_dashboard_in_browser(port);
+        }
         IDM_STATUS_DIALOG => {
             spawn_status_dialog(Arc::clone(ctx));
         }

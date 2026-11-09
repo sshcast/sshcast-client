@@ -14,3 +14,4 @@ pub mod prompt;
 pub mod win_dialogs;
 #[cfg(target_os = "windows")]
 pub mod win_native;
+pub mod zellij_proxy;

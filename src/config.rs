@@ -12,6 +12,17 @@ fn default_heartbeat_secs() -> u64 {
     25 // 25 seconds (keeps Cloudflare/Nginx HTTP/2 streams warm)
 }
 
+pub fn default_zellij_listen_port() -> u16 {
+    18080
+}
+
+pub fn default_stun_servers() -> Vec<String> {
+    sockcast_proto::p2p::DEFAULT_STUN_SERVERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KeyFilterConfig {
     /// If non-empty, only export local SSH keys whose SHA256 fingerprint matches one of these values.
@@ -68,6 +79,12 @@ pub struct ClientConfigFile {
     /// Optional key filtering rules
     #[serde(default)]
     pub key_filter: KeyFilterConfig,
+    /// Local loopback HTTP port for Zellij Web dashboard & tunneling (`http://localhost:18080/`; 0 = disabled)
+    #[serde(default = "default_zellij_listen_port")]
+    pub zellij_listen_port: u16,
+    /// STUN servers used for direct P2P hole-punching to Zellij-enabled relays
+    #[serde(default = "default_stun_servers")]
+    pub stun_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +96,8 @@ pub struct ClientConfig {
     pub heartbeat_interval_secs: u64,
     pub force_active: bool,
     pub key_filter: KeyFilterConfig,
+    pub zellij_listen_port: u16,
+    pub stun_servers: Vec<String>,
 }
 
 impl ClientConfigFile {
@@ -96,6 +115,8 @@ impl ClientConfigFile {
             heartbeat_interval_secs: default_heartbeat_secs(),
             force_active: false,
             key_filter: KeyFilterConfig::default(),
+            zellij_listen_port: default_zellij_listen_port(),
+            stun_servers: default_stun_servers(),
         }
     }
 
@@ -172,6 +193,12 @@ impl ClientConfig {
             heartbeat_interval_secs: file.heartbeat_interval_secs.max(1),
             force_active: file.force_active,
             key_filter: file.key_filter,
+            zellij_listen_port: file.zellij_listen_port,
+            stun_servers: if file.stun_servers.is_empty() {
+                default_stun_servers()
+            } else {
+                file.stun_servers
+            },
         })
     }
 }

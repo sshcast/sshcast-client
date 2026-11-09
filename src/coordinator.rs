@@ -19,6 +19,7 @@ use crate::local_agent::LocalAgentConnector;
 use crate::policy::{ApprovalDecision, PolicyEngine};
 use crate::presence::{current_os_name, now_unix_ms, query_last_input_epoch_ms};
 use crate::prompt::{ApprovalPrompter, PromptDetails};
+use crate::zellij_proxy::{serve_zellij_proxy_with_listener, ZellijProxyHub};
 
 pub struct WorkstationManager {
     cfg: ClientConfig,
@@ -28,6 +29,7 @@ pub struct WorkstationManager {
     cancellations: Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
     force_active_flag: Arc<AtomicBool>,
     connected_count: Arc<AtomicUsize>,
+    zellij_hub: Arc<ZellijProxyHub>,
 }
 
 impl WorkstationManager {
@@ -58,6 +60,7 @@ impl WorkstationManager {
         connected_count: Arc<AtomicUsize>,
     ) -> Self {
         connected_count.store(0, Ordering::Relaxed);
+        let zellij_hub = Arc::new(ZellijProxyHub::new(cfg.clone()));
         Self {
             cfg,
             local_agent,
@@ -66,7 +69,12 @@ impl WorkstationManager {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             force_active_flag,
             connected_count,
+            zellij_hub,
         }
+    }
+
+    pub fn zellij_hub(&self) -> Arc<ZellijProxyHub> {
+        Arc::clone(&self.zellij_hub)
     }
 
     pub fn force_active_flag(&self) -> Arc<AtomicBool> {
@@ -80,7 +88,26 @@ impl WorkstationManager {
     /// Maintains persistent bidirectional `ConnectWorkstation` gRPC streams to all configured
     /// `sockcast-server` instances concurrently until `shutdown_rx` signals true.
     pub async fn run(&self, shutdown_rx: watch::Receiver<bool>) -> Result<()> {
-        let mut handles = Vec::with_capacity(self.cfg.servers.len());
+        let mut handles = Vec::with_capacity(self.cfg.servers.len() + 1);
+        if self.cfg.zellij_listen_port > 0 {
+            let bind_addr = format!("127.0.0.1:{}", self.cfg.zellij_listen_port);
+            match tokio::net::TcpListener::bind(&bind_addr).await {
+                Ok(listener) => {
+                    let hub = Arc::clone(&self.zellij_hub);
+                    let shutdown = shutdown_rx.clone();
+                    handles.push(tokio::spawn(async move {
+                        let _ = serve_zellij_proxy_with_listener(listener, hub, shutdown).await;
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not bind Zellij Web local proxy on {} ({}); continuing without local Zellij HTTP listener",
+                        bind_addr,
+                        e
+                    );
+                }
+            }
+        }
         for server_url in &self.cfg.servers {
             let url = server_url.clone();
             let cfg = self.cfg.clone();
@@ -90,6 +117,7 @@ impl WorkstationManager {
             let cancellations = Arc::clone(&self.cancellations);
             let force_active_flag = Arc::clone(&self.force_active_flag);
             let connected_count = Arc::clone(&self.connected_count);
+            let zellij_hub = Arc::clone(&self.zellij_hub);
             let mut shutdown = shutdown_rx.clone();
 
             handles.push(tokio::spawn(async move {
@@ -110,6 +138,7 @@ impl WorkstationManager {
                         &cancellations,
                         &force_active_flag,
                         &connected_count,
+                        &zellij_hub,
                         shutdown.clone(),
                     )
                     .await;
@@ -177,6 +206,7 @@ async fn run_single_coordinator_stream(
     cancellations: &Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
     force_active_flag: &Arc<AtomicBool>,
     connected_count: &Arc<AtomicUsize>,
+    zellij_hub: &Arc<ZellijProxyHub>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let endpoint = Endpoint::new(server_url.to_string())
@@ -189,7 +219,8 @@ async fn run_single_coordinator_stream(
     let channel = endpoint.connect().await?;
     let mut client = SockcastServiceClient::new(channel);
 
-    let (tx, rx) = mpsc::channel::<ClientStreamMessage>(64);
+    let (tx, rx) = mpsc::channel::<ClientStreamMessage>(256);
+    zellij_hub.register_coordinator_sender(tx.clone()).await;
 
     // 1. First message on ConnectWorkstation stream MUST be AuthHandshake
     let handshake = create_node_auth(cfg.grant.clone(), &cfg.node_signing_key, now_unix_ms())?;
@@ -304,6 +335,15 @@ async fn run_single_coordinator_stream(
                                     payload: Some(ClientPayload::SignResponse(sign_resp)),
                                 })
                                 .await;
+                        });
+                    }
+                    Some(ServerPayload::ZellijHostList(list)) => {
+                        zellij_hub.update_host_list(list).await;
+                    }
+                    Some(ServerPayload::ZellijFrame(z_frame)) => {
+                        let hub = Arc::clone(zellij_hub);
+                        tokio::spawn(async move {
+                            hub.handle_incoming_frame(z_frame).await;
                         });
                     }
                     None => {}

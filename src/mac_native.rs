@@ -98,6 +98,7 @@ struct StatusBarWidgets {
     status_item: Retained<NSStatusItem>,
     header_item: Retained<NSMenuItem>,
     conn_item: Retained<NSMenuItem>,
+    zellij_action_item: Retained<NSMenuItem>,
     status_action_item: Retained<NSMenuItem>,
     backends_action_item: Retained<NSMenuItem>,
     bundle_action_item: Retained<NSMenuItem>,
@@ -136,6 +137,7 @@ fn refresh_status_bar_widgets(mtm: MainThreadMarker) {
             }
             w.header_item.setTitle(&NSString::from_str(&header_str));
             w.conn_item.setTitle(&NSString::from_str(&conn_str));
+            w.zellij_action_item.setEnabled(is_enrolled);
             w.status_action_item.setEnabled(is_enrolled);
             w.backends_action_item.setEnabled(is_enrolled);
             w.bundle_action_item.setEnabled(is_enrolled && has_root_key);
@@ -524,6 +526,15 @@ define_class!(
     }
 
     impl SockcastMenuTarget {
+        #[unsafe(method(onZellijDashboard:))]
+        fn on_zellij_dashboard(&self, _sender: Option<&AnyObject>) {
+            let port = get_tray_context()
+                .and_then(|ctx| ctx.current_config())
+                .map(|c| c.zellij_listen_port)
+                .unwrap_or(18080);
+            crate::zellij_proxy::open_zellij_dashboard_in_browser(port);
+        }
+
         #[unsafe(method(onStatusDialog:))]
         fn on_status_dialog(&self, _sender: Option<&AnyObject>) {
             if let Some(ctx) = get_tray_context() {
@@ -697,6 +708,8 @@ pub fn run_macos_tray_loop(
         item
     };
 
+    let zellij_action_item =
+        make_action_item("Open Zellij Web Dashboard...", sel!(onZellijDashboard:), "z");
     let status_action_item =
         make_action_item("Workstation Status & SSH Keys...", sel!(onStatusDialog:), "");
     let backends_action_item =
@@ -726,6 +739,7 @@ pub fn run_macos_tray_loop(
             status_item,
             header_item,
             conn_item,
+            zellij_action_item,
             status_action_item,
             backends_action_item,
             bundle_action_item,

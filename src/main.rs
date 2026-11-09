@@ -161,6 +161,24 @@ enum Commands {
         /// Automatically approve all verified requests without interactive prompting (useful for testing)
         #[arg(long, default_value_t = false)]
         auto_approve: bool,
+
+        /// Optional override for local Zellij Web HTTP proxy port (default from client.toml: 18080; 0 to disable)
+        #[arg(long)]
+        zellij_port: Option<u16>,
+    },
+    /// Open the local Zellij Web dashboard (or a specific remote relay host/session) in your browser
+    Zellij {
+        /// Optional target relay hostname (e.g. `sunduk`)
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Optional Zellij session name on the target host
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Optional path to `client.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Internal helper subcommand that renders the native `eframe`/`egui` approval modal window
     #[command(hide = true)]
@@ -186,6 +204,7 @@ async fn main() -> Result<()> {
         agent_socket: None,
         force_active: false,
         auto_approve: false,
+        zellij_port: None,
     }) {
         Commands::Keygen { key_file, force } => {
             let out = run_keygen(key_file.as_deref(), force)?;
@@ -334,6 +353,7 @@ async fn main() -> Result<()> {
             agent_socket,
             force_active,
             auto_approve,
+            zellij_port,
         } => {
             let mut cfg = ClientConfig::load(config.as_deref())?;
             if let Some(sock) = agent_socket {
@@ -341,6 +361,9 @@ async fn main() -> Result<()> {
             }
             if force_active {
                 cfg.force_active = true;
+            }
+            if let Some(zp) = zellij_port {
+                cfg.zellij_listen_port = zp;
             }
 
             let local_agent = Arc::new(LocalAgentConnector::new(
@@ -363,6 +386,36 @@ async fn main() -> Result<()> {
 
             let manager = WorkstationManager::new(cfg, local_agent, policy, prompter);
             manager.run(shutdown_rx).await
+        }
+        Commands::Zellij {
+            host,
+            session,
+            config,
+        } => {
+            let port = ClientConfig::load(config.as_deref())
+                .map(|c| c.zellij_listen_port)
+                .unwrap_or(18080);
+            let url = match (host, session) {
+                (Some(h), Some(s)) => format!("http://{h}.localhost:{port}/{s}"),
+                (Some(h), None) => format!("http://{h}.localhost:{port}/"),
+                (None, _) => format!("http://localhost:{port}/"),
+            };
+            println!("Opening {url}");
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "start", "", &url])
+                    .spawn();
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+            }
+            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+            {
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            }
+            Ok(())
         }
         Commands::InternalGuiPrompt { payload_json } => {
             let details: PromptDetails = serde_json::from_str(&payload_json)

@@ -12,9 +12,14 @@ use sockcast_client::local_agent::{
 };
 use sockcast_client::policy::{ApprovalDecision, PolicyEngine};
 use sockcast_client::prompt::{ApprovalPrompter, PromptDetails, StaticPrompter};
+use sockcast_client::zellij_proxy::{
+    extract_relay_target_from_host_header, parse_http_host_and_path,
+    serve_zellij_proxy_with_listener, ZellijProxyHub,
+};
 use sockcast_proto::bundle::EnrollmentBundle;
 use sockcast_proto::crypto::{
-    sign_node_grant, sign_sign_request, verify_node_auth, DEFAULT_MAX_CLOCK_SKEW_MS,
+    sign_node_grant, sign_sign_request, verify_node_auth, verify_zellij_tunnel_frame,
+    DEFAULT_MAX_CLOCK_SKEW_MS,
 };
 use sockcast_proto::ssh::parse_public_key_blob;
 use sockcast_proto::v1::client_stream_message::Payload as ClientPayload;
@@ -22,8 +27,9 @@ use sockcast_proto::v1::server_stream_message::Payload as ServerPayload;
 use sockcast_proto::v1::sockcast_service_server::{SockcastService, SockcastServiceServer};
 use sockcast_proto::v1::{
     ClientStreamMessage, GetIdentitiesRequest, GetIdentitiesResponse, NodeGrant, NodeRole,
-    ProcessAncestor, ProcessContext, ServerStreamMessage, SignAck, SignRequest, SignResponse,
-    SshAuthContext, WorkstationStatus,
+    ProcessAncestor, ProcessContext, RelayStreamMessage, RelayZellijStatus, ServerStreamMessage,
+    ServerToRelayMessage, SignAck, SignRequest, SignResponse, SshAuthContext, WorkstationStatus,
+    ZellijFrameType, ZellijHostList, ZellijSessionInfo, ZellijTunnelFrame,
 };
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -410,6 +416,16 @@ impl SockcastService for MockCoordinatorStreamServer {
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+
+    type ConnectRelayStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ServerToRelayMessage, Status>> + Send>>;
+
+    async fn connect_relay(
+        &self,
+        _request: Request<Streaming<RelayStreamMessage>>,
+    ) -> Result<Response<Self::ConnectRelayStream>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
 }
 
 #[tokio::test]
@@ -507,6 +523,8 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         heartbeat_interval_secs: 25,
         force_active: true,
         key_filter: KeyFilterConfig::default(),
+        zellij_listen_port: 0,
+        stun_servers: Vec::new(),
     };
 
     let (_c_tx, c_rx) = watch::channel(None);
@@ -557,6 +575,8 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
             allowed_comment_substrings: vec!["workstation".to_string()],
             excluded_fingerprints: Vec::new(),
         },
+        zellij_listen_port: 0,
+        stun_servers: Vec::new(),
     };
 
     let counting_prompter = Arc::new(CountingPrompter {
@@ -598,4 +618,172 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), manager_handle).await;
+}
+
+#[tokio::test]
+async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
+    assert_eq!(
+        extract_relay_target_from_host_header("sunduk.localhost:18080").as_deref(),
+        Some("sunduk")
+    );
+    assert_eq!(extract_relay_target_from_host_header("localhost:18080"), None);
+
+    let (method, path, host) = parse_http_host_and_path(
+        b"GET /sunduk/work HTTP/1.1\r\nHost: localhost:18080\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(method, "GET");
+    assert_eq!(path, "/sunduk/work");
+    assert_eq!(host, "localhost:18080");
+
+    let user_sk = SigningKey::from_bytes(&[0x60; 32]);
+    let client_sk = SigningKey::from_bytes(&[0x61; 32]);
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut client_grant = NodeGrant {
+        user_id: String::new(),
+        user_pubkey: Vec::new(),
+        node_id: "workstation-1".to_string(),
+        role: NodeRole::Client as i32,
+        node_pubkey: client_sk.verifying_key().to_bytes().to_vec(),
+        issued_at_unix_sec: now_sec - 60,
+        expires_at_unix_sec: 0,
+        user_signature: Vec::new(),
+    };
+    sign_node_grant(&mut client_grant, &user_sk);
+
+    let cfg = ClientConfig {
+        servers: vec!["http://127.0.0.1:1".to_string()],
+        node_signing_key: client_sk,
+        grant: client_grant.clone(),
+        local_agent_socket: None,
+        heartbeat_interval_secs: 25,
+        force_active: true,
+        key_filter: KeyFilterConfig::default(),
+        zellij_listen_port: 18080,
+        stun_servers: Vec::new(),
+    };
+
+    let hub = Arc::new(ZellijProxyHub::new(cfg));
+    let (coord_tx, mut coord_rx) = mpsc::channel(32);
+    hub.register_coordinator_sender(coord_tx).await;
+    hub.update_host_list(ZellijHostList {
+        hosts: vec![RelayZellijStatus {
+            node_id: "sunduk.infra.local".to_string(),
+            zellij_enabled: true,
+            sessions: vec![ZellijSessionInfo {
+                name: "dev-session".to_string(),
+                created_info: "Created 5m ago".to_string(),
+                exited: false,
+            }],
+            updated_at_unix_ms: now_sec * 1000,
+        }],
+    })
+    .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let hub_for_srv = Arc::clone(&hub);
+    tokio::spawn(async move {
+        let _ = serve_zellij_proxy_with_listener(listener, hub_for_srv, shutdown_rx).await;
+    });
+
+    // 1. GET http://localhost:<port>/ -> 200 OK Dashboard containing sunduk.infra.local and dev-session
+    let mut s1 = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    s1.write_all(
+        format!(
+            "GET / HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+            proxy_addr.port()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut r1 = Vec::new();
+    s1.read_to_end(&mut r1).await.unwrap();
+    let r1_str = String::from_utf8_lossy(&r1);
+    assert!(r1_str.starts_with("HTTP/1.1 200 OK"));
+    assert!(r1_str.contains("sunduk.infra.local"));
+    assert!(r1_str.contains("dev-session"));
+
+    // 2. GET http://localhost:<port>/sunduk/dev-session -> 302 Redirect to http://sunduk.localhost:<port>/dev-session
+    let mut s2 = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    s2.write_all(
+        format!(
+            "GET /sunduk/dev-session HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+            proxy_addr.port()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut r2 = Vec::new();
+    s2.read_to_end(&mut r2).await.unwrap();
+    let r2_str = String::from_utf8_lossy(&r2);
+    assert!(r2_str.starts_with("HTTP/1.1 302 Found"));
+    assert!(r2_str.contains(&format!(
+        "Location: http://sunduk.localhost:{}/dev-session",
+        proxy_addr.port()
+    )));
+
+    // 3. GET http://sunduk.localhost:<port>/dev-session -> Tunnels via signed ZellijTunnelFrame (OPEN -> DATA -> CLOSE)
+    let hub_for_reply = Arc::clone(&hub);
+    let user_pubkey = client_grant.user_pubkey.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = coord_rx.recv().await {
+            if let Some(ClientPayload::ZellijFrame(frame)) = msg.payload {
+                if frame.frame_type == ZellijFrameType::Open as i32 {
+                    verify_zellij_tunnel_frame(&frame, NodeRole::Client, &user_pubkey, now_sec)
+                        .unwrap();
+                    assert_eq!(frame.relay_node_id, "sunduk.infra.local");
+                    hub_for_reply
+                        .handle_incoming_frame(ZellijTunnelFrame {
+                            tunnel_id: frame.tunnel_id.clone(),
+                            relay_node_id: "sunduk.infra.local".to_string(),
+                            client_node_id: "workstation-1".to_string(),
+                            frame_type: ZellijFrameType::Data as i32,
+                            payload: b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\nZELLIJ_WEB_OK!".to_vec(),
+                            error_message: String::new(),
+                            sender_grant: None,
+                            sender_signature: Vec::new(),
+                        })
+                        .await;
+                    hub_for_reply
+                        .handle_incoming_frame(ZellijTunnelFrame {
+                            tunnel_id: frame.tunnel_id,
+                            relay_node_id: "sunduk.infra.local".to_string(),
+                            client_node_id: "workstation-1".to_string(),
+                            frame_type: ZellijFrameType::Close as i32,
+                            payload: Vec::new(),
+                            error_message: String::new(),
+                            sender_grant: None,
+                            sender_signature: Vec::new(),
+                        })
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut s3 = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    s3.write_all(
+        format!(
+            "GET /dev-session HTTP/1.1\r\nHost: sunduk.localhost:{}\r\nConnection: close\r\n\r\n",
+            proxy_addr.port()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut r3 = Vec::new();
+    s3.read_to_end(&mut r3).await.unwrap();
+    let r3_str = String::from_utf8_lossy(&r3);
+    assert!(r3_str.ends_with("ZELLIJ_WEB_OK!"));
+
+    let _ = shutdown_tx.send(true);
 }
