@@ -152,7 +152,11 @@ fn test_keygen_and_grant_relay_and_client_bundles() {
         0,
     )
     .unwrap();
-    write_client_config_from_bundle(&client_bundle, Some(&client_cfg_path)).unwrap();
+    write_client_config_from_bundle(&client_bundle, Some(&client_cfg_path), false).unwrap();
+    // Second write without --force must fail instead of silently overwriting client.toml
+    assert!(write_client_config_from_bundle(&client_bundle, Some(&client_cfg_path), false).is_err());
+    // Overwrite succeeds with force = true
+    write_client_config_from_bundle(&client_bundle, Some(&client_cfg_path), true).unwrap();
 
     let loaded_client = ClientConfig::load(Some(&client_cfg_path)).unwrap();
     assert_eq!(loaded_client.grant.node_id, "macbook-pro");

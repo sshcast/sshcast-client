@@ -140,6 +140,7 @@ pub fn mint_enrollment_bundle(
 pub fn write_client_config_from_bundle(
     bundle: &EnrollmentBundle,
     config_path: Option<&Path>,
+    force: bool,
 ) -> Result<PathBuf> {
     let now_sec = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -159,6 +160,13 @@ pub fn write_client_config_from_bundle(
         Some(p) => p.to_path_buf(),
         None => default_client_config_path()?,
     };
+
+    if path.exists() && !force {
+        anyhow::bail!(
+            "client config already exists at {} (pass --bundle-only to mint a bundle for another machine, or --force to overwrite)",
+            path.display()
+        );
+    }
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

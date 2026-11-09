@@ -82,6 +82,10 @@ enum Commands {
         /// Only print the `sc1_<base64>` enrollment token instead of writing `client.toml` locally
         #[arg(long, default_value_t = false)]
         bundle_only: bool,
+
+        /// Overwrite existing `client.toml` if present
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Initialize `client.toml` on a secondary workstation from an `sc1_<base64>` client bundle
     Init {
@@ -92,6 +96,10 @@ enum Commands {
         /// Optional path to write `client.toml` (defaults to `~/.config/sockcast/client.toml`)
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Overwrite existing `client.toml` if present
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// List local OS SSH agent public keys (showing which keys pass `key_filter`)
     ListKeys {
@@ -181,6 +189,7 @@ async fn main() -> Result<()> {
             key_file,
             config,
             bundle_only,
+            force,
         } => {
             let user_sk = load_user_signing_key(key_file.as_deref())?;
             let bundle =
@@ -189,7 +198,7 @@ async fn main() -> Result<()> {
             if bundle_only {
                 println!("{token}");
             } else {
-                let path = write_client_config_from_bundle(&bundle, config.as_deref())?;
+                let path = write_client_config_from_bundle(&bundle, config.as_deref(), force)?;
                 println!(
                     "Enrolled workstation '{}' (user '{}')",
                     bundle.grant.node_id, bundle.grant.user_id
@@ -198,10 +207,14 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Init { bundle, config } => {
+        Commands::Init {
+            bundle,
+            config,
+            force,
+        } => {
             let decoded =
                 EnrollmentBundle::decode(&bundle).context("failed to decode client bundle")?;
-            let path = write_client_config_from_bundle(&decoded, config.as_deref())?;
+            let path = write_client_config_from_bundle(&decoded, config.as_deref(), force)?;
             println!(
                 "Enrolled workstation '{}' (user '{}')",
                 decoded.grant.node_id, decoded.grant.user_id
