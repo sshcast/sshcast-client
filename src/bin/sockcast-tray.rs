@@ -106,10 +106,17 @@ fn main() -> Result<()> {
                         .and_then(|ctx| ctx.current_config());
 
                     if let Some(cfg) = maybe_cfg {
-                        let local_agent = Arc::new(LocalAgentConnector::new(
-                            cfg.local_agent_socket.clone(),
-                            cfg.key_filter.clone(),
-                        ));
+                        let local_agent = Arc::new(
+                            LocalAgentConnector::from_client_config(&cfg, &[], false)
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!("Failed to load some built-in SSH keys: {:#}", e);
+                                    LocalAgentConnector::with_options(
+                                        cfg.local_agent_socket.clone(),
+                                        cfg.key_filter.clone(),
+                                        cfg.disable_os_agent,
+                                    )
+                                }),
+                        );
                         let manager = WorkstationManager::with_shared_state(
                             cfg,
                             local_agent,
@@ -183,10 +190,7 @@ fn main() -> Result<()> {
         let cfg = initial_cfg.ok_or_else(|| {
             anyhow::anyhow!("failed to load client.toml (run `sockcast-client init` first)")
         })?;
-        let local_agent = Arc::new(LocalAgentConnector::new(
-            cfg.local_agent_socket.clone(),
-            cfg.key_filter.clone(),
-        ));
+        let local_agent = Arc::new(LocalAgentConnector::from_client_config(&cfg, &[], true)?);
         let policy = Arc::new(PolicyEngine::default());
         let prompter: Arc<dyn ApprovalPrompter> = if args.auto_approve {
             Arc::new(StaticPrompter::new(ApprovalDecision::ApproveOnce))

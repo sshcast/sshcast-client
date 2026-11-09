@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sockcast_client::config::ClientConfig;
+use sockcast_client::config::{expand_tilde_path, ClientConfig, ClientConfigFile};
 use sockcast_client::coordinator::WorkstationManager;
 use sockcast_client::enroll::{
     decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
@@ -134,7 +134,21 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// List local OS SSH agent public keys (showing which keys pass `key_filter`)
+    /// Validate an OpenSSH private key and register it in `client.toml` (`ssh_key_files` or `ssh_keys_inline`)
+    AddKey {
+        /// Path to the OpenSSH private key file (e.g. `~/.ssh/id_ed25519`)
+        #[arg(long = "ssh-key", visible_alias = "key-path")]
+        ssh_key: PathBuf,
+
+        /// Embed the private key PEM directly into `client.toml` (`ssh_keys_inline`) instead of referencing its file path
+        #[arg(long, default_value_t = false)]
+        inline: bool,
+
+        /// Optional path to `client.toml` (defaults to `~/.config/sockcast/client.toml`)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// List built-in and local OS SSH agent public keys (showing which keys pass `key_filter`)
     ListKeys {
         /// Optional path to `client.toml`
         #[arg(long)]
@@ -143,8 +157,16 @@ enum Commands {
         /// Optional local SSH agent socket override
         #[arg(long)]
         agent_socket: Option<String>,
+
+        /// Additional OpenSSH private key file(s) to load into the built-in agent
+        #[arg(long = "ssh-key")]
+        ssh_keys: Vec<PathBuf>,
+
+        /// Disable querying the external OS SSH agent (`$SSH_AUTH_SOCK` / Windows `openssh-ssh-agent`)
+        #[arg(long = "no-os-agent", default_value_t = false)]
+        no_os_agent: bool,
     },
-    /// Run the workstation client daemon (connects to all coordinators, sends 25s heartbeats, prompts & bridges to local SSH agent)
+    /// Run the workstation client daemon (connects to all coordinators, sends 25s heartbeats, prompts & bridges to built-in/OS SSH agent)
     Run {
         /// Optional path to `client.toml` (defaults to `~/.config/sockcast/client.toml`)
         #[arg(long)]
@@ -153,6 +175,14 @@ enum Commands {
         /// Optional local SSH agent socket override
         #[arg(long)]
         agent_socket: Option<String>,
+
+        /// Additional OpenSSH private key file(s) to load into the built-in agent
+        #[arg(long = "ssh-key")]
+        ssh_keys: Vec<PathBuf>,
+
+        /// Disable querying the external OS SSH agent (`$SSH_AUTH_SOCK` / Windows `openssh-ssh-agent`)
+        #[arg(long = "no-os-agent", default_value_t = false)]
+        no_os_agent: bool,
 
         /// Force this workstation to be prioritized as active
         #[arg(long, default_value_t = false)]
@@ -202,6 +232,8 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Commands::Run {
         config: None,
         agent_socket: None,
+        ssh_keys: Vec::new(),
+        no_os_agent: false,
         force_active: false,
         auto_approve: false,
         zellij_port: None,
@@ -329,20 +361,71 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::AddKey {
+            ssh_key,
+            inline,
+            config,
+        } => {
+            let expanded = expand_tilde_path(&ssh_key.to_string_lossy());
+            let connector = LocalAgentConnector::with_options(None, Default::default(), true);
+            let pk = connector.load_private_key_file_interactive(&expanded, true)?;
+            let (cfg_path, mut cfg_file) = ClientConfigFile::load(config.as_deref())?;
+            if inline {
+                let raw_pem = std::fs::read_to_string(&expanded)
+                    .with_context(|| format!("failed to read {}", expanded.display()))?;
+                if !cfg_file.ssh_keys_inline.iter().any(|k| k.trim() == raw_pem.trim()) {
+                    cfg_file.ssh_keys_inline.push(raw_pem);
+                }
+            } else {
+                let path_str = ssh_key.to_string_lossy().to_string();
+                if !cfg_file.ssh_key_files.contains(&path_str) {
+                    cfg_file.ssh_key_files.push(path_str);
+                }
+            }
+            let saved_path = cfg_file.save(Some(&cfg_path))?;
+            println!("Registered built-in SSH private key in {}:", saved_path.display());
+            println!(
+                "  - [built-in] {} {} ({})",
+                pk.key_type, pk.fingerprint_sha256, pk.comment
+            );
+            Ok(())
+        }
         Commands::ListKeys {
             config,
             agent_socket,
+            ssh_keys,
+            no_os_agent,
         } => {
-            let (sock_override, filter) = match ClientConfig::load(config.as_deref()) {
-                Ok(c) => (agent_socket.or(c.local_agent_socket), c.key_filter),
-                Err(_) => (agent_socket, Default::default()),
+            let connector = match ClientConfig::load(config.as_deref()) {
+                Ok(mut c) => {
+                    if let Some(sock) = agent_socket {
+                        c.local_agent_socket = Some(sock);
+                    }
+                    if no_os_agent {
+                        c.disable_os_agent = true;
+                    }
+                    LocalAgentConnector::from_client_config(&c, &ssh_keys, true)?
+                }
+                Err(_) => {
+                    let conn =
+                        LocalAgentConnector::with_options(agent_socket, Default::default(), no_os_agent);
+                    for path in &ssh_keys {
+                        let expanded = expand_tilde_path(&path.to_string_lossy());
+                        conn.load_private_key_file_interactive(&expanded, true)?;
+                    }
+                    conn
+                }
             };
-            let connector = LocalAgentConnector::new(sock_override, filter);
             let keys = connector.list_filtered_keys().await?;
             println!("Exported local SSH keys ({}):", keys.len());
             for k in keys {
+                let source = if connector.is_loaded_key(&k.key_blob) {
+                    "built-in"
+                } else {
+                    "os-agent"
+                };
                 println!(
-                    "  - {} {} ({})",
+                    "  - [{source}] {} {} ({})",
                     k.key_type, k.fingerprint_sha256, k.comment
                 );
             }
@@ -351,6 +434,8 @@ async fn main() -> Result<()> {
         Commands::Run {
             config,
             agent_socket,
+            ssh_keys,
+            no_os_agent,
             force_active,
             auto_approve,
             zellij_port,
@@ -359,6 +444,9 @@ async fn main() -> Result<()> {
             if let Some(sock) = agent_socket {
                 cfg.local_agent_socket = Some(sock);
             }
+            if no_os_agent {
+                cfg.disable_os_agent = true;
+            }
             if force_active {
                 cfg.force_active = true;
             }
@@ -366,10 +454,9 @@ async fn main() -> Result<()> {
                 cfg.zellij_listen_port = zp;
             }
 
-            let local_agent = Arc::new(LocalAgentConnector::new(
-                cfg.local_agent_socket.clone(),
-                cfg.key_filter.clone(),
-            ));
+            let local_agent = Arc::new(LocalAgentConnector::from_client_config(
+                &cfg, &ssh_keys, true,
+            )?);
             let policy = Arc::new(PolicyEngine::default());
             let prompter: Arc<dyn ApprovalPrompter> = if auto_approve {
                 Arc::new(StaticPrompter::new(ApprovalDecision::ApproveOnce))

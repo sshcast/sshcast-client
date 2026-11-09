@@ -525,6 +525,9 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         key_filter: KeyFilterConfig::default(),
         zellij_listen_port: 0,
         stun_servers: Vec::new(),
+        ssh_key_files: Vec::new(),
+        ssh_keys_inline: Vec::new(),
+        disable_os_agent: false,
     };
 
     let (_c_tx, c_rx) = watch::channel(None);
@@ -577,6 +580,9 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         },
         zellij_listen_port: 0,
         stun_servers: Vec::new(),
+        ssh_key_files: Vec::new(),
+        ssh_keys_inline: Vec::new(),
+        disable_os_agent: false,
     };
 
     let counting_prompter = Arc::new(CountingPrompter {
@@ -665,6 +671,9 @@ async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
         key_filter: KeyFilterConfig::default(),
         zellij_listen_port: 18080,
         stun_servers: Vec::new(),
+        ssh_key_files: Vec::new(),
+        ssh_keys_inline: Vec::new(),
+        disable_os_agent: false,
     };
 
     let hub = Arc::new(ZellijProxyHub::new(cfg));
@@ -806,4 +815,159 @@ async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
     assert_eq!(&r4[r4_hdr_end + 4..r4_hdr_end + 6], &[0x1f, 0x8b]);
 
     let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_builtin_ssh_agent_keys_without_os_agent() {
+    use sockcast_proto::ssh::LoadedSshKey;
+
+    let tmp = TempDir::new().unwrap();
+    let key_file_path = tmp.path().join("id_ed25519_builtin");
+
+    // Generate a real OpenSSH private key and save to disk
+    let builtin_key = LoadedSshKey::generate_ed25519("builtin@browser-ready");
+    std::fs::write(&key_file_path, builtin_key.to_openssh_pem()).unwrap();
+
+    let user_sk = SigningKey::from_bytes(&[0x70; 32]);
+    let relay_sk = SigningKey::from_bytes(&[0x71; 32]);
+    let client_sk = SigningKey::from_bytes(&[0x72; 32]);
+
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let now_ms = now_sec * 1000;
+
+    let mut relay_grant = NodeGrant {
+        user_id: String::new(),
+        user_pubkey: Vec::new(),
+        node_id: "relay-restrictive.local".to_string(),
+        role: NodeRole::Relay as i32,
+        node_pubkey: relay_sk.verifying_key().to_bytes().to_vec(),
+        issued_at_unix_sec: now_sec - 60,
+        expires_at_unix_sec: 0,
+        user_signature: Vec::new(),
+    };
+    sign_node_grant(&mut relay_grant, &user_sk);
+
+    let mut client_grant = NodeGrant {
+        user_id: String::new(),
+        user_pubkey: Vec::new(),
+        node_id: "standalone-client".to_string(),
+        role: NodeRole::Client as i32,
+        node_pubkey: client_sk.verifying_key().to_bytes().to_vec(),
+        issued_at_unix_sec: now_sec - 60,
+        expires_at_unix_sec: 0,
+        user_signature: Vec::new(),
+    };
+    sign_node_grant(&mut client_grant, &user_sk);
+
+    let challenge_data = b"builtin-agent-ssh-auth-challenge".to_vec();
+    let mut sign_req = SignRequest {
+        request_id: "req-builtin-1".to_string(),
+        timestamp_unix_ms: now_ms,
+        key_blob: builtin_key.key_blob().to_vec(),
+        data: challenge_data.clone(),
+        flags: 0,
+        process_context: Some(ProcessContext {
+            hostname: "relay-restrictive.local".to_string(),
+            uid: 1000,
+            pid: 4242,
+            comm: "ssh".to_string(),
+            cmdline: "ssh prod-box".to_string(),
+            cwd: "/home/stingray".to_string(),
+            ancestors: Vec::new(),
+        }),
+        ssh_auth_context: Some(SshAuthContext {
+            is_userauth_request: true,
+            target_username: "stingray".to_string(),
+            service_name: "ssh-connection".to_string(),
+            pubkey_algorithm: "ssh-ed25519".to_string(),
+            session_id: vec![0x01, 0x02, 0x03, 0x04],
+        }),
+        relay_grant: Some(relay_grant),
+        relay_signature: Vec::new(),
+        auth: None,
+    };
+    sign_sign_request(&mut sign_req, &relay_sk).unwrap();
+
+    let (ack_tx, mut ack_rx) = mpsc::channel(4);
+    let (resp_tx, mut resp_rx) = mpsc::channel(4);
+    let (status_tx, mut status_rx) = mpsc::channel(4);
+
+    let mock_server = MockCoordinatorStreamServer {
+        sign_req_to_push: sign_req,
+        ack_tx: Mutex::new(Some(ack_tx)),
+        resp_tx: Mutex::new(Some(resp_tx)),
+        status_tx: Mutex::new(Some(status_tx)),
+    };
+
+    let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(SockcastServiceServer::new(mock_server))
+            .serve_with_incoming(TcpListenerStream::new(tcp_listener))
+            .await;
+    });
+
+    // Configure client with NO OS agent (pointing to a non-existent socket AND disable_os_agent = true)
+    let cfg = ClientConfig {
+        servers: vec![format!("http://{}", addr)],
+        node_signing_key: client_sk,
+        grant: client_grant,
+        local_agent_socket: Some("/nonexistent/ssh-agent.sock".to_string()),
+        heartbeat_interval_secs: 25,
+        force_active: true,
+        key_filter: KeyFilterConfig::default(),
+        zellij_listen_port: 0,
+        stun_servers: Vec::new(),
+        ssh_key_files: vec![key_file_path.to_string_lossy().to_string()],
+        ssh_keys_inline: Vec::new(),
+        disable_os_agent: true,
+    };
+
+    let connector = Arc::new(LocalAgentConnector::from_client_config(&cfg, &[], false).unwrap());
+    assert_eq!(connector.loaded_key_count(), 1);
+
+    let policy = Arc::new(PolicyEngine::default());
+    let prompter: Arc<dyn ApprovalPrompter> =
+        Arc::new(StaticPrompter::new(ApprovalDecision::ApproveOnce));
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let manager = WorkstationManager::new(cfg, connector, policy, prompter);
+    let manager_handle = tokio::spawn(async move { manager.run(shutdown_rx).await });
+
+    let status = tokio::time::timeout(Duration::from_secs(3), status_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.keys.len(), 1);
+    assert_eq!(status.keys[0].comment, "builtin@browser-ready");
+    assert_eq!(
+        status.keys[0].fingerprint_sha256,
+        builtin_key.fingerprint_sha256()
+    );
+
+    let ack = tokio::time::timeout(Duration::from_secs(3), ack_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.request_id, "req-builtin-1");
+
+    let resp = tokio::time::timeout(Duration::from_secs(3), resp_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.request_id, "req-builtin-1");
+    assert!(resp.approved);
+    assert_eq!(resp.handled_by_node_id, "standalone-client");
+
+    // Cryptographically verify the returned RFC 4253 signature blob against the challenge!
+    builtin_key
+        .verify_ssh_signature_blob(&challenge_data, &resp.signature_blob)
+        .unwrap();
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), manager_handle).await;
 }

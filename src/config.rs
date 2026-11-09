@@ -85,6 +85,15 @@ pub struct ClientConfigFile {
     /// STUN servers used for direct P2P hole-punching to Zellij-enabled relays
     #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<String>,
+    /// Optional paths to OpenSSH private key files (e.g. `["~/.ssh/id_ed25519"]`) to load into the built-in SSH agent
+    #[serde(default)]
+    pub ssh_key_files: Vec<String>,
+    /// Optional inline OpenSSH private keys (`-----BEGIN OPENSSH PRIVATE KEY-----...`) to load into the built-in SSH agent
+    #[serde(default)]
+    pub ssh_keys_inline: Vec<String>,
+    /// Disable querying the external OS SSH agent (`$SSH_AUTH_SOCK` / Windows `openssh-ssh-agent`) and use only built-in keys
+    #[serde(default)]
+    pub disable_os_agent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +107,9 @@ pub struct ClientConfig {
     pub key_filter: KeyFilterConfig,
     pub zellij_listen_port: u16,
     pub stun_servers: Vec<String>,
+    pub ssh_key_files: Vec<String>,
+    pub ssh_keys_inline: Vec<String>,
+    pub disable_os_agent: bool,
 }
 
 impl ClientConfigFile {
@@ -117,6 +129,9 @@ impl ClientConfigFile {
             key_filter: KeyFilterConfig::default(),
             zellij_listen_port: default_zellij_listen_port(),
             stun_servers: default_stun_servers(),
+            ssh_key_files: Vec::new(),
+            ssh_keys_inline: Vec::new(),
+            disable_os_agent: false,
         }
     }
 
@@ -199,8 +214,21 @@ impl ClientConfig {
             } else {
                 file.stun_servers
             },
+            ssh_key_files: file.ssh_key_files,
+            ssh_keys_inline: file.ssh_keys_inline,
+            disable_os_agent: file.disable_os_agent,
         })
     }
+}
+
+pub fn expand_tilde_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        if let Ok(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
 }
 
 pub fn home_dir() -> Result<PathBuf> {
