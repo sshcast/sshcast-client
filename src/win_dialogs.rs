@@ -1399,14 +1399,14 @@ unsafe extern "system" fn bundle_wnd_proc(
                 "User Root Key (for /etc/sockcast/server.toml):",
                 24,
                 70,
-                384,
+                464,
                 18,
                 ID_STYLE_SECTION_HEADER_1,
                 dpi,
                 assets.font_section,
             );
             let root_str = format_root_key_allowlist().unwrap_or_else(|| {
-                "No user_key.toml yet — click 'Generate Key' to create one".to_string()
+                "No user_key.toml found on this workstation".to_string()
             });
             create_edit(
                 hwnd,
@@ -1415,7 +1415,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                 true,
                 24,
                 96,
-                384,
+                464,
                 26,
                 ID_BUNDLE_ROOT_PUBKEY_EDIT,
                 dpi,
@@ -1423,21 +1423,10 @@ unsafe extern "system" fn bundle_wnd_proc(
             );
             create_button(
                 hwnd,
-                "Generate Key",
-                416,
-                95,
-                96,
-                28,
-                ID_BUNDLE_BTN_KEYGEN,
-                dpi,
-                assets.font_ui,
-            );
-            create_button(
-                hwnd,
                 "Copy Allowlist",
-                518,
+                496,
                 95,
-                98,
+                120,
                 28,
                 ID_BUNDLE_BTN_COPY_PUBKEY,
                 dpi,
@@ -1874,6 +1863,14 @@ unsafe extern "system" fn bundle_wnd_proc(
 }
 
 pub unsafe fn show_bundle_generator_window() {
+    let is_enrolled = crate::win_native::get_tray_context()
+        .and_then(|c| c.current_config())
+        .is_some();
+    if !is_enrolled {
+        show_enroll_window();
+        return;
+    }
+
     {
         let g = DIALOG_RES.lock().unwrap();
         let existing = g.bundle_hwnd as HWND;
@@ -2223,6 +2220,14 @@ unsafe extern "system" fn backends_wnd_proc(
 }
 
 pub unsafe fn show_backends_window() {
+    let is_enrolled = crate::win_native::get_tray_context()
+        .and_then(|c| c.current_config())
+        .is_some();
+    if !is_enrolled {
+        show_enroll_window();
+        return;
+    }
+
     {
         let g = DIALOG_RES.lock().unwrap();
         let existing = g.backends_hwnd as HWND;

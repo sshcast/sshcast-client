@@ -552,26 +552,35 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     AppendMenuW(hmenu, MF_STRING | MF_GRAYED, 0, conn_label.as_ptr());
     AppendMenuW(hmenu, MF_SEPARATOR, 0, null());
 
-    let status_flags = if maybe_cfg.is_some() {
+    let is_enrolled = maybe_cfg.is_some();
+    let has_root_key = crate::config::UserKeyFile::load(None).is_ok();
+
+    let enrolled_flags = if is_enrolled {
         MF_STRING
     } else {
         MF_STRING | MF_GRAYED
     };
+    let bundle_flags = if is_enrolled && has_root_key {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED
+    };
+
     AppendMenuW(
         hmenu,
-        status_flags,
+        enrolled_flags,
         IDM_STATUS_DIALOG as usize,
         status_label.as_ptr(),
     );
     AppendMenuW(
         hmenu,
-        MF_STRING,
+        enrolled_flags,
         IDM_BACKENDS_WINDOW as usize,
         backends_label.as_ptr(),
     );
     AppendMenuW(
         hmenu,
-        MF_STRING,
+        bundle_flags,
         IDM_BUNDLE_GENERATOR_WINDOW as usize,
         bundle_label.as_ptr(),
     );
@@ -583,11 +592,14 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     );
     AppendMenuW(hmenu, MF_SEPARATOR, 0, null());
 
-    let force_flags = if force_active {
+    let mut force_flags = if force_active {
         MF_STRING | MF_CHECKED
     } else {
         MF_STRING | MF_UNCHECKED
     };
+    if !is_enrolled {
+        force_flags |= MF_GRAYED;
+    }
     AppendMenuW(
         hmenu,
         force_flags,
