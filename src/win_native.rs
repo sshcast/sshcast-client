@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
@@ -16,7 +16,8 @@ use windows_sys::Win32::UI::Controls::{
     TD_SHIELD_ICON,
 };
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -33,6 +34,10 @@ use crate::config::{default_config_dir, ClientConfig};
 use crate::local_agent::LocalAgentConnector;
 use crate::policy::ApprovalDecision;
 use crate::prompt::PromptDetails;
+use crate::win_dialogs::{
+    cleanup_dialog_fonts, is_any_management_dialog_message, show_backends_window,
+    show_bundle_generator_window, show_enroll_window,
+};
 
 const BTN_APPROVE_ONCE: i32 = 101;
 const BTN_APPROVE_TOOL_15M: i32 = 102;
@@ -44,9 +49,12 @@ const WM_TRAY_SHUTDOWN: u32 = WM_APP + 2;
 const TRAY_ICON_ID: u32 = 1;
 
 const IDM_STATUS_DIALOG: u32 = 1001;
-const IDM_TOGGLE_FORCE_ACTIVE: u32 = 1002;
-const IDM_OPEN_CONFIG_DIR: u32 = 1003;
-const IDM_QUIT: u32 = 1004;
+const IDM_BACKENDS_WINDOW: u32 = 1002;
+const IDM_BUNDLE_GENERATOR_WINDOW: u32 = 1003;
+const IDM_ENROLL_WINDOW: u32 = 1004;
+const IDM_TOGGLE_FORCE_ACTIVE: u32 = 1005;
+const IDM_OPEN_CONFIG_DIR: u32 = 1006;
+const IDM_QUIT: u32 = 1007;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -255,7 +263,7 @@ pub async fn prompt_task_dialog(
     }
 }
 
-/// Displays a native Windows error dialog (used by `sockcast-tray.exe` when startup fails).
+/// Displays a native Windows error dialog.
 pub fn show_tray_error_dialog(title: &str, instruction: &str, details: &str) {
     unsafe {
         let title_w = to_wide(title);
@@ -307,21 +315,61 @@ pub fn show_tray_error_dialog(title: &str, instruction: &str, details: &str) {
     }
 }
 
-struct TraySharedContext {
-    node_id: String,
-    user_id: String,
-    servers: Vec<String>,
-    config_dir: PathBuf,
-    local_agent: Arc<LocalAgentConnector>,
-    force_active_flag: Arc<AtomicBool>,
-    connected_count: Arc<AtomicUsize>,
-    shutdown_tx: watch::Sender<bool>,
-    status_dialog_open: AtomicBool,
-    taskbar_created_msg: u32,
-    hicon_raw: isize,
+pub struct TraySharedContext {
+    pub config_path: Option<PathBuf>,
+    pub agent_socket_override: Option<String>,
+    pub config_dir: PathBuf,
+    pub active_config: Mutex<Option<ClientConfig>>,
+    pub force_active_flag: Arc<AtomicBool>,
+    pub connected_count: Arc<AtomicUsize>,
+    pub reload_tx: watch::Sender<u64>,
+    pub shutdown_tx: watch::Sender<bool>,
+    pub status_dialog_open: AtomicBool,
+    pub taskbar_created_msg: u32,
+    pub hicon_raw: isize,
+    pub tray_hwnd: AtomicIsize,
+}
+
+impl TraySharedContext {
+    pub fn current_config(&self) -> Option<ClientConfig> {
+        self.active_config.lock().ok().and_then(|g| g.clone())
+    }
 }
 
 static TRAY_CONTEXT: Mutex<Option<Arc<TraySharedContext>>> = Mutex::new(None);
+
+pub fn get_tray_context() -> Option<Arc<TraySharedContext>> {
+    TRAY_CONTEXT
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+}
+
+/// Reloads `client.toml` from disk, updates the tray icon tooltip, and notifies the background
+/// Tokio runtime in `sockcast-tray.exe` to reconnect to all configured coordinator backends.
+pub fn reload_tray_configuration() {
+    let Some(ctx) = get_tray_context() else {
+        return;
+    };
+    if let Ok(mut cfg) = ClientConfig::load(ctx.config_path.as_deref()) {
+        if let Some(ref sock) = ctx.agent_socket_override {
+            cfg.local_agent_socket = Some(sock.clone());
+        }
+        cfg.force_active = ctx.force_active_flag.load(Ordering::Relaxed);
+        if let Ok(mut guard) = ctx.active_config.lock() {
+            *guard = Some(cfg);
+        }
+        let next_gen = (*ctx.reload_tx.borrow()).wrapping_add(1);
+        let _ = ctx.reload_tx.send(next_gen);
+
+        let hwnd = ctx.tray_hwnd.load(Ordering::Relaxed) as HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                let _ = add_or_update_tray_icon(hwnd, &ctx, true);
+            }
+        }
+    }
+}
 
 unsafe fn load_tray_icon() -> HICON {
     let shield = LoadIconW(null_mut(), IDI_SHIELD);
@@ -331,7 +379,7 @@ unsafe fn load_tray_icon() -> HICON {
     LoadIconW(null_mut(), IDI_APPLICATION)
 }
 
-unsafe fn add_tray_icon(hwnd: HWND, ctx: &TraySharedContext) -> BOOL {
+unsafe fn add_or_update_tray_icon(hwnd: HWND, ctx: &TraySharedContext, modify: bool) -> BOOL {
     let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
     nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     nid.hWnd = hwnd;
@@ -340,12 +388,15 @@ unsafe fn add_tray_icon(hwnd: HWND, ctx: &TraySharedContext) -> BOOL {
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = ctx.hicon_raw as HICON;
 
-    let tip = format!("Sockcast — {} ({})", ctx.node_id, ctx.user_id);
+    let tip = match ctx.current_config() {
+        Some(cfg) => format!("Sockcast — {} ({})", cfg.grant.node_id, cfg.grant.user_id),
+        None => "Sockcast — Not Enrolled (Click to Setup)".to_string(),
+    };
     let tip_wide = to_wide(&tip);
     let copy_len = tip_wide.len().min(nid.szTip.len() - 1);
     nid.szTip[..copy_len].copy_from_slice(&tip_wide[..copy_len]);
 
-    Shell_NotifyIconW(NIM_ADD, &nid)
+    Shell_NotifyIconW(if modify { NIM_MODIFY } else { NIM_ADD }, &nid)
 }
 
 unsafe fn remove_tray_icon(hwnd: HWND) {
@@ -357,25 +408,36 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 }
 
 fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
+    let Some(cfg) = ctx.current_config() else {
+        unsafe {
+            show_enroll_window();
+        }
+        return;
+    };
+
     if ctx.status_dialog_open.swap(true, Ordering::SeqCst) {
         return;
     }
     std::thread::spawn(move || {
+        let local_agent = LocalAgentConnector::new(
+            cfg.local_agent_socket.clone(),
+            cfg.key_filter.clone(),
+        );
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
         let keys = match rt {
             Ok(rt) => rt
-                .block_on(ctx.local_agent.list_filtered_keys())
+                .block_on(local_agent.list_filtered_keys())
                 .unwrap_or_default(),
             Err(_) => Vec::new(),
         };
 
         let connected = ctx.connected_count.load(Ordering::Relaxed);
-        let total = ctx.servers.len();
+        let total = cfg.servers.len();
         let force_active = ctx.force_active_flag.load(Ordering::Relaxed);
 
-        let servers_str = ctx.servers.join("\n  • ");
+        let servers_str = cfg.servers.join("\n  • ");
         let keys_str = if keys.is_empty() {
             "  (No local SSH keys currently loaded or matching filter)".to_string()
         } else {
@@ -398,7 +460,7 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
             let title_w = to_wide("Sockcast Workstation Status");
             let instr_w = to_wide(&format!(
                 "Workstation '{}' ({}/{total} coordinators connected)",
-                ctx.node_id, connected
+                cfg.grant.node_id, connected
             ));
             let content_w = to_wide(&format!(
                 "User ID:             {}\n\
@@ -406,8 +468,12 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
                  Config Directory:    {}\n\n\
                  Coordinators:\n  • {}\n\n\
                  Exported Local SSH Keys ({}):\n{}",
-                ctx.user_id,
-                if force_active { "Enabled" } else { "Disabled (Automatic Idle Detection)" },
+                cfg.grant.user_id,
+                if force_active {
+                    "Enabled"
+                } else {
+                    "Disabled (Automatic Idle Detection)"
+                },
                 ctx.config_dir.display(),
                 servers_str,
                 keys.len(),
@@ -459,18 +525,25 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
         return;
     }
 
+    let maybe_cfg = ctx.current_config();
     let connected = ctx.connected_count.load(Ordering::Relaxed);
-    let total = ctx.servers.len();
     let force_active = ctx.force_active_flag.load(Ordering::Relaxed);
 
-    let header_label = to_wide(&format!(
-        "Sockcast: {} ({})",
-        ctx.node_id, ctx.user_id
-    ));
-    let conn_label = to_wide(&format!(
-        "Coordinators: {connected}/{total} connected"
-    ));
+    let header_str = match &maybe_cfg {
+        Some(cfg) => format!("Sockcast: {} ({})", cfg.grant.node_id, cfg.grant.user_id),
+        None => "Sockcast: Workstation Not Enrolled".to_string(),
+    };
+    let conn_str = match &maybe_cfg {
+        Some(cfg) => format!("Coordinators: {connected}/{} connected", cfg.servers.len()),
+        None => "Coordinators: 0/0 connected".to_string(),
+    };
+
+    let header_label = to_wide(&header_str);
+    let conn_label = to_wide(&conn_str);
     let status_label = to_wide("Workstation Status & SSH Keys...");
+    let backends_label = to_wide("Coordinator Backends (Servers)...");
+    let bundle_label = to_wide("Generate Enrollment Bundle (Relay / Client)...");
+    let enroll_label = to_wide("Initialize / Enroll Workstation...");
     let force_label = to_wide("Force Active Workstation");
     let open_cfg_label = to_wide("Open Config Folder");
     let quit_label = to_wide("Quit Sockcast");
@@ -478,12 +551,38 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     AppendMenuW(hmenu, MF_STRING | MF_GRAYED, 0, header_label.as_ptr());
     AppendMenuW(hmenu, MF_STRING | MF_GRAYED, 0, conn_label.as_ptr());
     AppendMenuW(hmenu, MF_SEPARATOR, 0, null());
+
+    let status_flags = if maybe_cfg.is_some() {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED
+    };
     AppendMenuW(
         hmenu,
-        MF_STRING,
+        status_flags,
         IDM_STATUS_DIALOG as usize,
         status_label.as_ptr(),
     );
+    AppendMenuW(
+        hmenu,
+        MF_STRING,
+        IDM_BACKENDS_WINDOW as usize,
+        backends_label.as_ptr(),
+    );
+    AppendMenuW(
+        hmenu,
+        MF_STRING,
+        IDM_BUNDLE_GENERATOR_WINDOW as usize,
+        bundle_label.as_ptr(),
+    );
+    AppendMenuW(
+        hmenu,
+        MF_STRING,
+        IDM_ENROLL_WINDOW as usize,
+        enroll_label.as_ptr(),
+    );
+    AppendMenuW(hmenu, MF_SEPARATOR, 0, null());
+
     let force_flags = if force_active {
         MF_STRING | MF_CHECKED
     } else {
@@ -524,11 +623,21 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
         IDM_STATUS_DIALOG => {
             spawn_status_dialog(Arc::clone(ctx));
         }
+        IDM_BACKENDS_WINDOW => {
+            show_backends_window();
+        }
+        IDM_BUNDLE_GENERATOR_WINDOW => {
+            show_bundle_generator_window();
+        }
+        IDM_ENROLL_WINDOW => {
+            show_enroll_window();
+        }
         IDM_TOGGLE_FORCE_ACTIVE => {
             let prev = ctx.force_active_flag.fetch_xor(true, Ordering::SeqCst);
             tracing::info!("Toggled force_active to {}", !prev);
         }
         IDM_OPEN_CONFIG_DIR => {
+            let _ = std::fs::create_dir_all(&ctx.config_dir);
             let _ = std::process::Command::new("explorer.exe")
                 .arg(&ctx.config_dir)
                 .spawn();
@@ -548,14 +657,11 @@ unsafe extern "system" fn tray_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let maybe_ctx = TRAY_CONTEXT
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().cloned());
+    let maybe_ctx = get_tray_context();
 
     if let Some(ref ctx) = maybe_ctx {
         if ctx.taskbar_created_msg != 0 && msg == ctx.taskbar_created_msg {
-            add_tray_icon(hwnd, ctx);
+            add_or_update_tray_icon(hwnd, ctx, false);
             return 0;
         }
     }
@@ -569,7 +675,11 @@ unsafe extern "system" fn tray_wnd_proc(
                         show_tray_context_menu(hwnd, &ctx);
                     }
                     WM_LBUTTONDBLCLK => {
-                        spawn_status_dialog(ctx);
+                        if ctx.current_config().is_some() {
+                            spawn_status_dialog(ctx);
+                        } else {
+                            show_enroll_window();
+                        }
                     }
                     _ => {}
                 }
@@ -583,6 +693,7 @@ unsafe extern "system" fn tray_wnd_proc(
         }
         WM_DESTROY => {
             remove_tray_icon(hwnd);
+            cleanup_dialog_fonts();
             PostQuitMessage(0);
             0
         }
@@ -592,11 +703,14 @@ unsafe extern "system" fn tray_wnd_proc(
 
 /// Runs the native Win32 System Tray message loop on the main thread while `WorkstationManager`
 /// runs on a background multi-threaded Tokio runtime.
+#[allow(clippy::too_many_arguments)]
 pub fn run_windows_tray_loop(
-    cfg: &ClientConfig,
-    local_agent: Arc<LocalAgentConnector>,
+    config_path: Option<PathBuf>,
+    agent_socket_override: Option<String>,
+    initial_cfg: Option<ClientConfig>,
     force_active_flag: Arc<AtomicBool>,
     connected_count: Arc<AtomicUsize>,
+    reload_tx: watch::Sender<u64>,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -622,24 +736,27 @@ pub fn run_windows_tray_loop(
         };
         RegisterClassW(&wc);
 
+        let is_unconfigured = initial_cfg.is_none();
         let config_dir = default_config_dir().unwrap_or_else(|_| PathBuf::from("."));
         let ctx = Arc::new(TraySharedContext {
-            node_id: cfg.grant.node_id.clone(),
-            user_id: cfg.grant.user_id.clone(),
-            servers: cfg.servers.clone(),
+            config_path,
+            agent_socket_override,
             config_dir,
-            local_agent,
+            active_config: Mutex::new(initial_cfg),
             force_active_flag,
             connected_count,
+            reload_tx,
             shutdown_tx,
             status_dialog_open: AtomicBool::new(false),
             taskbar_created_msg,
             hicon_raw: hicon as isize,
+            tray_hwnd: AtomicIsize::new(0),
         });
 
         if let Ok(mut guard) = TRAY_CONTEXT.lock() {
             *guard = Some(Arc::clone(&ctx));
         }
+        let _ = ctx.reload_tx.send(1);
 
         let hwnd = CreateWindowExW(
             0,
@@ -658,8 +775,13 @@ pub fn run_windows_tray_loop(
         if hwnd.is_null() {
             anyhow::bail!("CreateWindowExW failed for system tray message window");
         }
+        ctx.tray_hwnd.store(hwnd as isize, Ordering::Relaxed);
 
-        add_tray_icon(hwnd, &ctx);
+        add_or_update_tray_icon(hwnd, &ctx, false);
+
+        if is_unconfigured {
+            show_enroll_window();
+        }
 
         let hwnd_raw = hwnd as isize;
         std::thread::spawn(move || {
@@ -680,8 +802,10 @@ pub fn run_windows_tray_loop(
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if !is_any_management_dialog_message(&msg) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
 
         if let Ok(mut guard) = TRAY_CONTEXT.lock() {

@@ -8,6 +8,7 @@ use sockcast_client::local_agent::LocalAgentConnector;
 use sockcast_client::policy::{ApprovalDecision, PolicyEngine};
 use sockcast_client::prompt::{ApprovalPrompter, InteractivePrompter, StaticPrompter};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
@@ -46,59 +47,33 @@ fn main() -> Result<()> {
 
     let args = TrayArgs::parse();
 
-    let mut cfg = match ClientConfig::load(args.config.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            #[cfg(target_os = "windows")]
-            {
-                sockcast_client::win_native::show_tray_error_dialog(
-                    "Sockcast System Tray — Configuration Error",
-                    "Failed to load Sockcast workstation configuration (client.toml)",
-                    &format!(
-                        "{e:#}\n\n\
-                         Enroll this workstation first from a terminal using:\n\
-                         • sockcast-client init --bundle sc1_...\n\
-                         • or sockcast-client grant-client --node <name> --server https://...",
-                    ),
-                );
-            }
-            return Err(e);
+    let mut initial_cfg = ClientConfig::load(args.config.as_deref()).ok();
+    if let Some(ref mut cfg) = initial_cfg {
+        if let Some(ref sock) = args.agent_socket {
+            cfg.local_agent_socket = Some(sock.clone());
         }
-    };
-
-    if let Some(sock) = args.agent_socket {
-        cfg.local_agent_socket = Some(sock);
-    }
-    if args.force_active {
-        cfg.force_active = true;
+        if args.force_active {
+            cfg.force_active = true;
+        }
     }
 
-    let local_agent = Arc::new(LocalAgentConnector::new(
-        cfg.local_agent_socket.clone(),
-        cfg.key_filter.clone(),
-    ));
-    let policy = Arc::new(PolicyEngine::default());
-    let prompter: Arc<dyn ApprovalPrompter> = if args.auto_approve {
-        Arc::new(StaticPrompter::new(ApprovalDecision::ApproveOnce))
-    } else {
-        Arc::new(InteractivePrompter::new())
-    };
+    let initial_force_active = initial_cfg
+        .as_ref()
+        .map(|c| c.force_active)
+        .unwrap_or(args.force_active);
 
+    let force_active_flag = Arc::new(AtomicBool::new(initial_force_active));
+    let connected_count = Arc::new(AtomicUsize::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let manager = Arc::new(WorkstationManager::new(
-        cfg.clone(),
-        Arc::clone(&local_agent),
-        policy,
-        prompter,
-    ));
+    let (reload_tx, mut reload_rx) = watch::channel(0u64);
 
     #[cfg(target_os = "windows")]
     {
-        let force_active_flag = manager.force_active_flag();
-        let connected_count = manager.connected_count();
-        let manager_bg = Arc::clone(&manager);
-        let shutdown_rx_bg = shutdown_rx.clone();
+        let force_active_bg = Arc::clone(&force_active_flag);
+        let connected_bg = Arc::clone(&connected_count);
+        let mut shutdown_rx_bg = shutdown_rx.clone();
         let shutdown_tx_ctrlc = shutdown_tx.clone();
+        let auto_approve = args.auto_approve;
 
         let bg_handle = std::thread::spawn(move || -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -110,15 +85,72 @@ fn main() -> Result<()> {
                         let _ = shutdown_tx_ctrlc.send(true);
                     }
                 });
-                manager_bg.run(shutdown_rx_bg).await
+
+                let policy = Arc::new(PolicyEngine::default());
+                let prompter: Arc<dyn ApprovalPrompter> = if auto_approve {
+                    Arc::new(StaticPrompter::new(ApprovalDecision::ApproveOnce))
+                } else {
+                    Arc::new(InteractivePrompter::new())
+                };
+
+                loop {
+                    if *shutdown_rx_bg.borrow() {
+                        break;
+                    }
+
+                    let maybe_cfg = sockcast_client::win_native::get_tray_context()
+                        .and_then(|ctx| ctx.current_config());
+
+                    if let Some(cfg) = maybe_cfg {
+                        let local_agent = Arc::new(LocalAgentConnector::new(
+                            cfg.local_agent_socket.clone(),
+                            cfg.key_filter.clone(),
+                        ));
+                        let manager = WorkstationManager::with_shared_state(
+                            cfg,
+                            local_agent,
+                            Arc::clone(&policy),
+                            Arc::clone(&prompter),
+                            Arc::clone(&force_active_bg),
+                            Arc::clone(&connected_bg),
+                        );
+
+                        let (mgr_stop_tx, mgr_stop_rx) = watch::channel(false);
+                        let mut mgr_task = tokio::spawn(async move { manager.run(mgr_stop_rx).await });
+
+                        tokio::select! {
+                            _ = shutdown_rx_bg.changed() => {
+                                let _ = mgr_stop_tx.send(true);
+                                let _ = mgr_task.await;
+                                break;
+                            }
+                            _ = reload_rx.changed() => {
+                                tracing::info!("Reloading workstation configuration and reconnecting...");
+                                let _ = mgr_stop_tx.send(true);
+                                let _ = mgr_task.await;
+                            }
+                            _ = &mut mgr_task => {}
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = shutdown_rx_bg.changed() => {
+                                break;
+                            }
+                            _ = reload_rx.changed() => {}
+                        }
+                    }
+                }
+                Ok(())
             })
         });
 
         sockcast_client::win_native::run_windows_tray_loop(
-            &cfg,
-            local_agent,
+            args.config,
+            args.agent_socket,
+            initial_cfg,
             force_active_flag,
             connected_count,
+            reload_tx,
             shutdown_tx,
             shutdown_rx,
         )?;
@@ -129,6 +161,29 @@ fn main() -> Result<()> {
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = reload_tx;
+        let _ = reload_rx.borrow_and_update();
+        let cfg = initial_cfg.ok_or_else(|| {
+            anyhow::anyhow!("failed to load client.toml (run `sockcast-client init` first)")
+        })?;
+        let local_agent = Arc::new(LocalAgentConnector::new(
+            cfg.local_agent_socket.clone(),
+            cfg.key_filter.clone(),
+        ));
+        let policy = Arc::new(PolicyEngine::default());
+        let prompter: Arc<dyn ApprovalPrompter> = if args.auto_approve {
+            Arc::new(StaticPrompter::new(ApprovalDecision::ApproveOnce))
+        } else {
+            Arc::new(InteractivePrompter::new())
+        };
+        let manager = WorkstationManager::with_shared_state(
+            cfg,
+            local_agent,
+            policy,
+            prompter,
+            force_active_flag,
+            connected_count,
+        );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;

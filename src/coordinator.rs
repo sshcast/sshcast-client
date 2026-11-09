@@ -38,6 +38,26 @@ impl WorkstationManager {
         prompter: Arc<dyn ApprovalPrompter>,
     ) -> Self {
         let force_active_flag = Arc::new(AtomicBool::new(cfg.force_active));
+        let connected_count = Arc::new(AtomicUsize::new(0));
+        Self::with_shared_state(
+            cfg,
+            local_agent,
+            policy,
+            prompter,
+            force_active_flag,
+            connected_count,
+        )
+    }
+
+    pub fn with_shared_state(
+        cfg: ClientConfig,
+        local_agent: Arc<LocalAgentConnector>,
+        policy: Arc<PolicyEngine>,
+        prompter: Arc<dyn ApprovalPrompter>,
+        force_active_flag: Arc<AtomicBool>,
+        connected_count: Arc<AtomicUsize>,
+    ) -> Self {
+        connected_count.store(0, Ordering::Relaxed);
         Self {
             cfg,
             local_agent,
@@ -45,7 +65,7 @@ impl WorkstationManager {
             prompter,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             force_active_flag,
-            connected_count: Arc::new(AtomicUsize::new(0)),
+            connected_count,
         }
     }
 

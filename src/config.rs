@@ -34,6 +34,20 @@ pub struct UserKeyFile {
     pub user_privkey_seed_b64: String,
 }
 
+impl UserKeyFile {
+    pub fn load(path: Option<&Path>) -> Result<(PathBuf, Self)> {
+        let p = match path {
+            Some(p) => p.to_path_buf(),
+            None => default_user_key_path()?,
+        };
+        let raw = std::fs::read_to_string(&p)
+            .with_context(|| format!("failed to read user root key {}", p.display()))?;
+        let parsed: Self =
+            toml::from_str(&raw).with_context(|| format!("failed to parse {}", p.display()))?;
+        Ok((p, parsed))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfigFile {
     /// Coordinator server URLs (e.g. ["https://coord1.example.com", "https://coord2.example.com"])
@@ -83,6 +97,35 @@ impl ClientConfigFile {
             force_active: false,
             key_filter: KeyFilterConfig::default(),
         }
+    }
+
+    pub fn load(path: Option<&Path>) -> Result<(PathBuf, Self)> {
+        let cfg_path = match path {
+            Some(p) => p.to_path_buf(),
+            None => default_client_config_path()?,
+        };
+        let raw = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("failed to read client config {}", cfg_path.display()))?;
+        let parsed: Self = toml::from_str(&raw).context("failed to parse client.toml")?;
+        Ok((cfg_path, parsed))
+    }
+
+    pub fn save(&self, path: Option<&Path>) -> Result<PathBuf> {
+        if self.servers.is_empty() {
+            anyhow::bail!("client configuration must specify at least one coordinator server URL");
+        }
+        let cfg_path = match path {
+            Some(p) => p.to_path_buf(),
+            None => default_client_config_path()?,
+        };
+        if let Some(parent) = cfg_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        let toml_str = toml::to_string_pretty(self).context("failed to serialize client.toml")?;
+        std::fs::write(&cfg_path, &toml_str)
+            .with_context(|| format!("failed to write {}", cfg_path.display()))?;
+        Ok(cfg_path)
     }
 }
 
