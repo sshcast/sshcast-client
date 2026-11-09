@@ -1,4 +1,5 @@
 %global debug_package %{nil}
+%global rustflags_codegen_units 16
 
 Name:           sockcast-client
 Version:        0.1.0
@@ -24,10 +25,12 @@ ancestry), and bridges approved requests to the local OS SSH agent.
 %autosetup -n %{name}-%{version}
 
 %build
-cargo build --release --locked
+export CARGO_BUILD_JOBS="${RPM_BUILD_NCPUS:-$(nproc)}"
+cargo build %{?_smp_mflags} --release --locked --bins
 
 %check
-cargo test --release --locked
+export CARGO_BUILD_JOBS="${RPM_BUILD_NCPUS:-$(nproc)}"
+cargo test %{?_smp_mflags} --release --locked
 
 %install
 install -D -m 0755 target/release/sockcast-client %{buildroot}%{_bindir}/sockcast-client
