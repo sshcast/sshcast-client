@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "sockcast-tray",
     version,
-    about = "Sockcast Roaming SSH Agent Windows System Tray Application (No Console Window)"
+    about = "Sockcast Roaming SSH Agent System Tray / Menu Bar Application"
 )]
 struct TrayArgs {
     /// Optional path to `client.toml` (defaults to `~/.config/sockcast/client.toml`)
@@ -67,7 +67,7 @@ fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (reload_tx, mut reload_rx) = watch::channel(0u64);
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let force_active_bg = Arc::clone(&force_active_flag);
         let connected_bg = Arc::clone(&connected_count);
@@ -98,7 +98,11 @@ fn main() -> Result<()> {
                         break;
                     }
 
+                    #[cfg(target_os = "windows")]
                     let maybe_cfg = sockcast_client::win_native::get_tray_context()
+                        .and_then(|ctx| ctx.current_config());
+                    #[cfg(target_os = "macos")]
+                    let maybe_cfg = sockcast_client::mac_native::get_tray_context()
                         .and_then(|ctx| ctx.current_config());
 
                     if let Some(cfg) = maybe_cfg {
@@ -144,7 +148,20 @@ fn main() -> Result<()> {
             })
         });
 
+        #[cfg(target_os = "windows")]
         sockcast_client::win_native::run_windows_tray_loop(
+            args.config,
+            args.agent_socket,
+            initial_cfg,
+            force_active_flag,
+            connected_count,
+            reload_tx,
+            shutdown_tx,
+            shutdown_rx,
+        )?;
+
+        #[cfg(target_os = "macos")]
+        sockcast_client::mac_native::run_macos_tray_loop(
             args.config,
             args.agent_socket,
             initial_cfg,
@@ -159,7 +176,7 @@ fn main() -> Result<()> {
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = reload_tx;
         let _ = reload_rx.borrow_and_update();

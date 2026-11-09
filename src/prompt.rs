@@ -191,8 +191,19 @@ async fn try_native_gui_dialog(
         }
     }
 
-    // Try eframe/egui modal subprocess on non-Windows (or if TaskDialogIndirect was unavailable)
-    #[cfg(all(feature = "gui", not(target_os = "windows")))]
+    // On macOS, prefer the in-process native AppKit NSAlert modal when sockcast-tray's NSApplication loop is running
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(decision) = crate::mac_native::prompt_macos_dialog(details, cancel_rx).await {
+            return Some(decision);
+        }
+    }
+
+    // Try native GUI modal subprocess on macOS (AppKit NSAlert) or Linux (eframe/egui)
+    #[cfg(any(
+        target_os = "macos",
+        all(feature = "gui", not(target_os = "windows"))
+    ))]
     {
         let has_display = if cfg!(target_os = "linux") {
             std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()

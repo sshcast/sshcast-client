@@ -60,6 +60,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" dist/
           cp README.md dist/
           if [ "${{ runner.os }}" = "macOS" ]; then
+            cp "target/${{ matrix.target }}/release/sockcast-tray" dist/
             cp -r macos dist/
           else
             cp -r systemd dist/

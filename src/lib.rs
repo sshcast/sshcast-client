@@ -3,6 +3,10 @@ pub mod coordinator;
 pub mod enroll;
 pub mod gui;
 pub mod local_agent;
+#[cfg(target_os = "macos")]
+pub mod mac_dialogs;
+#[cfg(target_os = "macos")]
+pub mod mac_native;
 pub mod policy;
 pub mod presence;
 pub mod prompt;

@@ -3,9 +3,10 @@
 Cross-platform Workstation GUI & Enrollment CLI for the **Sockcast** Roaming SSH Agent architecture.
 
 ## Key Features
-- **Native Desktop Approval UI & Windows System Tray (`src/win_native.rs`, `src/gui.rs`):**
-  - **Windows (`sockcast-tray.exe` + `TaskDialogIndirect`):** Pure GUI-subsystem tray application (`windows_subsystem = "windows"`, zero console window) sitting in the Windows System Tray (`Shell_NotifyIconW`) with a native context menu, plus native Win32 `TaskDialogIndirect` (`comctl32.dll` v6) Command-Link approval dialogs.
-  - **Linux / macOS (`eframe`/`egui` + native dialogs):** Renders a native approval modal displaying the cryptographically verified source hostname, RFC 4252 target SSH username, primary tool & command, 6-level `/proc` process ancestry tree, working directory, and SSH key fingerprint.
+- **Native Desktop Approval UI & System Tray / Menu Bar (`src/win_native.rs`, `src/mac_native.rs`, `src/gui.rs`):**
+  - **Windows (`sockcast-tray.exe` + `TaskDialogIndirect`):** Pure GUI-subsystem tray application (`windows_subsystem = "windows"`, zero console window) sitting in the Windows System Tray (`Shell_NotifyIconW`) with a native context menu, Win32 management dialogs (`src/win_dialogs.rs`), and `TaskDialogIndirect` (`comctl32.dll` v6) Command-Link approval dialogs.
+  - **macOS (`sockcast-tray` + `objc2-app-kit`):** Native AppKit Menu Bar application (`NSStatusBar`, `NSApplicationActivationPolicy::Accessory` — no Dock icon) with an SF Symbol shield menu bar icon, native `NSWindow` management dialogs (`src/mac_dialogs.rs`), and native `NSAlert` approval modals with custom monospaced accessory views.
+  - **Linux (`eframe`/`egui` + native dialogs):** Renders a native approval modal displaying the cryptographically verified source hostname, RFC 4252 target SSH username, primary tool & command, 6-level `/proc` process ancestry tree, working directory, and SSH key fingerprint.
   - Supports 4 one-click actions:
     1. **`[Approve Once]`**: Signs this single request.
     2. **`[Approve <tool> on <host> for 15m]`**: Caches an in-memory session rule matching `(verified_host, caller_tool, key_blob, target_ssh_user)` for 15 minutes.
@@ -45,11 +46,14 @@ tito build --test --rpm -o /tmp/tito-sockcast-client
 systemctl --user enable --now sockcast-client.service
 ```
 
-### macOS (`launchd` User Agent)
+### macOS (Menu Bar App & `launchd` User Agent)
 - Connects automatically to `$SSH_AUTH_SOCK` (Apple `ssh-agent`, 1Password, Secretive, YubiKey) and reports idle time via `IOHIDSystem` (`HIDIdleTime`).
+- Builds two binaries on macOS:
+  - `sockcast-client`: CLI for `keygen`, `grant-client`, `grant-relay`, `init`, `list-keys`, and `run`.
+  - `sockcast-tray`: Native AppKit Menu Bar daemon (`objc2-app-kit`) with full GUI windows for workstation enrollment, signed bundle generation, coordinator backend management, and `NSAlert` signature approval modals.
 ```bash
 cargo build --release --locked
-sudo cp target/release/sockcast-client /usr/local/bin/
+sudo cp target/release/sockcast-client target/release/sockcast-tray /usr/local/bin/
 ./macos/install-macos-agent.sh
 ```
 

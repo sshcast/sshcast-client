@@ -38,6 +38,74 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(not(windows))'.dependencies]
 eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "bitflags",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "NSAlert",
+    "NSAppearance",
+    "NSApplication",
+    "NSBox",
+    "NSButton",
+    "NSButtonCell",
+    "NSCell",
+    "NSColor",
+    "NSColorSpace",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSImage",
+    "NSImageCell",
+    "NSImageView",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPanel",
+    "NSPasteboard",
+    "NSPopUpButton",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSScrollView",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSText",
+    "NSTextField",
+    "NSTextFieldCell",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSAttributedString",
+    "NSDate",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSGeometry",
+    "NSNotification",
+    "NSObjCRuntime",
+    "NSObject",
+    "NSProcessInfo",
+    "NSRange",
+    "NSRunLoop",
+    "NSString",
+    "NSTimer",
+    "NSThread",
+    "NSURL",
+    "objc2-core-foundation",
+] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

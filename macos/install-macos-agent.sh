@@ -3,10 +3,10 @@ set -euo pipefail
 
 PLIST_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/io.sockcast.client.plist"
 PLIST_DST="${HOME}/Library/LaunchAgents/io.sockcast.client.plist"
-BIN_PATH="$(command -v sockcast-client || echo "/usr/local/bin/sockcast-client")"
+BIN_PATH="$(command -v sockcast-tray || echo "/usr/local/bin/sockcast-tray")"
 
 mkdir -p "${HOME}/Library/LaunchAgents"
-sed "s|/usr/local/bin/sockcast-client|${BIN_PATH}|g" "${PLIST_SRC}" > "${PLIST_DST}"
+sed "s|/usr/local/bin/sockcast-tray|${BIN_PATH}|g" "${PLIST_SRC}" > "${PLIST_DST}"
 
 launchctl unload "${PLIST_DST}" 2>/dev/null || true
 launchctl load -w "${PLIST_DST}"

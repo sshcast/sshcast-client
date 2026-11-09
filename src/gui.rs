@@ -1,17 +1,18 @@
-#[cfg(all(feature = "gui", not(target_os = "windows")))]
+#[cfg(all(feature = "gui", not(any(target_os = "windows", target_os = "macos"))))]
 use eframe::egui;
 
 use crate::policy::ApprovalDecision;
 use crate::prompt::PromptDetails;
 
-/// Runs a native `eframe`/`egui` approval modal window in a fresh child process
+/// Runs a native approval modal window in a fresh child process
 /// (invoked via `sockcast-client internal-gui-prompt --payload-json <json>`),
 /// printing the chosen `ApprovalDecision` token (`ONCE`, `TOOL_15M`, `HOST_15M`, `DENY`) to stdout.
-///
-/// Running the GUI modal in a dedicated child process guarantees:
-/// 1. Clean cross-platform window lifecycle (`eframe::run_native` can be opened and closed repeatedly across requests).
-/// 2. Instantaneous window dismissal if a `CancelSignRequest` arrives from `sockcast-server` while the user is looking at the prompt.
-#[cfg(all(feature = "gui", not(target_os = "windows")))]
+#[cfg(target_os = "macos")]
+pub fn run_egui_modal_process(details: PromptDetails) -> anyhow::Result<ApprovalDecision> {
+    Ok(crate::mac_native::run_macos_modal_process(details))
+}
+
+#[cfg(all(feature = "gui", not(any(target_os = "windows", target_os = "macos"))))]
 pub fn run_egui_modal_process(details: PromptDetails) -> anyhow::Result<ApprovalDecision> {
     use std::sync::{Arc, Mutex};
 
@@ -44,18 +45,21 @@ pub fn run_egui_modal_process(details: PromptDetails) -> anyhow::Result<Approval
     Ok(final_decision)
 }
 
-#[cfg(not(all(feature = "gui", not(target_os = "windows"))))]
+#[cfg(not(any(
+    target_os = "macos",
+    all(feature = "gui", not(target_os = "windows"))
+)))]
 pub fn run_egui_modal_process(_details: PromptDetails) -> anyhow::Result<ApprovalDecision> {
     anyhow::bail!("compiled without 'gui' (eframe/egui) feature")
 }
 
-#[cfg(all(feature = "gui", not(target_os = "windows")))]
+#[cfg(all(feature = "gui", not(any(target_os = "windows", target_os = "macos"))))]
 struct ApprovalModalApp {
     details: PromptDetails,
     chosen: std::sync::Arc<std::sync::Mutex<ApprovalDecision>>,
 }
 
-#[cfg(all(feature = "gui", not(target_os = "windows")))]
+#[cfg(all(feature = "gui", not(any(target_os = "windows", target_os = "macos"))))]
 impl eframe::App for ApprovalModalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
