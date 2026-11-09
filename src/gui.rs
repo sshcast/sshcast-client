@@ -1,4 +1,4 @@
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(target_os = "windows")))]
 use eframe::egui;
 
 use crate::policy::ApprovalDecision;
@@ -11,7 +11,7 @@ use crate::prompt::PromptDetails;
 /// Running the GUI modal in a dedicated child process guarantees:
 /// 1. Clean cross-platform window lifecycle (`eframe::run_native` can be opened and closed repeatedly across requests).
 /// 2. Instantaneous window dismissal if a `CancelSignRequest` arrives from `sockcast-server` while the user is looking at the prompt.
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(target_os = "windows")))]
 pub fn run_egui_modal_process(details: PromptDetails) -> anyhow::Result<ApprovalDecision> {
     use std::sync::{Arc, Mutex};
 
@@ -44,18 +44,18 @@ pub fn run_egui_modal_process(details: PromptDetails) -> anyhow::Result<Approval
     Ok(final_decision)
 }
 
-#[cfg(not(feature = "gui"))]
+#[cfg(not(all(feature = "gui", not(target_os = "windows"))))]
 pub fn run_egui_modal_process(_details: PromptDetails) -> anyhow::Result<ApprovalDecision> {
     anyhow::bail!("compiled without 'gui' (eframe/egui) feature")
 }
 
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(target_os = "windows")))]
 struct ApprovalModalApp {
     details: PromptDetails,
     chosen: std::sync::Arc<std::sync::Mutex<ApprovalDecision>>,
 }
 
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(target_os = "windows")))]
 impl eframe::App for ApprovalModalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

@@ -34,6 +34,8 @@ toml = "0.8"
 tonic = { version = "0.12", features = ["transport", "tls", "tls-native-roots", "tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(not(windows))'.dependencies]
 eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 
 [target.'cfg(windows)'.dependencies]
