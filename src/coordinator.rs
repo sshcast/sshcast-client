@@ -341,10 +341,7 @@ async fn run_single_coordinator_stream(
                         zellij_hub.update_host_list(list).await;
                     }
                     Some(ServerPayload::ZellijFrame(z_frame)) => {
-                        let hub = Arc::clone(zellij_hub);
-                        tokio::spawn(async move {
-                            hub.handle_incoming_frame(z_frame).await;
-                        });
+                        zellij_hub.handle_incoming_frame(z_frame).await;
                     }
                     None => {}
                 }

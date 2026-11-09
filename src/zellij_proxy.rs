@@ -307,28 +307,48 @@ impl ZellijProxyHub {
             let Ok(addr) = cand.parse::<SocketAddr>() else {
                 continue;
             };
-            if tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr))
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false)
-            {
-                let canonical_id = answer_frame.relay_node_id.clone();
-                let peer = DirectP2pPeer {
-                    addr,
-                    client_auth_token,
-                    relay_auth_token,
-                    cipher_key,
-                };
-                tracing::info!(
-                    "Established direct STUN/P2P channel to relay '{}' at {}",
-                    canonical_id,
-                    addr
-                );
-                let mut guard = self.direct_peers.write().await;
-                guard.insert(canonical_id.clone(), peer.clone());
-                guard.insert(relay_node_id.to_string(), peer);
-                return Ok(());
+            let Ok(Ok(mut probe_stream)) =
+                tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await
+            else {
+                continue;
+            };
+
+            let mut c2r_cipher = P2pStreamCipher::new(cipher_key, b"c2r");
+            let mut r2c_cipher = P2pStreamCipher::new(cipher_key, b"r2c");
+            let mut auth_out = client_auth_token;
+            c2r_cipher.apply_keystream(&mut auth_out);
+            if probe_stream.write_all(&auth_out).await.is_err() {
+                continue;
             }
+            let mut auth_in = [0u8; 32];
+            let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(600), probe_stream.read_exact(&mut auth_in))
+                    .await
+            else {
+                continue;
+            };
+            r2c_cipher.apply_keystream(&mut auth_in);
+            if auth_in != relay_auth_token {
+                continue;
+            }
+            let _ = probe_stream.shutdown().await;
+
+            let canonical_id = answer_frame.relay_node_id.clone();
+            let peer = DirectP2pPeer {
+                addr,
+                client_auth_token,
+                relay_auth_token,
+                cipher_key,
+            };
+            tracing::info!(
+                "Established direct STUN/P2P channel to relay '{}' at {}",
+                canonical_id,
+                addr
+            );
+            let mut guard = self.direct_peers.write().await;
+            guard.insert(canonical_id.clone(), peer.clone());
+            guard.insert(relay_node_id.to_string(), peer);
+            return Ok(());
         }
 
         anyhow::bail!("no TCP candidate reachable")
@@ -413,7 +433,7 @@ impl ZellijProxyHub {
         mut browser_stream: TcpStream,
     ) -> Result<()> {
         let tunnel_id = self.next_tunnel_id("zjt");
-        let (in_tx, mut in_rx) = mpsc::channel::<ZellijTunnelFrame>(128);
+        let (in_tx, mut in_rx) = mpsc::channel::<ZellijTunnelFrame>(1024);
         self.active_tunnels
             .lock()
             .await
@@ -482,26 +502,13 @@ impl ZellijProxyHub {
                     }
                 }
             }
-            let close_frame = ZellijTunnelFrame {
-                tunnel_id: tunnel_id_wr,
-                relay_node_id: relay_id_wr,
-                client_node_id: client_id_wr,
-                frame_type: ZellijFrameType::Close as i32,
-                payload: Vec::new(),
-                error_message: String::new(),
-                sender_grant: None,
-                sender_signature: Vec::new(),
-            };
-            let _ = hub_for_write
-                .send_to_coordinator(ClientStreamMessage {
-                    payload: Some(ClientPayload::ZellijFrame(close_frame)),
-                })
-                .await;
         });
 
         let mut received_any_data = false;
+        let mut closed_by_relay = false;
         while let Some(frame) = in_rx.recv().await {
             if frame.frame_type == ZellijFrameType::Close as i32 {
+                closed_by_relay = true;
                 if !received_any_data && !frame.error_message.is_empty() {
                     let body = format!(
                         "<!doctype html><html><body style=\"font-family:sans-serif;background:#0f172a;color:#f8fafc;padding:2rem;\"><h2>Zellij Web Tunnel Error</h2><p>{}</p><p><a href=\"http://localhost:{}/\" style=\"color:#38bdf8;\">&larr; Back to Sockcast Zellij Dashboard</a></p></body></html>",
@@ -528,6 +535,23 @@ impl ZellijProxyHub {
         let _ = b_wr.shutdown().await;
         b2r_task.abort();
         self.active_tunnels.lock().await.remove(&tunnel_id);
+        if !closed_by_relay {
+            let close_frame = ZellijTunnelFrame {
+                tunnel_id,
+                relay_node_id: relay_node_id.to_string(),
+                client_node_id: self.cfg.grant.node_id.clone(),
+                frame_type: ZellijFrameType::Close as i32,
+                payload: Vec::new(),
+                error_message: String::new(),
+                sender_grant: None,
+                sender_signature: Vec::new(),
+            };
+            let _ = self
+                .send_to_coordinator(ClientStreamMessage {
+                    payload: Some(ClientPayload::ZellijFrame(close_frame)),
+                })
+                .await;
+        }
         Ok(())
     }
 
