@@ -5,6 +5,15 @@ edition = "2021"
 description = "Sockcast Roaming SSH Agent Workstation Client & Enrollment CLI"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/theraphim/sockcast-client"
+default-run = "sockcast-client"
+
+[[bin]]
+name = "sockcast-client"
+path = "src/main.rs"
+
+[[bin]]
+name = "sockcast-tray"
+path = "src/bin/sockcast-tray.rs"
 
 [dependencies]
 anyhow = "1"
@@ -26,6 +35,17 @@ tonic = { version = "0.12", features = ["transport", "tls", "tls-native-roots", 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 default = ["gui"]

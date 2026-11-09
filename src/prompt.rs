@@ -108,9 +108,11 @@ impl ApprovalPrompter for StaticPrompter {
 
 /// Interactive desktop & terminal prompter:
 /// 1. Fires a desktop notification (`notify-send`) if available.
-/// 2. If a native desktop dialog helper (`zenity` or `kdialog` on Linux, `osascript` on macOS) is available,
-///    pops a native GUI modal window and automatically kills the modal if `CancelSignRequest` arrives!
-/// 3. Otherwise renders a rich interactive terminal modal on stderr/stdin.
+/// 2. On Windows, displays a native Win32 `TaskDialogIndirect` (`comctl32.dll` v6) modal with Command-Link buttons
+///    and automatic `CancelSignRequest` dismissal.
+/// 3. On Linux/macOS, displays an `eframe`/`egui` modal or native desktop dialog (`zenity` / `osascript`)
+///    and automatically kills the modal if `CancelSignRequest` arrives!
+/// 4. Otherwise renders a rich interactive terminal modal on stderr/stdin.
 #[derive(Default)]
 pub struct InteractivePrompter {
     prompt_lock: Arc<tokio::sync::Mutex<()>>,
@@ -181,8 +183,16 @@ async fn try_native_gui_dialog(
     details: &PromptDetails,
     cancel_rx: &mut watch::Receiver<Option<String>>,
 ) -> Option<ApprovalDecision> {
-    // 1. Try native eframe/egui modal window first if compiled with `gui` feature and a display is available
-    #[cfg(feature = "gui")]
+    // On Windows, prefer the in-process native Win32 TaskDialogIndirect (comctl32 v6) with Command-Link buttons
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(decision) = crate::win_native::prompt_task_dialog(details, cancel_rx).await {
+            return Some(decision);
+        }
+    }
+
+    // Try eframe/egui modal subprocess on non-Windows (or if TaskDialogIndirect was unavailable)
+    #[cfg(all(feature = "gui", not(target_os = "windows")))]
     {
         let has_display = if cfg!(target_os = "linux") {
             std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -197,11 +207,6 @@ async fn try_native_gui_dialog(
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::null())
                         .kill_on_drop(true);
-                    #[cfg(target_os = "windows")]
-                    {
-                        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                        cmd.creation_flags(CREATE_NO_WINDOW);
-                    }
                     if let Ok(mut child) = cmd.spawn() {
                         if let Some(mut stdout) = child.stdout.take() {
                             let egui_res = tokio::select! {
@@ -388,11 +393,18 @@ async fn try_native_gui_dialog(
         );
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut cmd = Command::new("powershell");
-        cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &ps_script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
         let mut child = cmd.spawn().ok()?;
         let mut stdout = child.stdout.take()?;
 

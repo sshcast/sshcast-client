@@ -71,7 +71,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination dist/
+          Copy-Item "target/${{ matrix.target }}/release/sockcast-client.exe" -Destination dist/
+          Copy-Item "target/${{ matrix.target }}/release/sockcast-tray.exe" -Destination dist/
           Copy-Item README.md -Destination dist/
           Copy-Item -Recurse windows -Destination dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive_name }}" -Force

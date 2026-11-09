@@ -6,3 +6,5 @@ pub mod local_agent;
 pub mod policy;
 pub mod presence;
 pub mod prompt;
+#[cfg(target_os = "windows")]
+pub mod win_native;

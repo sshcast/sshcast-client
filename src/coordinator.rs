@@ -7,6 +7,7 @@ use sockcast_proto::v1::{
     ClientStreamMessage, SignAck, SignRequest, SignResponse, WorkstationStatus,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch, Mutex};
@@ -25,6 +26,8 @@ pub struct WorkstationManager {
     policy: Arc<PolicyEngine>,
     prompter: Arc<dyn ApprovalPrompter>,
     cancellations: Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
+    force_active_flag: Arc<AtomicBool>,
+    connected_count: Arc<AtomicUsize>,
 }
 
 impl WorkstationManager {
@@ -34,13 +37,24 @@ impl WorkstationManager {
         policy: Arc<PolicyEngine>,
         prompter: Arc<dyn ApprovalPrompter>,
     ) -> Self {
+        let force_active_flag = Arc::new(AtomicBool::new(cfg.force_active));
         Self {
             cfg,
             local_agent,
             policy,
             prompter,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            force_active_flag,
+            connected_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn force_active_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.force_active_flag)
+    }
+
+    pub fn connected_count(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.connected_count)
     }
 
     /// Maintains persistent bidirectional `ConnectWorkstation` gRPC streams to all configured
@@ -54,6 +68,8 @@ impl WorkstationManager {
             let policy = Arc::clone(&self.policy);
             let prompter = Arc::clone(&self.prompter);
             let cancellations = Arc::clone(&self.cancellations);
+            let force_active_flag = Arc::clone(&self.force_active_flag);
+            let connected_count = Arc::clone(&self.connected_count);
             let mut shutdown = shutdown_rx.clone();
 
             handles.push(tokio::spawn(async move {
@@ -72,6 +88,8 @@ impl WorkstationManager {
                         &policy,
                         &prompter,
                         &cancellations,
+                        &force_active_flag,
+                        &connected_count,
                         shutdown.clone(),
                     )
                     .await;
@@ -114,6 +132,22 @@ impl WorkstationManager {
     }
 }
 
+struct ConnectedGuard<'a>(&'a AtomicUsize);
+
+impl<'a> ConnectedGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ConnectedGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_single_coordinator_stream(
     server_url: &str,
     cfg: &ClientConfig,
@@ -121,6 +155,8 @@ async fn run_single_coordinator_stream(
     policy: &Arc<PolicyEngine>,
     prompter: &Arc<dyn ApprovalPrompter>,
     cancellations: &Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
+    force_active_flag: &Arc<AtomicBool>,
+    connected_count: &Arc<AtomicUsize>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let endpoint = Endpoint::new(server_url.to_string())
@@ -143,7 +179,8 @@ async fn run_single_coordinator_stream(
     .await?;
 
     // 2. Immediately push initial WorkstationStatus (including local filtered public keys)
-    let initial_status = build_workstation_status(cfg, local_agent).await;
+    let initial_status =
+        build_workstation_status(local_agent, force_active_flag.load(Ordering::Relaxed)).await;
     tx.send(ClientStreamMessage {
         payload: Some(ClientPayload::Status(initial_status)),
     })
@@ -154,6 +191,8 @@ async fn run_single_coordinator_stream(
         .await
         .with_context(|| format!("ConnectWorkstation RPC failed on {server_url}"))?;
     let mut inbound = response.into_inner();
+
+    let _conn_guard = ConnectedGuard::new(connected_count);
 
     tracing::info!(
         "Connected workstation '{}' to coordinator {}",
@@ -175,7 +214,11 @@ async fn run_single_coordinator_stream(
                 }
             }
             _ = heartbeat_ticker.tick() => {
-                let status = build_workstation_status(cfg, local_agent).await;
+                let status = build_workstation_status(
+                    local_agent,
+                    force_active_flag.load(Ordering::Relaxed),
+                )
+                .await;
                 if tx.send(ClientStreamMessage {
                     payload: Some(ClientPayload::Status(status)),
                 }).await.is_err() {
@@ -251,13 +294,13 @@ async fn run_single_coordinator_stream(
 }
 
 async fn build_workstation_status(
-    cfg: &ClientConfig,
     local_agent: &LocalAgentConnector,
+    force_active: bool,
 ) -> WorkstationStatus {
     let keys = local_agent.list_filtered_keys().await.unwrap_or_default();
     WorkstationStatus {
         last_input_epoch_ms: query_last_input_epoch_ms(),
-        force_active: cfg.force_active,
+        force_active,
         os: current_os_name().to_string(),
         keys,
     }
