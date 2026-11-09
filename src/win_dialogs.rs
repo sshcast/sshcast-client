@@ -6,11 +6,12 @@ use std::sync::Mutex;
 use sockcast_proto::bundle::EnrollmentBundle;
 use sockcast_proto::v1::NodeRole;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, S_OK, WPARAM};
+use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, S_OK, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, GetDC, GetDeviceCaps, GetSysColorBrush, ReleaseDC,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET, DEFAULT_PITCH,
-    FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HFONT, LOGPIXELSX, OUT_DEFAULT_PRECIS,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
+    GetDeviceCaps, InvalidateRect, ReleaseDC, SetBkColor, SetBkMode, SetTextColor,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL,
+    FW_SEMIBOLD, HBRUSH, HDC, HFONT, LOGPIXELSX, OPAQUE, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
@@ -23,12 +24,13 @@ use windows_sys::Win32::UI::Controls::{
     TD_WARNING_ICON,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, GetSystemMetrics,
-    GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsWindow, LoadCursorW, LoadIconW,
-    RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, IDC_ARROW,
-    IDI_SHIELD, IDYES, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_GROUP,
-    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DrawIconEx, GetClientRect,
+    GetDlgCtrlID, GetDlgItem, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW,
+    IsDialogMessageW, IsWindow, LoadCursorW, LoadIconW, RegisterClassW, SendMessageW,
+    SetForegroundWindow, SetWindowTextW, ShowWindow, DI_NORMAL, IDC_ARROW, IDI_SHIELD, IDYES, MSG,
+    SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_ERASEBKGND, WM_PAINT, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
@@ -37,15 +39,16 @@ use crate::enroll::{
 };
 use crate::win_native::{show_tray_error_dialog, TraySharedContext};
 
-const ES_MULTILINE: u32 = 0x0004;
-const ES_AUTOVSCROLL: u32 = 0x0040;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 const ES_READONLY: u32 = 0x0800;
 
 const BS_PUSHBUTTON: u32 = 0x0000;
-const BS_DEFPUSHBUTTON: u32 = 0x0001;
-const BS_GROUPBOX: u32 = 0x0007;
 const BS_AUTORADIOBUTTON: u32 = 0x0009;
+const BS_COMMANDLINK: u32 = 0x000E;
+const BS_DEFCOMMANDLINK: u32 = 0x000F;
+
+const BCM_SETNOTE: u32 = 0x1609;
+const EM_SETCUEBANNER: u32 = 0x1501;
 
 const LBS_NOTIFY: u32 = 0x0001;
 const LB_ADDSTRING: u32 = 0x0180;
@@ -63,10 +66,22 @@ const BM_SETCHECK: u32 = 0x00F1;
 const BST_CHECKED: usize = 1;
 const BN_CLICKED: u32 = 0;
 
+const WM_CTLCOLORBTN: u32 = 0x0135;
+const WM_CTLCOLORSTATIC: u32 = 0x0138;
+
 const CF_UNICODETEXT: u32 = 13;
 
+// Special control ID ranges for styling in WM_CTLCOLORSTATIC
+const ID_STYLE_MAIN_HEADER: i32 = 1900;
+const ID_STYLE_SECTION_HEADER_1: i32 = 1901;
+const ID_STYLE_SECTION_HEADER_2: i32 = 1902;
+const ID_STYLE_SECTION_HEADER_3: i32 = 1903;
+const ID_STYLE_FOOTER_STATUS: i32 = 1910;
+const ID_STYLE_READONLY_CODE_MIN: i32 = 1950;
+const ID_STYLE_READONLY_CODE_MAX: i32 = 1959;
+
 // Control IDs for Initialize / Enroll Window
-const ID_ENROLL_ROOT_KEY_EDIT: i32 = 2001;
+const ID_ENROLL_ROOT_KEY_EDIT: i32 = 1951;
 const ID_ENROLL_BTN_KEYGEN: i32 = 2002;
 const ID_ENROLL_BTN_COPY_PUBKEY: i32 = 2003;
 const ID_ENROLL_NODE_EDIT: i32 = 2004;
@@ -75,11 +90,10 @@ const ID_ENROLL_BTN_ENROLL_PRIMARY: i32 = 2006;
 const ID_ENROLL_BTN_PASTE_BUNDLE: i32 = 2007;
 const ID_ENROLL_BUNDLE_EDIT: i32 = 2008;
 const ID_ENROLL_BTN_INIT_BUNDLE: i32 = 2009;
-const ID_ENROLL_STATUS_LABEL: i32 = 2010;
 const ID_ENROLL_BTN_CLOSE: i32 = 2011;
 
 // Control IDs for Bundle Generator Window
-const ID_BUNDLE_ROOT_PUBKEY_EDIT: i32 = 3001;
+const ID_BUNDLE_ROOT_PUBKEY_EDIT: i32 = 1952;
 const ID_BUNDLE_BTN_KEYGEN: i32 = 3002;
 const ID_BUNDLE_BTN_COPY_PUBKEY: i32 = 3003;
 const ID_BUNDLE_RADIO_RELAY: i32 = 3004;
@@ -88,11 +102,10 @@ const ID_BUNDLE_NODE_EDIT: i32 = 3006;
 const ID_BUNDLE_EXPIRES_EDIT: i32 = 3007;
 const ID_BUNDLE_SERVERS_EDIT: i32 = 3008;
 const ID_BUNDLE_BTN_GENERATE: i32 = 3009;
-const ID_BUNDLE_TOKEN_OUT_EDIT: i32 = 3010;
+const ID_BUNDLE_TOKEN_OUT_EDIT: i32 = 1953;
 const ID_BUNDLE_BTN_COPY_TOKEN: i32 = 3011;
-const ID_BUNDLE_CMD_OUT_EDIT: i32 = 3012;
+const ID_BUNDLE_CMD_OUT_EDIT: i32 = 1954;
 const ID_BUNDLE_BTN_COPY_CMD: i32 = 3013;
-const ID_BUNDLE_STATUS_LABEL: i32 = 3014;
 const ID_BUNDLE_BTN_CLOSE: i32 = 3015;
 
 // Control IDs for Coordinator Backends Window
@@ -101,25 +114,53 @@ const ID_BACKENDS_BTN_REMOVE: i32 = 4002;
 const ID_BACKENDS_ADD_EDIT: i32 = 4003;
 const ID_BACKENDS_BTN_ADD: i32 = 4004;
 const ID_BACKENDS_BTN_SAVE: i32 = 4005;
-const ID_BACKENDS_STATUS_LABEL: i32 = 4006;
 const ID_BACKENDS_BTN_CLOSE: i32 = 4007;
 
-struct DialogHandles {
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+const COLOR_WHITE: COLORREF = rgb(255, 255, 255);
+const COLOR_TASKDIALOG_BLUE: COLORREF = rgb(0, 51, 153);
+const COLOR_SECTION_TITLE: COLORREF = rgb(15, 23, 42);
+const COLOR_LABEL_TEXT: COLORREF = rgb(71, 85, 105);
+const COLOR_CODE_BG: COLORREF = rgb(246, 248, 250);
+const COLOR_CODE_TEXT: COLORREF = rgb(15, 23, 42);
+const COLOR_FOOTER_BG: COLORREF = rgb(242, 243, 245);
+const COLOR_FOOTER_TEXT: COLORREF = rgb(51, 65, 85);
+const COLOR_DIVIDER: COLORREF = rgb(226, 232, 240);
+const COLOR_FOOTER_BORDER: COLORREF = rgb(212, 216, 222);
+
+const FOOTER_HEIGHT_96DPI: i32 = 54;
+
+struct DialogResources {
     enroll_hwnd: isize,
     bundle_hwnd: isize,
     backends_hwnd: isize,
+    font_title: isize,
+    font_section: isize,
     font_ui: isize,
-    font_bold: isize,
     font_mono: isize,
+    brush_white: isize,
+    brush_code_bg: isize,
+    brush_footer_bg: isize,
+    brush_divider: isize,
+    brush_footer_border: isize,
 }
 
-static DIALOG_HANDLES: Mutex<DialogHandles> = Mutex::new(DialogHandles {
+static DIALOG_RES: Mutex<DialogResources> = Mutex::new(DialogResources {
     enroll_hwnd: 0,
     bundle_hwnd: 0,
     backends_hwnd: 0,
+    font_title: 0,
+    font_section: 0,
     font_ui: 0,
-    font_bold: 0,
     font_mono: 0,
+    brush_white: 0,
+    brush_code_bg: 0,
+    brush_footer_bg: 0,
+    brush_divider: 0,
+    brush_footer_border: 0,
 });
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -140,16 +181,26 @@ fn scale_px(px: i32, dpi: i32) -> i32 {
     (px * dpi + 48) / 96
 }
 
-unsafe fn ensure_dialog_fonts(dpi: i32) -> (HFONT, HFONT, HFONT) {
-    let mut guard = DIALOG_HANDLES.lock().unwrap();
-    if guard.font_ui == 0 {
+struct ThemeAssets {
+    font_title: HFONT,
+    font_section: HFONT,
+    font_ui: HFONT,
+    font_mono: HFONT,
+    brush_white: HBRUSH,
+    brush_code_bg: HBRUSH,
+    brush_footer_bg: HBRUSH,
+    brush_divider: HBRUSH,
+    brush_footer_border: HBRUSH,
+}
+
+unsafe fn ensure_theme_assets(dpi: i32) -> ThemeAssets {
+    let mut g = DIALOG_RES.lock().unwrap();
+    if g.font_ui == 0 {
         let segoe = to_wide("Segoe UI");
         let consolas = to_wide("Consolas");
-        let ui_height = -scale_px(15, dpi);
-        let mono_height = -scale_px(14, dpi);
 
-        let f_ui = CreateFontW(
-            ui_height,
+        g.font_title = CreateFontW(
+            -scale_px(20, dpi),
             0,
             0,
             0,
@@ -163,9 +214,10 @@ unsafe fn ensure_dialog_fonts(dpi: i32) -> (HFONT, HFONT, HFONT) {
             CLEARTYPE_QUALITY as u32,
             (DEFAULT_PITCH | FF_DONTCARE) as u32,
             segoe.as_ptr(),
-        );
-        let f_bold = CreateFontW(
-            ui_height,
+        ) as isize;
+
+        g.font_section = CreateFontW(
+            -scale_px(15, dpi),
             0,
             0,
             0,
@@ -179,9 +231,27 @@ unsafe fn ensure_dialog_fonts(dpi: i32) -> (HFONT, HFONT, HFONT) {
             CLEARTYPE_QUALITY as u32,
             (DEFAULT_PITCH | FF_DONTCARE) as u32,
             segoe.as_ptr(),
-        );
-        let f_mono = CreateFontW(
-            mono_height,
+        ) as isize;
+
+        g.font_ui = CreateFontW(
+            -scale_px(14, dpi),
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            segoe.as_ptr(),
+        ) as isize;
+
+        g.font_mono = CreateFontW(
+            -scale_px(14, dpi),
             0,
             0,
             0,
@@ -195,38 +265,65 @@ unsafe fn ensure_dialog_fonts(dpi: i32) -> (HFONT, HFONT, HFONT) {
             CLEARTYPE_QUALITY as u32,
             (DEFAULT_PITCH | FF_DONTCARE) as u32,
             consolas.as_ptr(),
-        );
-        guard.font_ui = f_ui as isize;
-        guard.font_bold = f_bold as isize;
-        guard.font_mono = f_mono as isize;
+        ) as isize;
+
+        g.brush_white = CreateSolidBrush(COLOR_WHITE) as isize;
+        g.brush_code_bg = CreateSolidBrush(COLOR_CODE_BG) as isize;
+        g.brush_footer_bg = CreateSolidBrush(COLOR_FOOTER_BG) as isize;
+        g.brush_divider = CreateSolidBrush(COLOR_DIVIDER) as isize;
+        g.brush_footer_border = CreateSolidBrush(COLOR_FOOTER_BORDER) as isize;
     }
-    (
-        guard.font_ui as HFONT,
-        guard.font_bold as HFONT,
-        guard.font_mono as HFONT,
-    )
+
+    ThemeAssets {
+        font_title: g.font_title as HFONT,
+        font_section: g.font_section as HFONT,
+        font_ui: g.font_ui as HFONT,
+        font_mono: g.font_mono as HFONT,
+        brush_white: g.brush_white as HBRUSH,
+        brush_code_bg: g.brush_code_bg as HBRUSH,
+        brush_footer_bg: g.brush_footer_bg as HBRUSH,
+        brush_divider: g.brush_divider as HBRUSH,
+        brush_footer_border: g.brush_footer_border as HBRUSH,
+    }
 }
 
 pub unsafe fn cleanup_dialog_fonts() {
-    if let Ok(mut guard) = DIALOG_HANDLES.lock() {
-        if guard.font_ui != 0 {
-            DeleteObject(guard.font_ui as _);
-            guard.font_ui = 0;
-        }
-        if guard.font_bold != 0 {
-            DeleteObject(guard.font_bold as _);
-            guard.font_bold = 0;
-        }
-        if guard.font_mono != 0 {
-            DeleteObject(guard.font_mono as _);
-            guard.font_mono = 0;
+    if let Ok(mut g) = DIALOG_RES.lock() {
+        let handles = [
+            g.font_title,
+            g.font_section,
+            g.font_ui,
+            g.font_mono,
+            g.brush_white,
+            g.brush_code_bg,
+            g.brush_footer_bg,
+            g.brush_divider,
+            g.brush_footer_border,
+        ];
+        g.font_title = 0;
+        g.font_section = 0;
+        g.font_ui = 0;
+        g.font_mono = 0;
+        g.brush_white = 0;
+        g.brush_code_bg = 0;
+        g.brush_footer_bg = 0;
+        g.brush_divider = 0;
+        g.brush_footer_border = 0;
+        for h in handles {
+            if h != 0 {
+                DeleteObject(h as _);
+            }
         }
     }
 }
 
 pub unsafe fn is_any_management_dialog_message(msg: &MSG) -> bool {
-    let (h1, h2, h3) = match DIALOG_HANDLES.lock() {
-        Ok(g) => (g.enroll_hwnd as HWND, g.bundle_hwnd as HWND, g.backends_hwnd as HWND),
+    let (h1, h2, h3) = match DIALOG_RES.lock() {
+        Ok(g) => (
+            g.enroll_hwnd as HWND,
+            g.bundle_hwnd as HWND,
+            g.backends_hwnd as HWND,
+        ),
         Err(_) => return false,
     };
     if !h1.is_null() && IsWindow(h1) != 0 && IsDialogMessageW(h1, msg) != 0 {
@@ -246,8 +343,9 @@ unsafe fn set_ctrl_font(hwnd_ctrl: HWND, font: HFONT) {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn create_child(
+unsafe fn create_child_ex(
     parent: HWND,
+    ex_style: u32,
     class_name: &str,
     text: &str,
     style: u32,
@@ -263,7 +361,7 @@ unsafe fn create_child(
     let txt_w = to_wide(text);
     let hinstance = GetModuleHandleW(null());
     let hwnd = CreateWindowExW(
-        0,
+        ex_style,
         cls_w.as_ptr(),
         txt_w.as_ptr(),
         WS_CHILD | WS_VISIBLE | style,
@@ -280,6 +378,277 @@ unsafe fn create_child(
         set_ctrl_font(hwnd, font);
     }
     hwnd
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_label(
+    parent: HWND,
+    text: &str,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: i32,
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    create_child_ex(parent, 0, "STATIC", text, 0, x, y, w, h, id, dpi, font)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_edit(
+    parent: HWND,
+    text: &str,
+    cue_banner: &str,
+    readonly: bool,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: i32,
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    let style = ES_AUTOHSCROLL | WS_TABSTOP | if readonly { ES_READONLY } else { 0 };
+    let hwnd = create_child_ex(
+        parent,
+        WS_EX_CLIENTEDGE,
+        "EDIT",
+        text,
+        style,
+        x,
+        y,
+        w,
+        h,
+        id,
+        dpi,
+        font,
+    );
+    if !hwnd.is_null() && !cue_banner.is_empty() && !readonly {
+        let cue_w = to_wide(cue_banner);
+        SendMessageW(hwnd, EM_SETCUEBANNER, 1, cue_w.as_ptr() as isize);
+    }
+    hwnd
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_button(
+    parent: HWND,
+    text: &str,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: i32,
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    create_child_ex(
+        parent,
+        0,
+        "BUTTON",
+        text,
+        BS_PUSHBUTTON | WS_TABSTOP,
+        x,
+        y,
+        w,
+        h,
+        id,
+        dpi,
+        font,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_command_link(
+    parent: HWND,
+    title: &str,
+    note: &str,
+    is_default: bool,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: i32,
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    let cmd_style = if is_default {
+        BS_DEFCOMMANDLINK
+    } else {
+        BS_COMMANDLINK
+    };
+    let hwnd = create_child_ex(
+        parent,
+        0,
+        "BUTTON",
+        title,
+        cmd_style | WS_TABSTOP,
+        x,
+        y,
+        w,
+        h,
+        id,
+        dpi,
+        font,
+    );
+    if !hwnd.is_null() && !note.is_empty() {
+        let note_w = to_wide(note);
+        SendMessageW(hwnd, BCM_SETNOTE, 0, note_w.as_ptr() as isize);
+    }
+    hwnd
+}
+
+/// Paints the modern TaskDialog-style white canvas, top shield icon, horizontal section dividers,
+/// and bottom `#F2F3F5` footer strip.
+unsafe fn paint_taskdialog_frame(hwnd: HWND, divider_ys_96dpi: &[i32]) {
+    let dpi = get_dpi_scale();
+    let assets = ensure_theme_assets(dpi);
+
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    GetClientRect(hwnd, &mut rc);
+    let footer_h = scale_px(FOOTER_HEIGHT_96DPI, dpi);
+    let footer_top = (rc.bottom - footer_h).max(0);
+
+    // 1. White main canvas
+    let body_rc = RECT {
+        left: 0,
+        top: 0,
+        right: rc.right,
+        bottom: footer_top,
+    };
+    FillRect(hdc, &body_rc, assets.brush_white);
+
+    // 2. Top shield icon next to the blue Main Instruction header
+    let hicon = LoadIconW(null_mut(), IDI_SHIELD);
+    if !hicon.is_null() {
+        let icon_sz = scale_px(28, dpi);
+        DrawIconEx(
+            hdc,
+            scale_px(24, dpi),
+            scale_px(18, dpi),
+            hicon,
+            icon_sz,
+            icon_sz,
+            0,
+            null_mut(),
+            DI_NORMAL,
+        );
+    }
+
+    // 3. Horizontal section dividers
+    let pad_x = scale_px(24, dpi);
+    for &y96 in divider_ys_96dpi {
+        let y = scale_px(y96, dpi);
+        let div_rc = RECT {
+            left: pad_x,
+            top: y,
+            right: (rc.right - pad_x).max(pad_x),
+            bottom: y + scale_px(1, dpi).max(1),
+        };
+        FillRect(hdc, &div_rc, assets.brush_divider);
+    }
+
+    // 4. Footer 1px top border + #F2F3F5 footer strip
+    let border_rc = RECT {
+        left: 0,
+        top: footer_top,
+        right: rc.right,
+        bottom: footer_top + scale_px(1, dpi).max(1),
+    };
+    FillRect(hdc, &border_rc, assets.brush_footer_border);
+
+    let footer_rc = RECT {
+        left: 0,
+        top: footer_top + scale_px(1, dpi).max(1),
+        right: rc.right,
+        bottom: rc.bottom,
+    };
+    FillRect(hdc, &footer_rc, assets.brush_footer_bg);
+
+    EndPaint(hwnd, &ps);
+}
+
+/// Colors static labels, headers, radio buttons, and read-only code edits cleanly on the white canvas
+/// or footer strip without 90s gray boxes.
+unsafe fn handle_ctlcolor(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let hdc = wparam as HDC;
+    let ctrl_hwnd = lparam as HWND;
+    let id = GetDlgCtrlID(ctrl_hwnd);
+    let dpi = get_dpi_scale();
+    let assets = ensure_theme_assets(dpi);
+
+    SetBkMode(hdc, OPAQUE as i32);
+
+    if id == ID_STYLE_MAIN_HEADER {
+        SetTextColor(hdc, COLOR_TASKDIALOG_BLUE);
+        SetBkColor(hdc, COLOR_WHITE);
+        return assets.brush_white as LRESULT;
+    }
+    if (ID_STYLE_SECTION_HEADER_1..=ID_STYLE_SECTION_HEADER_3).contains(&id) {
+        SetTextColor(hdc, COLOR_SECTION_TITLE);
+        SetBkColor(hdc, COLOR_WHITE);
+        return assets.brush_white as LRESULT;
+    }
+    if id == ID_STYLE_FOOTER_STATUS {
+        SetTextColor(hdc, COLOR_FOOTER_TEXT);
+        SetBkColor(hdc, COLOR_FOOTER_BG);
+        return assets.brush_footer_bg as LRESULT;
+    }
+    if (ID_STYLE_READONLY_CODE_MIN..=ID_STYLE_READONLY_CODE_MAX).contains(&id) {
+        SetTextColor(hdc, COLOR_CODE_TEXT);
+        SetBkColor(hdc, COLOR_CODE_BG);
+        return assets.brush_code_bg as LRESULT;
+    }
+
+    SetTextColor(hdc, COLOR_LABEL_TEXT);
+    SetBkColor(hdc, COLOR_WHITE);
+    assets.brush_white as LRESULT
+}
+
+unsafe fn create_centered_dialog_window(
+    class_name: &[u16],
+    title: &[u16],
+    client_w_96dpi: i32,
+    client_h_96dpi: i32,
+    dpi: i32,
+) -> HWND {
+    let hinstance = GetModuleHandleW(null());
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: scale_px(client_w_96dpi, dpi),
+        bottom: scale_px(client_h_96dpi, dpi),
+    };
+    AdjustWindowRectEx(&mut rc, style, 0, 0);
+    let win_w = rc.right - rc.left;
+    let win_h = rc.bottom - rc.top;
+    let x = (GetSystemMetrics(SM_CXSCREEN) - win_w).max(0) / 2;
+    let y = (GetSystemMetrics(SM_CYSCREEN) - win_h).max(0) / 2;
+
+    CreateWindowExW(
+        0,
+        class_name.as_ptr(),
+        title.as_ptr(),
+        style,
+        x,
+        y,
+        win_w,
+        win_h,
+        null_mut(),
+        null_mut(),
+        hinstance,
+        null(),
+    )
 }
 
 unsafe fn get_dlg_item_string(hwnd: HWND, id: i32) -> String {
@@ -304,6 +673,7 @@ unsafe fn set_dlg_item_string(hwnd: HWND, id: i32, text: &str) {
     if !ctrl.is_null() {
         let wide = to_wide(text);
         SetWindowTextW(ctrl, wide.as_ptr());
+        InvalidateRect(ctrl, null(), 1);
     }
 }
 
@@ -356,7 +726,12 @@ pub unsafe fn paste_from_clipboard(owner: HWND) -> Option<String> {
     Some(s)
 }
 
-unsafe fn confirm_overwrite_dialog(parent: HWND, title: &str, instruction: &str, content: &str) -> bool {
+unsafe fn confirm_overwrite_dialog(
+    parent: HWND,
+    title: &str,
+    instruction: &str,
+    content: &str,
+) -> bool {
     let title_w = to_wide(title);
     let instr_w = to_wide(instruction);
     let content_w = to_wide(content);
@@ -436,7 +811,7 @@ fn default_servers_csv(ctx: &TraySharedContext) -> String {
 }
 
 // ============================================================================
-// 1. INITIALIZE / ENROLL WORKSTATION WINDOW
+// 1. INITIALIZE / ENROLL WORKSTATION WINDOW (640 x 540 Client Area)
 // ============================================================================
 
 unsafe extern "system" fn enroll_wnd_proc(
@@ -446,250 +821,249 @@ unsafe extern "system" fn enroll_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            paint_taskdialog_frame(hwnd, &[56, 304]);
+            0
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => handle_ctlcolor(wparam, lparam),
         WM_CREATE => {
             let dpi = get_dpi_scale();
-            let (font_ui, font_bold, font_mono) = ensure_dialog_fonts(dpi);
+            let assets = ensure_theme_assets(dpi);
             let maybe_ctx = crate::win_native::get_tray_context();
 
-            // Group A: Primary Enrollment
-            create_child(
+            // Main TaskDialog-style Header
+            create_label(
                 hwnd,
-                "BUTTON",
-                "Option A — Enroll Primary Workstation (Using Local Root Key)",
-                BS_GROUPBOX,
-                16,
-                12,
-                628,
-                274,
-                0,
+                "Initialize or Enroll This Workstation",
+                62,
+                18,
+                554,
+                28,
+                ID_STYLE_MAIN_HEADER,
                 dpi,
-                font_bold,
+                assets.font_title,
             );
-            create_child(
+
+            // Section 1: Primary Workstation Enrollment
+            create_label(
                 hwnd,
-                "STATIC",
-                "User Root Key (server.toml allowlist entry):",
-                0,
-                32,
-                38,
+                "1. Enroll Primary Workstation Using Local Root Key",
+                24,
+                70,
+                592,
+                22,
+                ID_STYLE_SECTION_HEADER_1,
+                dpi,
+                assets.font_section,
+            );
+            create_label(
+                hwnd,
+                "User Root Key (for /etc/sockcast/server.toml):",
+                24,
+                96,
                 400,
-                20,
+                18,
                 0,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
             let root_str = format_root_key_allowlist().unwrap_or_else(|| {
-                "<No user_key.toml yet — click 'Generate Key' or 'Enroll This Workstation'>".to_string()
+                "No user_key.toml yet — click 'Generate Key' or 'Enroll' below".to_string()
             });
-            create_child(
+            create_edit(
                 hwnd,
-                "EDIT",
                 &root_str,
-                ES_AUTOHSCROLL | ES_READONLY | WS_BORDER | WS_TABSTOP,
-                32,
-                60,
-                390,
+                "",
+                true,
+                24,
+                116,
+                384,
                 26,
                 ID_ENROLL_ROOT_KEY_EDIT,
                 dpi,
-                font_mono,
+                assets.font_mono,
             );
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Generate Key",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                430,
-                58,
-                100,
-                30,
+                416,
+                115,
+                96,
+                28,
                 ID_ENROLL_BTN_KEYGEN,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Copy Allowlist",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                536,
-                58,
-                94,
-                30,
+                518,
+                115,
+                98,
+                28,
                 ID_ENROLL_BTN_COPY_PUBKEY,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
 
-            create_child(
+            create_label(
                 hwnd,
-                "STATIC",
-                "Workstation Node Name (e.g. bandura, laptop-win):",
-                0,
-                32,
-                98,
-                450,
-                20,
+                "Workstation Name:",
+                24,
+                154,
+                190,
+                18,
                 0,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
+            create_label(
+                hwnd,
+                "Coordinator Backend URL(s) (comma-separated):",
+                228,
+                154,
+                388,
+                18,
+                0,
+                dpi,
+                assets.font_ui,
+            );
+
             let node_default = maybe_ctx
                 .as_ref()
                 .map(|c| default_workstation_node_name(c))
                 .unwrap_or_else(|| "workstation".to_string());
-            create_child(
+            create_edit(
                 hwnd,
-                "EDIT",
                 &node_default,
-                ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                32,
-                120,
-                598,
+                "e.g. bandura",
+                false,
+                24,
+                174,
+                192,
                 26,
                 ID_ENROLL_NODE_EDIT,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
 
-            create_child(
-                hwnd,
-                "STATIC",
-                "Coordinator Backend URL(s) (comma-separated, e.g. https://sockcast.stingr.net):",
-                0,
-                32,
-                156,
-                598,
-                20,
-                0,
-                dpi,
-                font_ui,
-            );
             let servers_default = maybe_ctx
                 .as_ref()
                 .map(|c| default_servers_csv(c))
                 .unwrap_or_else(|| "https://sockcast.stingr.net".to_string());
-            create_child(
+            create_edit(
                 hwnd,
-                "EDIT",
                 &servers_default,
-                ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                32,
-                178,
-                598,
+                "https://sockcast.example.com",
+                false,
+                228,
+                174,
+                388,
                 26,
                 ID_ENROLL_SERVERS_EDIT,
                 dpi,
-                font_mono,
+                assets.font_mono,
             );
 
-            create_child(
+            create_command_link(
                 hwnd,
-                "BUTTON",
-                "Enroll This Workstation (Mint Grant & Save client.toml)",
-                BS_DEFPUSHBUTTON | WS_TABSTOP,
-                32,
-                220,
-                598,
-                36,
+                "Enroll This Workstation",
+                "Mint a signed client grant using your local root key and save ~/.config/sockcast/client.toml",
+                true,
+                24,
+                214,
+                592,
+                58,
                 ID_ENROLL_BTN_ENROLL_PRIMARY,
                 dpi,
-                font_bold,
+                assets.font_ui,
             );
 
-            // Group B: Init from Bundle
-            create_child(
+            // Section 2: Initialize from Bundle
+            create_label(
                 hwnd,
-                "BUTTON",
-                "Option B — Initialize Workstation from Enrollment Bundle (sc1_...)",
-                BS_GROUPBOX,
-                16,
-                298,
-                628,
-                198,
+                "2. Or Initialize Secondary Workstation from an Enrollment Bundle",
+                24,
+                318,
+                592,
+                22,
+                ID_STYLE_SECTION_HEADER_2,
+                dpi,
+                assets.font_section,
+            );
+            create_label(
+                hwnd,
+                "Client Enrollment Bundle Token (sc1_<base64>):",
+                24,
+                344,
+                400,
+                18,
                 0,
                 dpi,
-                font_bold,
+                assets.font_ui,
             );
-            create_child(
+            create_edit(
                 hwnd,
-                "STATIC",
-                "Paste an sc1_<base64> Client Enrollment Bundle minted on another machine:",
-                0,
-                32,
-                326,
-                460,
-                20,
-                0,
+                "",
+                "Paste sc1_... client bundle token here",
+                false,
+                24,
+                364,
+                464,
+                26,
+                ID_ENROLL_BUNDLE_EDIT,
                 dpi,
-                font_ui,
+                assets.font_mono,
             );
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Paste Clipboard",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                500,
-                320,
-                130,
+                496,
+                363,
+                120,
                 28,
                 ID_ENROLL_BTN_PASTE_BUNDLE,
                 dpi,
-                font_ui,
-            );
-            create_child(
-                hwnd,
-                "EDIT",
-                "",
-                ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER | WS_TABSTOP,
-                32,
-                354,
-                598,
-                76,
-                ID_ENROLL_BUNDLE_EDIT,
-                dpi,
-                font_mono,
-            );
-            create_child(
-                hwnd,
-                "BUTTON",
-                "Initialize Workstation from Bundle",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                32,
-                442,
-                598,
-                36,
-                ID_ENROLL_BTN_INIT_BUNDLE,
-                dpi,
-                font_bold,
+                assets.font_ui,
             );
 
-            // Status & Close
-            create_child(
+            create_command_link(
                 hwnd,
-                "STATIC",
-                "Ready.",
-                0,
-                18,
-                510,
-                490,
+                "Initialize Workstation from Bundle",
+                "Verify the pasted sc1_ token, write ~/.config/sockcast/client.toml, and connect immediately",
+                false,
                 24,
-                ID_ENROLL_STATUS_LABEL,
+                404,
+                592,
+                58,
+                ID_ENROLL_BTN_INIT_BUNDLE,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+
+            // Footer Bar (y = 486 .. 540)
+            create_label(
                 hwnd,
-                "BUTTON",
+                "Ready.",
+                24,
+                503,
+                470,
+                20,
+                ID_STYLE_FOOTER_STATUS,
+                dpi,
+                assets.font_ui,
+            );
+            create_button(
+                hwnd,
                 "Close",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                524,
-                506,
-                120,
-                32,
+                516,
+                498,
+                100,
+                30,
                 ID_ENROLL_BTN_CLOSE,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
             0
         }
@@ -719,7 +1093,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                                 set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &allow);
                                 set_dlg_item_string(
                                     hwnd,
-                                    ID_ENROLL_STATUS_LABEL,
+                                    ID_STYLE_FOOTER_STATUS,
                                     &format!("Generated root key (User ID: {}).", out.user_id),
                                 );
                             }
@@ -737,14 +1111,14 @@ unsafe extern "system" fn enroll_wnd_proc(
                             if copy_to_clipboard(hwnd, &allow) {
                                 set_dlg_item_string(
                                     hwnd,
-                                    ID_ENROLL_STATUS_LABEL,
+                                    ID_STYLE_FOOTER_STATUS,
                                     "Copied allowed_user_pubkeys line to clipboard!",
                                 );
                             }
                         } else {
                             set_dlg_item_string(
                                 hwnd,
-                                ID_ENROLL_STATUS_LABEL,
+                                ID_STYLE_FOOTER_STATUS,
                                 "Generate a root key first before copying.",
                             );
                         }
@@ -756,7 +1130,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                         if node_name.trim().is_empty() {
                             show_tray_error_dialog(
                                 "Validation Error",
-                                "Workstation Node Name is required",
+                                "Workstation Name is required",
                                 "Please enter a workstation identifier (e.g. 'bandura').",
                             );
                             return 0;
@@ -770,7 +1144,6 @@ unsafe extern "system" fn enroll_wnd_proc(
                             return 0;
                         }
 
-                        // Auto-create user_key.toml if not present yet
                         if format_root_key_allowlist().is_none() {
                             if let Err(e) = run_keygen(None, false) {
                                 show_tray_error_dialog(
@@ -795,7 +1168,11 @@ unsafe extern "system" fn enroll_wnd_proc(
                                     hwnd,
                                     "Overwrite Existing Workstation Config?",
                                     "A client.toml file already exists for this workstation.",
-                                    &format!("Do you want to overwrite {} and re-enroll as '{}'?", p.display(), node_name.trim()),
+                                    &format!(
+                                        "Do you want to overwrite {} and re-enroll as '{}'?",
+                                        p.display(),
+                                        node_name.trim()
+                                    ),
                                 )
                             {
                                 return 0;
@@ -815,15 +1192,14 @@ unsafe extern "system" fn enroll_wnd_proc(
                         })();
 
                         match res {
-                            Ok(path) => {
+                            Ok(_path) => {
                                 crate::win_native::reload_tray_configuration();
                                 set_dlg_item_string(
                                     hwnd,
-                                    ID_ENROLL_STATUS_LABEL,
+                                    ID_STYLE_FOOTER_STATUS,
                                     &format!(
-                                        "Enrolled '{}' and saved {} — reconnecting now!",
-                                        node_name.trim(),
-                                        path.display()
+                                        "Enrolled '{}' and saved client.toml — connecting now!",
+                                        node_name.trim()
                                     ),
                                 );
                             }
@@ -838,7 +1214,6 @@ unsafe extern "system" fn enroll_wnd_proc(
                     }
                     ID_ENROLL_BTN_PASTE_BUNDLE => {
                         if let Some(clip) = paste_from_clipboard(hwnd) {
-                            // Extract sc1_ token if the user copied a full CLI command
                             let token = clip
                                 .split_whitespace()
                                 .find(|w| w.starts_with("sc1_"))
@@ -846,7 +1221,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                             set_dlg_item_string(hwnd, ID_ENROLL_BUNDLE_EDIT, token);
                             set_dlg_item_string(
                                 hwnd,
-                                ID_ENROLL_STATUS_LABEL,
+                                ID_STYLE_FOOTER_STATUS,
                                 "Pasted bundle token from clipboard.",
                             );
                         }
@@ -900,15 +1275,14 @@ unsafe extern "system" fn enroll_wnd_proc(
                         }
 
                         match write_client_config_from_bundle(&decoded, cfg_path.as_deref(), true) {
-                            Ok(path) => {
+                            Ok(_path) => {
                                 crate::win_native::reload_tray_configuration();
                                 set_dlg_item_string(
                                     hwnd,
-                                    ID_ENROLL_STATUS_LABEL,
+                                    ID_STYLE_FOOTER_STATUS,
                                     &format!(
-                                        "Initialized workstation '{}' ({}) — reconnecting now!",
-                                        decoded.grant.node_id,
-                                        path.display()
+                                        "Initialized workstation '{}' — connecting now!",
+                                        decoded.grant.node_id
                                     ),
                                 );
                             }
@@ -934,7 +1308,7 @@ unsafe extern "system" fn enroll_wnd_proc(
             0
         }
         WM_DESTROY => {
-            if let Ok(mut g) = DIALOG_HANDLES.lock() {
+            if let Ok(mut g) = DIALOG_RES.lock() {
                 if g.enroll_hwnd == hwnd as isize {
                     g.enroll_hwnd = 0;
                 }
@@ -947,7 +1321,7 @@ unsafe extern "system" fn enroll_wnd_proc(
 
 pub unsafe fn show_enroll_window() {
     {
-        let g = DIALOG_HANDLES.lock().unwrap();
+        let g = DIALOG_RES.lock().unwrap();
         let existing = g.enroll_hwnd as HWND;
         if !existing.is_null() && IsWindow(existing) != 0 {
             ShowWindow(existing, SW_RESTORE);
@@ -957,8 +1331,9 @@ pub unsafe fn show_enroll_window() {
     }
 
     let dpi = get_dpi_scale();
+    let assets = ensure_theme_assets(dpi);
     let hinstance = GetModuleHandleW(null());
-    let class_name = to_wide("SockcastEnrollWndClass");
+    let class_name = to_wide("SockcastEnrollWndClassV2");
     let title = to_wide("Sockcast — Initialize / Enroll Workstation");
 
     let wc = WNDCLASSW {
@@ -969,40 +1344,22 @@ pub unsafe fn show_enroll_window() {
         hInstance: hinstance,
         hIcon: LoadIconW(null_mut(), IDI_SHIELD),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+        hbrBackground: assets.brush_white,
         lpszMenuName: null(),
         lpszClassName: class_name.as_ptr(),
     };
     RegisterClassW(&wc);
 
-    let w = scale_px(676, dpi);
-    let h = scale_px(585, dpi);
-    let x = (GetSystemMetrics(SM_CXSCREEN) - w).max(0) / 2;
-    let y = (GetSystemMetrics(SM_CYSCREEN) - h).max(0) / 2;
-
-    let hwnd = CreateWindowExW(
-        0,
-        class_name.as_ptr(),
-        title.as_ptr(),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
-        x,
-        y,
-        w,
-        h,
-        null_mut(),
-        null_mut(),
-        hinstance,
-        null(),
-    );
+    let hwnd = create_centered_dialog_window(&class_name, &title, 640, 540, dpi);
     if !hwnd.is_null() {
-        DIALOG_HANDLES.lock().unwrap().enroll_hwnd = hwnd as isize;
+        DIALOG_RES.lock().unwrap().enroll_hwnd = hwnd as isize;
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }
 }
 
 // ============================================================================
-// 2. GENERATE ENROLLMENT BUNDLE (RELAY / CLIENT) WINDOW
+// 2. GENERATE ENROLLMENT BUNDLE WINDOW (640 x 560 Client Area)
 // ============================================================================
 
 unsafe extern "system" fn bundle_wnd_proc(
@@ -1012,341 +1369,310 @@ unsafe extern "system" fn bundle_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            paint_taskdialog_frame(hwnd, &[56, 146, 368]);
+            0
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => handle_ctlcolor(wparam, lparam),
         WM_CREATE => {
             let dpi = get_dpi_scale();
-            let (font_ui, font_bold, font_mono) = ensure_dialog_fonts(dpi);
+            let assets = ensure_theme_assets(dpi);
             let maybe_ctx = crate::win_native::get_tray_context();
 
-            // Group 1: Root Key
-            create_child(
+            // Main TaskDialog-style Header
+            create_label(
                 hwnd,
-                "BUTTON",
-                "User Root Key (for /etc/sockcast/server.toml allowed_user_pubkeys)",
-                BS_GROUPBOX,
-                16,
-                12,
-                628,
-                84,
-                0,
+                "Generate Signed Enrollment Bundle",
+                62,
+                18,
+                554,
+                28,
+                ID_STYLE_MAIN_HEADER,
                 dpi,
-                font_bold,
+                assets.font_title,
+            );
+
+            // Section 1: Root Key Allowlist
+            create_label(
+                hwnd,
+                "User Root Key (for /etc/sockcast/server.toml):",
+                24,
+                70,
+                384,
+                18,
+                ID_STYLE_SECTION_HEADER_1,
+                dpi,
+                assets.font_section,
             );
             let root_str = format_root_key_allowlist().unwrap_or_else(|| {
-                "<No user_key.toml yet — click 'Generate Key' to create one>".to_string()
+                "No user_key.toml yet — click 'Generate Key' to create one".to_string()
             });
-            create_child(
+            create_edit(
                 hwnd,
-                "EDIT",
                 &root_str,
-                ES_AUTOHSCROLL | ES_READONLY | WS_BORDER | WS_TABSTOP,
-                32,
-                42,
-                390,
+                "",
+                true,
+                24,
+                96,
+                384,
                 26,
                 ID_BUNDLE_ROOT_PUBKEY_EDIT,
                 dpi,
-                font_mono,
+                assets.font_mono,
             );
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Generate Key",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                430,
-                40,
-                100,
-                30,
+                416,
+                95,
+                96,
+                28,
                 ID_BUNDLE_BTN_KEYGEN,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Copy Allowlist",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                536,
-                40,
-                94,
-                30,
+                518,
+                95,
+                98,
+                28,
                 ID_BUNDLE_BTN_COPY_PUBKEY,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
 
-            // Group 2: Mint Parameters
-            create_child(
+            // Section 2: Target Node Parameters
+            create_label(
                 hwnd,
-                "BUTTON",
-                "Mint Signed Enrollment Bundle (sc1_...)",
-                BS_GROUPBOX,
-                16,
-                108,
-                628,
-                222,
-                0,
+                "Target Node & Coordinator Configuration",
+                24,
+                160,
+                592,
+                22,
+                ID_STYLE_SECTION_HEADER_2,
                 dpi,
-                font_bold,
+                assets.font_section,
             );
-            create_child(
+            let r_relay = create_child_ex(
                 hwnd,
-                "STATIC",
-                "Target Role:",
                 0,
-                32,
-                136,
-                90,
-                20,
-                0,
-                dpi,
-                font_ui,
-            );
-            let r_relay = create_child(
-                hwnd,
                 "BUTTON",
-                "Remote Linux Relay (sockcast-relay)",
+                "Remote Linux Server Relay (sockcast-relay)",
                 BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
-                126,
-                134,
-                258,
+                24,
+                188,
+                286,
                 22,
                 ID_BUNDLE_RADIO_RELAY,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_child_ex(
                 hwnd,
+                0,
                 "BUTTON",
                 "Secondary Workstation (sockcast-client)",
                 BS_AUTORADIOBUTTON | WS_TABSTOP,
-                392,
-                134,
-                244,
+                326,
+                188,
+                286,
                 22,
                 ID_BUNDLE_RADIO_CLIENT,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
             SendMessageW(r_relay, BM_SETCHECK, BST_CHECKED, 0);
 
-            create_child(
+            create_label(
                 hwnd,
-                "STATIC",
-                "Target Hostname / Node ID (must match /proc hostname on relays):",
-                0,
-                32,
-                166,
-                444,
-                20,
+                "Target Hostname / Node ID:",
+                24,
+                220,
+                190,
+                18,
                 0,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_label(
                 hwnd,
-                "STATIC",
-                "Expires (days, 0=never):",
-                0,
-                486,
-                166,
-                148,
-                20,
+                "Coordinator URL(s):",
+                226,
+                220,
+                274,
+                18,
                 0,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_label(
                 hwnd,
-                "EDIT",
+                "Expires (days):",
+                512,
+                220,
+                104,
+                18,
+                0,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_edit(
+                hwnd,
                 "",
-                ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                32,
-                188,
-                444,
+                "e.g. server-x.infra.local",
+                false,
+                24,
+                240,
+                190,
                 26,
                 ID_BUNDLE_NODE_EDIT,
                 dpi,
-                font_ui,
-            );
-            create_child(
-                hwnd,
-                "EDIT",
-                "0",
-                ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                486,
-                188,
-                144,
-                26,
-                ID_BUNDLE_EXPIRES_EDIT,
-                dpi,
-                font_ui,
-            );
-
-            create_child(
-                hwnd,
-                "STATIC",
-                "Coordinator Backend URL(s) (comma-separated):",
-                0,
-                32,
-                224,
-                598,
-                20,
-                0,
-                dpi,
-                font_ui,
+                assets.font_ui,
             );
             let servers_default = maybe_ctx
                 .as_ref()
                 .map(|c| default_servers_csv(c))
                 .unwrap_or_else(|| "https://sockcast.stingr.net".to_string());
-            create_child(
+            create_edit(
                 hwnd,
-                "EDIT",
                 &servers_default,
-                ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                32,
-                246,
-                598,
+                "https://sockcast.example.com",
+                false,
+                226,
+                240,
+                274,
                 26,
                 ID_BUNDLE_SERVERS_EDIT,
                 dpi,
-                font_mono,
+                assets.font_mono,
+            );
+            create_edit(
+                hwnd,
+                "0",
+                "0 = never",
+                false,
+                512,
+                240,
+                104,
+                26,
+                ID_BUNDLE_EXPIRES_EDIT,
+                dpi,
+                assets.font_ui,
             );
 
-            create_child(
+            create_command_link(
                 hwnd,
-                "BUTTON",
                 "Generate Signed Enrollment Bundle",
-                BS_DEFPUSHBUTTON | WS_TABSTOP,
-                32,
+                "Sign a NodeGrant with your root key and copy the ready-to-run init command to clipboard",
+                true,
+                24,
                 282,
-                598,
-                36,
+                592,
+                58,
                 ID_BUNDLE_BTN_GENERATE,
                 dpi,
-                font_bold,
+                assets.font_ui,
             );
 
-            // Group 3: Output & Copy
-            create_child(
+            // Section 3: Output Token & Command
+            create_label(
                 hwnd,
-                "BUTTON",
-                "Generated Bundle Token & Ready-to-Run Command",
-                BS_GROUPBOX,
-                16,
-                342,
-                628,
-                166,
+                "Generated Bundle Token (sc1_...):",
+                24,
+                382,
+                400,
+                18,
                 0,
                 dpi,
-                font_bold,
+                assets.font_ui,
             );
-            create_child(
+            create_edit(
                 hwnd,
-                "STATIC",
-                "Raw Enrollment Token (sc1_...):",
-                0,
-                32,
-                370,
-                380,
-                20,
-                0,
-                dpi,
-                font_ui,
-            );
-            create_child(
-                hwnd,
-                "BUTTON",
-                "Copy Bundle Token",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                480,
-                364,
-                150,
-                28,
-                ID_BUNDLE_BTN_COPY_TOKEN,
-                dpi,
-                font_ui,
-            );
-            create_child(
-                hwnd,
-                "EDIT",
                 "",
-                ES_AUTOHSCROLL | ES_READONLY | WS_BORDER | WS_TABSTOP,
-                32,
-                394,
-                598,
+                "",
+                true,
+                24,
+                402,
+                464,
                 26,
                 ID_BUNDLE_TOKEN_OUT_EDIT,
                 dpi,
-                font_mono,
+                assets.font_mono,
+            );
+            create_button(
+                hwnd,
+                "Copy Token",
+                496,
+                401,
+                120,
+                28,
+                ID_BUNDLE_BTN_COPY_TOKEN,
+                dpi,
+                assets.font_ui,
             );
 
-            create_child(
+            create_label(
                 hwnd,
-                "STATIC",
                 "Ready-to-Run CLI Command:",
-                0,
-                32,
-                432,
-                380,
-                20,
+                24,
+                438,
+                400,
+                18,
                 0,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_edit(
                 hwnd,
-                "BUTTON",
-                "Copy CLI Command",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                480,
-                426,
-                150,
-                28,
-                ID_BUNDLE_BTN_COPY_CMD,
-                dpi,
-                font_ui,
-            );
-            create_child(
-                hwnd,
-                "EDIT",
                 "",
-                ES_AUTOHSCROLL | ES_READONLY | WS_BORDER | WS_TABSTOP,
-                32,
-                456,
-                598,
+                "",
+                true,
+                24,
+                458,
+                464,
                 26,
                 ID_BUNDLE_CMD_OUT_EDIT,
                 dpi,
-                font_mono,
+                assets.font_mono,
+            );
+            create_button(
+                hwnd,
+                "Copy Command",
+                496,
+                457,
+                120,
+                28,
+                ID_BUNDLE_BTN_COPY_CMD,
+                dpi,
+                assets.font_ui,
             );
 
-            // Status & Close
-            create_child(
+            // Footer Bar (y = 506 .. 560)
+            create_label(
                 hwnd,
-                "STATIC",
                 "Enter target hostname and click 'Generate Signed Enrollment Bundle'.",
-                0,
-                18,
-                520,
-                490,
                 24,
-                ID_BUNDLE_STATUS_LABEL,
+                523,
+                470,
+                20,
+                ID_STYLE_FOOTER_STATUS,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Close",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                524,
                 516,
-                120,
-                32,
+                518,
+                100,
+                30,
                 ID_BUNDLE_BTN_CLOSE,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
             0
         }
@@ -1376,7 +1702,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                                 set_dlg_item_string(hwnd, ID_BUNDLE_ROOT_PUBKEY_EDIT, &allow);
                                 set_dlg_item_string(
                                     hwnd,
-                                    ID_BUNDLE_STATUS_LABEL,
+                                    ID_STYLE_FOOTER_STATUS,
                                     &format!("Generated root key (User ID: {}).", out.user_id),
                                 );
                             }
@@ -1394,14 +1720,14 @@ unsafe extern "system" fn bundle_wnd_proc(
                             if copy_to_clipboard(hwnd, &allow) {
                                 set_dlg_item_string(
                                     hwnd,
-                                    ID_BUNDLE_STATUS_LABEL,
+                                    ID_STYLE_FOOTER_STATUS,
                                     "Copied allowed_user_pubkeys line to clipboard!",
                                 );
                             }
                         } else {
                             set_dlg_item_string(
                                 hwnd,
-                                ID_BUNDLE_STATUS_LABEL,
+                                ID_STYLE_FOOTER_STATUS,
                                 "Generate a root key first before copying.",
                             );
                         }
@@ -1487,9 +1813,9 @@ unsafe extern "system" fn bundle_wnd_proc(
                                 let _ = copy_to_clipboard(hwnd, &cli_cmd);
                                 set_dlg_item_string(
                                     hwnd,
-                                    ID_BUNDLE_STATUS_LABEL,
+                                    ID_STYLE_FOOTER_STATUS,
                                     &format!(
-                                        "Minted bundle for '{}' and copied CLI command to clipboard!",
+                                        "Minted bundle for '{}' & copied CLI command to clipboard!",
                                         node_name.trim()
                                     ),
                                 );
@@ -1508,7 +1834,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                         if !tok.is_empty() && copy_to_clipboard(hwnd, &tok) {
                             set_dlg_item_string(
                                 hwnd,
-                                ID_BUNDLE_STATUS_LABEL,
+                                ID_STYLE_FOOTER_STATUS,
                                 "Copied sc1_ bundle token to clipboard!",
                             );
                         }
@@ -1518,7 +1844,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                         if !cmd.is_empty() && copy_to_clipboard(hwnd, &cmd) {
                             set_dlg_item_string(
                                 hwnd,
-                                ID_BUNDLE_STATUS_LABEL,
+                                ID_STYLE_FOOTER_STATUS,
                                 "Copied CLI command to clipboard!",
                             );
                         }
@@ -1536,7 +1862,7 @@ unsafe extern "system" fn bundle_wnd_proc(
             0
         }
         WM_DESTROY => {
-            if let Ok(mut g) = DIALOG_HANDLES.lock() {
+            if let Ok(mut g) = DIALOG_RES.lock() {
                 if g.bundle_hwnd == hwnd as isize {
                     g.bundle_hwnd = 0;
                 }
@@ -1549,7 +1875,7 @@ unsafe extern "system" fn bundle_wnd_proc(
 
 pub unsafe fn show_bundle_generator_window() {
     {
-        let g = DIALOG_HANDLES.lock().unwrap();
+        let g = DIALOG_RES.lock().unwrap();
         let existing = g.bundle_hwnd as HWND;
         if !existing.is_null() && IsWindow(existing) != 0 {
             ShowWindow(existing, SW_RESTORE);
@@ -1559,9 +1885,10 @@ pub unsafe fn show_bundle_generator_window() {
     }
 
     let dpi = get_dpi_scale();
+    let assets = ensure_theme_assets(dpi);
     let hinstance = GetModuleHandleW(null());
-    let class_name = to_wide("SockcastBundleWndClass");
-    let title = to_wide("Sockcast — Generate Enrollment Bundle (Relay / Workstation)");
+    let class_name = to_wide("SockcastBundleWndClassV2");
+    let title = to_wide("Sockcast — Generate Enrollment Bundle");
 
     let wc = WNDCLASSW {
         style: 0,
@@ -1571,40 +1898,22 @@ pub unsafe fn show_bundle_generator_window() {
         hInstance: hinstance,
         hIcon: LoadIconW(null_mut(), IDI_SHIELD),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+        hbrBackground: assets.brush_white,
         lpszMenuName: null(),
         lpszClassName: class_name.as_ptr(),
     };
     RegisterClassW(&wc);
 
-    let w = scale_px(676, dpi);
-    let h = scale_px(596, dpi);
-    let x = (GetSystemMetrics(SM_CXSCREEN) - w).max(0) / 2;
-    let y = (GetSystemMetrics(SM_CYSCREEN) - h).max(0) / 2;
-
-    let hwnd = CreateWindowExW(
-        0,
-        class_name.as_ptr(),
-        title.as_ptr(),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
-        x,
-        y,
-        w,
-        h,
-        null_mut(),
-        null_mut(),
-        hinstance,
-        null(),
-    );
+    let hwnd = create_centered_dialog_window(&class_name, &title, 640, 560, dpi);
     if !hwnd.is_null() {
-        DIALOG_HANDLES.lock().unwrap().bundle_hwnd = hwnd as isize;
+        DIALOG_RES.lock().unwrap().bundle_hwnd = hwnd as isize;
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }
 }
 
 // ============================================================================
-// 3. MANAGE COORDINATOR BACKENDS (SERVERS) WINDOW
+// 3. MANAGE COORDINATOR BACKENDS WINDOW (560 x 420 Client Area)
 // ============================================================================
 
 unsafe fn listbox_get_items(lb: HWND) -> Vec<String> {
@@ -1636,49 +1945,54 @@ unsafe extern "system" fn backends_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            paint_taskdialog_frame(hwnd, &[56]);
+            0
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => handle_ctlcolor(wparam, lparam),
         WM_CREATE => {
             let dpi = get_dpi_scale();
-            let (font_ui, font_bold, font_mono) = ensure_dialog_fonts(dpi);
+            let assets = ensure_theme_assets(dpi);
             let maybe_ctx = crate::win_native::get_tray_context();
 
-            create_child(
+            // Main TaskDialog-style Header
+            create_label(
                 hwnd,
-                "BUTTON",
-                "Configured Coordinator Backend Servers (client.toml)",
-                BS_GROUPBOX,
-                16,
-                12,
-                528,
-                320,
-                0,
+                "Coordinator Backend Servers",
+                62,
+                18,
+                474,
+                28,
+                ID_STYLE_MAIN_HEADER,
                 dpi,
-                font_bold,
+                assets.font_title,
             );
-            create_child(
+
+            create_label(
                 hwnd,
-                "STATIC",
                 "Active Coordinator gRPC URLs (Workstation connects to all concurrently):",
-                0,
-                32,
-                38,
-                496,
-                20,
+                24,
+                70,
+                512,
+                18,
                 0,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            let lb = create_child(
+            let lb = create_child_ex(
                 hwnd,
+                WS_EX_CLIENTEDGE,
                 "LISTBOX",
                 "",
-                WS_BORDER | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP,
-                32,
-                62,
-                368,
-                140,
+                WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP,
+                24,
+                92,
+                384,
+                124,
                 ID_BACKENDS_LISTBOX,
                 dpi,
-                font_mono,
+                assets.font_mono,
             );
             if let Some(ref ctx) = maybe_ctx {
                 if let Some(cfg) = ctx.current_config() {
@@ -1692,99 +2006,90 @@ unsafe extern "system" fn backends_wnd_proc(
                 }
             }
 
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Remove Selected",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                410,
-                62,
-                118,
-                32,
+                416,
+                92,
+                120,
+                30,
                 ID_BACKENDS_BTN_REMOVE,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
 
-            create_child(
+            create_label(
                 hwnd,
-                "STATIC",
                 "Add Coordinator Server URL (http:// or https://):",
-                0,
-                32,
-                210,
-                496,
-                20,
+                24,
+                226,
+                512,
+                18,
                 0,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_edit(
                 hwnd,
-                "EDIT",
                 "https://",
-                ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                32,
-                232,
-                368,
-                28,
+                "https://sockcast.example.com",
+                false,
+                24,
+                246,
+                384,
+                26,
                 ID_BACKENDS_ADD_EDIT,
                 dpi,
-                font_mono,
+                assets.font_mono,
             );
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Add Server",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                410,
-                230,
-                118,
-                30,
+                416,
+                245,
+                120,
+                28,
                 ID_BACKENDS_BTN_ADD,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
 
-            create_child(
+            create_command_link(
                 hwnd,
-                "BUTTON",
                 "Save Backends & Reconnect Now",
-                BS_DEFPUSHBUTTON | WS_TABSTOP,
-                32,
-                278,
-                496,
-                38,
+                "Write updated coordinator URLs to client.toml and immediately reconnect active streams",
+                true,
+                24,
+                290,
+                512,
+                58,
                 ID_BACKENDS_BTN_SAVE,
                 dpi,
-                font_bold,
+                assets.font_ui,
             );
 
-            create_child(
+            // Footer Bar (y = 366 .. 420)
+            create_label(
                 hwnd,
-                "STATIC",
-                "Add or remove coordinator URLs, then click 'Save Backends & Reconnect Now'.",
-                0,
-                18,
-                344,
-                394,
+                "Add or remove coordinator URLs, then click Save.",
                 24,
-                ID_BACKENDS_STATUS_LABEL,
+                383,
+                396,
+                20,
+                ID_STYLE_FOOTER_STATUS,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
-            create_child(
+            create_button(
                 hwnd,
-                "BUTTON",
                 "Close",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                424,
-                340,
-                120,
-                32,
+                436,
+                378,
+                100,
+                30,
                 ID_BACKENDS_BTN_CLOSE,
                 dpi,
-                font_ui,
+                assets.font_ui,
             );
             0
         }
@@ -1811,7 +2116,7 @@ unsafe extern "system" fn backends_wnd_proc(
                         if existing.iter().any(|s| s.eq_ignore_ascii_case(trimmed)) {
                             set_dlg_item_string(
                                 hwnd,
-                                ID_BACKENDS_STATUS_LABEL,
+                                ID_STYLE_FOOTER_STATUS,
                                 "That coordinator URL is already in the list.",
                             );
                             return 0;
@@ -1822,7 +2127,7 @@ unsafe extern "system" fn backends_wnd_proc(
                         set_dlg_item_string(hwnd, ID_BACKENDS_ADD_EDIT, "https://");
                         set_dlg_item_string(
                             hwnd,
-                            ID_BACKENDS_STATUS_LABEL,
+                            ID_STYLE_FOOTER_STATUS,
                             &format!("Added '{trimmed}'. Click Save Backends to apply."),
                         );
                     }
@@ -1837,7 +2142,7 @@ unsafe extern "system" fn backends_wnd_proc(
                             }
                             set_dlg_item_string(
                                 hwnd,
-                                ID_BACKENDS_STATUS_LABEL,
+                                ID_STYLE_FOOTER_STATUS,
                                 "Removed selected server. Click Save Backends to apply.",
                             );
                         }
@@ -1859,7 +2164,7 @@ unsafe extern "system" fn backends_wnd_proc(
                             Ok((_, mut cfg_file)) => {
                                 cfg_file.servers = servers.clone();
                                 match cfg_file.save(cfg_path.as_deref()) {
-                                    Ok(saved_path) => {
+                                    Ok(_saved_path) => {
                                         crate::win_native::reload_tray_configuration();
                                         SendMessageW(lb, LB_RESETCONTENT, 0, 0);
                                         for srv in &servers {
@@ -1868,11 +2173,10 @@ unsafe extern "system" fn backends_wnd_proc(
                                         }
                                         set_dlg_item_string(
                                             hwnd,
-                                            ID_BACKENDS_STATUS_LABEL,
+                                            ID_STYLE_FOOTER_STATUS,
                                             &format!(
-                                                "Saved {} server(s) to {} & reconnecting!",
-                                                servers.len(),
-                                                saved_path.display()
+                                                "Saved {} server(s) to client.toml & reconnecting!",
+                                                servers.len()
                                             ),
                                         );
                                     }
@@ -1907,7 +2211,7 @@ unsafe extern "system" fn backends_wnd_proc(
             0
         }
         WM_DESTROY => {
-            if let Ok(mut g) = DIALOG_HANDLES.lock() {
+            if let Ok(mut g) = DIALOG_RES.lock() {
                 if g.backends_hwnd == hwnd as isize {
                     g.backends_hwnd = 0;
                 }
@@ -1920,7 +2224,7 @@ unsafe extern "system" fn backends_wnd_proc(
 
 pub unsafe fn show_backends_window() {
     {
-        let g = DIALOG_HANDLES.lock().unwrap();
+        let g = DIALOG_RES.lock().unwrap();
         let existing = g.backends_hwnd as HWND;
         if !existing.is_null() && IsWindow(existing) != 0 {
             ShowWindow(existing, SW_RESTORE);
@@ -1930,9 +2234,10 @@ pub unsafe fn show_backends_window() {
     }
 
     let dpi = get_dpi_scale();
+    let assets = ensure_theme_assets(dpi);
     let hinstance = GetModuleHandleW(null());
-    let class_name = to_wide("SockcastBackendsWndClass");
-    let title = to_wide("Sockcast — Manage Coordinator Backends (Servers)");
+    let class_name = to_wide("SockcastBackendsWndClassV2");
+    let title = to_wide("Sockcast — Manage Coordinator Backends");
 
     let wc = WNDCLASSW {
         style: 0,
@@ -1942,33 +2247,15 @@ pub unsafe fn show_backends_window() {
         hInstance: hinstance,
         hIcon: LoadIconW(null_mut(), IDI_SHIELD),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+        hbrBackground: assets.brush_white,
         lpszMenuName: null(),
         lpszClassName: class_name.as_ptr(),
     };
     RegisterClassW(&wc);
 
-    let w = scale_px(576, dpi);
-    let h = scale_px(420, dpi);
-    let x = (GetSystemMetrics(SM_CXSCREEN) - w).max(0) / 2;
-    let y = (GetSystemMetrics(SM_CYSCREEN) - h).max(0) / 2;
-
-    let hwnd = CreateWindowExW(
-        0,
-        class_name.as_ptr(),
-        title.as_ptr(),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
-        x,
-        y,
-        w,
-        h,
-        null_mut(),
-        null_mut(),
-        hinstance,
-        null(),
-    );
+    let hwnd = create_centered_dialog_window(&class_name, &title, 560, 420, dpi);
     if !hwnd.is_null() {
-        DIALOG_HANDLES.lock().unwrap().backends_hwnd = hwnd as isize;
+        DIALOG_RES.lock().unwrap().backends_hwnd = hwnd as isize;
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }
