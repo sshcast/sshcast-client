@@ -422,7 +422,8 @@ impl ZellijProxyHub {
             let _ = b_wr.shutdown().await;
         };
 
-        tokio::join!(c2r, r2c);
+        r2c.await;
+        let _ = tokio::time::timeout(Duration::from_millis(150), c2r).await;
         Ok(())
     }
 
@@ -474,7 +475,7 @@ impl ZellijProxyHub {
         let relay_id_wr = relay_node_id.to_string();
         let client_id_wr = self.cfg.grant.node_id.clone();
 
-        let b2r_task = tokio::spawn(async move {
+        let mut b2r_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 16384];
             loop {
                 match b_rd.read(&mut buf).await {
@@ -533,6 +534,7 @@ impl ZellijProxyHub {
         }
 
         let _ = b_wr.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_millis(150), &mut b2r_task).await;
         b2r_task.abort();
         self.active_tunnels.lock().await.remove(&tunnel_id);
         if !closed_by_relay {
