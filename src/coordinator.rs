@@ -219,8 +219,27 @@ async fn run_single_coordinator_stream(
     let channel = endpoint.connect().await?;
     let mut client = SockcastServiceClient::new(channel);
 
-    let (tx, rx) = mpsc::channel::<ClientStreamMessage>(256);
-    zellij_hub.register_coordinator_sender(tx.clone()).await;
+    let (tx, rx) = mpsc::channel::<ClientStreamMessage>(1024);
+    let sender_reg_id = zellij_hub.register_coordinator_sender(tx.clone()).await;
+    struct SenderRegGuard {
+        hub: Arc<ZellijProxyHub>,
+        id: u64,
+    }
+    impl Drop for SenderRegGuard {
+        fn drop(&mut self) {
+            let hub = Arc::clone(&self.hub);
+            let id = self.id;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    hub.unregister_coordinator_sender(id).await;
+                });
+            }
+        }
+    }
+    let _sender_guard = SenderRegGuard {
+        hub: Arc::clone(zellij_hub),
+        id: sender_reg_id,
+    };
 
     // 1. First message on ConnectWorkstation stream MUST be AuthHandshake
     let handshake = create_node_auth(cfg.grant.clone(), &cfg.node_signing_key, now_unix_ms())?;
@@ -355,8 +374,17 @@ async fn build_workstation_status(
     force_active: bool,
 ) -> WorkstationStatus {
     let keys = local_agent.list_filtered_keys().await.unwrap_or_default();
+    let last_input_epoch_ms = match tokio::time::timeout(
+        Duration::from_millis(800),
+        tokio::task::spawn_blocking(query_last_input_epoch_ms),
+    )
+    .await
+    {
+        Ok(Ok(ts)) => ts,
+        _ => now_unix_ms(),
+    };
     WorkstationStatus {
-        last_input_epoch_ms: query_last_input_epoch_ms(),
+        last_input_epoch_ms,
         force_active,
         os: current_os_name().to_string(),
         keys,

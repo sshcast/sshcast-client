@@ -100,7 +100,7 @@ fn html_escape(input: &str) -> String {
 pub struct ZellijProxyHub {
     cfg: ClientConfig,
     hosts: RwLock<Vec<RelayZellijStatus>>,
-    senders: Mutex<Vec<mpsc::Sender<ClientStreamMessage>>>,
+    senders: Mutex<Vec<(u64, mpsc::Sender<ClientStreamMessage>)>>,
     active_tunnels: Mutex<HashMap<String, mpsc::Sender<ZellijTunnelFrame>>>,
     pending_p2p: Mutex<HashMap<String, oneshot::Sender<ZellijTunnelFrame>>>,
     direct_peers: RwLock<HashMap<String, DirectP2pPeer>>,
@@ -127,17 +127,31 @@ impl ZellijProxyHub {
         format!("{}-{}-{}", prefix, self.cfg.grant.node_id, seq)
     }
 
-    pub async fn register_coordinator_sender(&self, tx: mpsc::Sender<ClientStreamMessage>) {
+    pub async fn register_coordinator_sender(&self, tx: mpsc::Sender<ClientStreamMessage>) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.senders.lock().await;
-        guard.retain(|s| !s.is_closed());
-        guard.push(tx);
+        guard.retain(|(_, s)| !s.is_closed());
+        guard.push((id, tx));
+        id
+    }
+
+    pub async fn unregister_coordinator_sender(&self, id: u64) {
+        let mut guard = self.senders.lock().await;
+        guard.retain(|(entry_id, s)| *entry_id != id && !s.is_closed());
     }
 
     async fn send_to_coordinator(&self, msg: ClientStreamMessage) -> Result<()> {
-        let mut guard = self.senders.lock().await;
-        guard.retain(|s| !s.is_closed());
-        for tx in guard.iter() {
-            if tx.send(msg.clone()).await.is_ok() {
+        let candidates: Vec<mpsc::Sender<ClientStreamMessage>> = {
+            let mut guard = self.senders.lock().await;
+            guard.retain(|(_, s)| !s.is_closed());
+            guard.iter().rev().map(|(_, s)| s.clone()).collect()
+        };
+        for tx in candidates {
+            if tokio::time::timeout(Duration::from_secs(2), tx.send(msg.clone()))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+            {
                 return Ok(());
             }
         }
@@ -422,8 +436,16 @@ impl ZellijProxyHub {
             let _ = b_wr.shutdown().await;
         };
 
-        r2c.await;
-        let _ = tokio::time::timeout(Duration::from_millis(150), c2r).await;
+        tokio::pin!(c2r);
+        tokio::pin!(r2c);
+        tokio::select! {
+            _ = &mut r2c => {
+                let _ = tokio::time::timeout(Duration::from_millis(150), &mut c2r).await;
+            }
+            _ = &mut c2r => {
+                r2c.await;
+            }
+        }
         Ok(())
     }
 
