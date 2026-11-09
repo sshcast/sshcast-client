@@ -4,9 +4,10 @@ use sockcast_proto::v1::PublicKey;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::config::{expand_tilde_path, ClientConfig, KeyFilterConfig};
+use crate::config::{expand_tilde_path, ClientConfig, ClientConfigFile, KeyFilterConfig};
 
 pub const SSH_AGENT_FAILURE: u8 = 5;
 pub const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 11;
@@ -15,12 +16,35 @@ pub const SSH2_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
 pub const MAX_AGENT_FRAME_LEN: usize = 1024 * 1024;
 
-#[derive(Debug, Clone)]
-pub struct LocalAgentConnector {
+#[derive(Debug, Clone, Default)]
+struct AgentConnectorOptions {
     socket_override: Option<String>,
     filter: KeyFilterConfig,
     disable_os_agent: bool,
-    loaded_keys: Arc<RwLock<Vec<LoadedSshKey>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedKeyEntry {
+    pub key: LoadedSshKey,
+    /// Origin of this built-in key (e.g. `~/.ssh/id_ed25519`, `inline`, or `memory`)
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldKeyDisplayItem {
+    /// `true` if held in the built-in in-memory agent; `false` if from the external OS `ssh-agent`
+    pub is_builtin: bool,
+    pub key_type: String,
+    pub fingerprint_sha256: String,
+    pub comment: String,
+    pub source: String,
+    pub display_line: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalAgentConnector {
+    options: Arc<RwLock<AgentConnectorOptions>>,
+    loaded_keys: Arc<RwLock<Vec<LoadedKeyEntry>>>,
 }
 
 impl LocalAgentConnector {
@@ -34,9 +58,11 @@ impl LocalAgentConnector {
         disable_os_agent: bool,
     ) -> Self {
         Self {
-            socket_override,
-            filter,
-            disable_os_agent,
+            options: Arc::new(RwLock::new(AgentConnectorOptions {
+                socket_override,
+                filter,
+                disable_os_agent,
+            })),
             loaded_keys: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -59,6 +85,7 @@ impl LocalAgentConnector {
             let pk = connector.load_private_key_pem_with_prompt(
                 inline_pem,
                 &label,
+                "inline",
                 interactive_passphrase_prompt,
             )?;
             tracing::info!(
@@ -69,20 +96,24 @@ impl LocalAgentConnector {
             );
         }
 
-        let mut all_paths: Vec<PathBuf> = cfg
+        let mut all_paths: Vec<(String, PathBuf)> = cfg
             .ssh_key_files
             .iter()
-            .map(|s| expand_tilde_path(s))
+            .map(|s| (s.clone(), expand_tilde_path(s)))
             .collect();
         for extra in extra_key_files {
-            if !all_paths.contains(extra) {
-                all_paths.push(extra.clone());
+            let expanded = expand_tilde_path(&extra.to_string_lossy());
+            if !all_paths.iter().any(|(_, p)| p == &expanded) {
+                all_paths.push((extra.to_string_lossy().to_string(), expanded));
             }
         }
 
-        for path in &all_paths {
-            let pk = connector
-                .load_private_key_file_interactive(path, interactive_passphrase_prompt)?;
+        for (raw_label, path) in &all_paths {
+            let pk = connector.load_private_key_file_with_source_interactive(
+                path,
+                raw_label,
+                interactive_passphrase_prompt,
+            )?;
             tracing::info!(
                 "Loaded built-in SSH key from {}: {} {} ({})",
                 path.display(),
@@ -95,15 +126,63 @@ impl LocalAgentConnector {
         Ok(connector)
     }
 
+    /// Synchronizes connector options (`socket_override`, `filter`, `disable_os_agent`) and
+    /// loads any newly configured keys from `ClientConfig` without wiping keys already unlocked
+    /// in memory during the current session.
+    pub fn sync_from_client_config(&self, cfg: &ClientConfig) {
+        {
+            let mut opts = self.options.write().expect("options lock poisoned");
+            opts.socket_override = cfg.local_agent_socket.clone();
+            opts.filter = cfg.key_filter.clone();
+            opts.disable_os_agent = cfg.disable_os_agent;
+        }
+
+        for inline_pem in &cfg.ssh_keys_inline {
+            if let Ok(key) = LoadedSshKey::parse_openssh_pem(inline_pem, None) {
+                self.add_loaded_key_with_source(key, "inline");
+            }
+        }
+
+        for raw_path in &cfg.ssh_key_files {
+            let expanded = expand_tilde_path(raw_path);
+            let already_loaded = {
+                let guard = self.loaded_keys.read().expect("loaded_keys lock poisoned");
+                guard.iter().any(|e| {
+                    e.source == *raw_path || expand_tilde_path(&e.source) == expanded
+                })
+            };
+            if !already_loaded {
+                if let Ok(pem) = std::fs::read_to_string(&expanded) {
+                    if let Ok(key) = LoadedSshKey::parse_openssh_pem(&pem, None) {
+                        self.add_loaded_key_with_source(key, raw_path.clone());
+                    }
+                }
+            }
+        }
+    }
+
     /// Adds an already-parsed `LoadedSshKey` into the built-in key ring, replacing any existing
     /// entry with the same public `key_blob`.
     pub fn add_loaded_key(&self, key: LoadedSshKey) -> PublicKey {
+        self.add_loaded_key_with_source(key, "memory")
+    }
+
+    pub fn add_loaded_key_with_source(
+        &self,
+        key: LoadedSshKey,
+        source: impl Into<String>,
+    ) -> PublicKey {
         let pk = key.public_key_proto();
+        let source_str = source.into();
         let mut guard = self.loaded_keys.write().expect("loaded_keys lock poisoned");
-        if let Some(existing) = guard.iter_mut().find(|k| k.key_blob() == pk.key_blob) {
-            *existing = key;
+        if let Some(existing) = guard.iter_mut().find(|e| e.key.key_blob() == pk.key_blob) {
+            existing.key = key;
+            existing.source = source_str;
         } else {
-            guard.push(key);
+            guard.push(LoadedKeyEntry {
+                key,
+                source: source_str,
+            });
         }
         pk
     }
@@ -115,7 +194,7 @@ impl LocalAgentConnector {
         passphrase: Option<&str>,
     ) -> std::result::Result<PublicKey, SshKeyError> {
         let key = LoadedSshKey::parse_openssh_pem(pem, passphrase)?;
-        Ok(self.add_loaded_key(key))
+        Ok(self.add_loaded_key_with_source(key, "inline"))
     }
 
     /// Loads an OpenSSH private key file from disk using an optional passphrase.
@@ -126,8 +205,9 @@ impl LocalAgentConnector {
     ) -> Result<PublicKey> {
         let pem = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read SSH private key file {}", path.display()))?;
-        self.load_private_key_pem(&pem, passphrase)
-            .with_context(|| format!("failed to load SSH private key from {}", path.display()))
+        let key = LoadedSshKey::parse_openssh_pem(&pem, passphrase)
+            .with_context(|| format!("failed to load SSH private key from {}", path.display()))?;
+        Ok(self.add_loaded_key_with_source(key, path.display().to_string()))
     }
 
     /// Loads an OpenSSH private key file from disk, checking `SOCKCAST_SSH_PASSPHRASE` or prompting
@@ -137,30 +217,41 @@ impl LocalAgentConnector {
         path: &Path,
         allow_prompt: bool,
     ) -> Result<PublicKey> {
+        let source = path.display().to_string();
+        self.load_private_key_file_with_source_interactive(path, &source, allow_prompt)
+    }
+
+    fn load_private_key_file_with_source_interactive(
+        &self,
+        path: &Path,
+        source: &str,
+        allow_prompt: bool,
+    ) -> Result<PublicKey> {
         let pem = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read SSH private key file {}", path.display()))?;
         let label = path.display().to_string();
-        self.load_private_key_pem_with_prompt(&pem, &label, allow_prompt)
+        self.load_private_key_pem_with_prompt(&pem, &label, source, allow_prompt)
     }
 
     fn load_private_key_pem_with_prompt(
         &self,
         pem: &str,
         label: &str,
+        source: &str,
         allow_prompt: bool,
     ) -> Result<PublicKey> {
-        match self.load_private_key_pem(pem, None) {
-            Ok(pk) => Ok(pk),
+        match LoadedSshKey::parse_openssh_pem(pem, None) {
+            Ok(key) => Ok(self.add_loaded_key_with_source(key, source)),
             Err(SshKeyError::PassphraseRequired) => {
                 if let Ok(env_pass) = std::env::var("SOCKCAST_SSH_PASSPHRASE") {
                     if !env_pass.is_empty() {
-                        return self.load_private_key_pem(pem, Some(&env_pass)).with_context(
-                            || {
+                        let key = LoadedSshKey::parse_openssh_pem(pem, Some(&env_pass))
+                            .with_context(|| {
                                 format!(
                                     "failed to unlock SSH private key {label} with SOCKCAST_SSH_PASSPHRASE"
                                 )
-                            },
-                        );
+                            })?;
+                        return Ok(self.add_loaded_key_with_source(key, source));
                     }
                 }
                 if !allow_prompt {
@@ -169,27 +260,39 @@ impl LocalAgentConnector {
                     );
                 }
                 let pass = prompt_key_passphrase(label)?;
-                self.load_private_key_pem(pem, Some(&pass))
-                    .with_context(|| format!("failed to unlock SSH private key {label}"))
+                let key = LoadedSshKey::parse_openssh_pem(pem, Some(&pass))
+                    .with_context(|| format!("failed to unlock SSH private key {label}"))?;
+                Ok(self.add_loaded_key_with_source(key, source))
             }
             Err(e) => Err(anyhow::Error::new(e))
                 .with_context(|| format!("failed to parse SSH private key {label}")),
         }
     }
 
-    /// Removes a key from the built-in key ring by SHA256 fingerprint or comment.
-    pub fn remove_loaded_key(&self, fingerprint_or_comment: &str) -> bool {
-        let target = fingerprint_or_comment.trim();
+    /// Removes a key from the built-in key ring by SHA256 fingerprint, comment, or source path.
+    pub fn remove_loaded_key(&self, identifier: &str) -> bool {
+        let target = identifier.trim();
         let mut guard = self.loaded_keys.write().expect("loaded_keys lock poisoned");
         let before = guard.len();
-        guard.retain(|k| k.fingerprint_sha256() != target && k.comment() != target);
+        guard.retain(|e| {
+            e.key.fingerprint_sha256() != target
+                && e.key.comment() != target
+                && e.source != target
+        });
         guard.len() != before
     }
 
     /// Lists all public keys currently loaded in the built-in in-memory agent.
     pub fn list_loaded_keys(&self) -> Vec<PublicKey> {
         let guard = self.loaded_keys.read().expect("loaded_keys lock poisoned");
-        guard.iter().map(|k| k.public_key_proto()).collect()
+        guard.iter().map(|e| e.key.public_key_proto()).collect()
+    }
+
+    pub fn list_loaded_key_entries(&self) -> Vec<LoadedKeyEntry> {
+        self.loaded_keys
+            .read()
+            .expect("loaded_keys lock poisoned")
+            .clone()
     }
 
     pub fn loaded_key_count(&self) -> usize {
@@ -201,19 +304,39 @@ impl LocalAgentConnector {
 
     pub fn is_loaded_key(&self, key_blob: &[u8]) -> bool {
         let guard = self.loaded_keys.read().expect("loaded_keys lock poisoned");
-        guard.iter().any(|k| k.key_blob() == key_blob)
+        guard.iter().any(|e| e.key.key_blob() == key_blob)
     }
 
     pub fn is_os_agent_disabled(&self) -> bool {
-        self.disable_os_agent
+        self.options
+            .read()
+            .expect("options lock poisoned")
+            .disable_os_agent
     }
 
-    pub fn filter_config(&self) -> &KeyFilterConfig {
-        &self.filter
+    pub fn set_disable_os_agent(&self, disable: bool) {
+        self.options
+            .write()
+            .expect("options lock poisoned")
+            .disable_os_agent = disable;
+    }
+
+    pub fn filter_config(&self) -> KeyFilterConfig {
+        self.options
+            .read()
+            .expect("options lock poisoned")
+            .filter
+            .clone()
     }
 
     pub fn resolve_endpoint(&self) -> Result<String> {
-        if let Some(s) = &self.socket_override {
+        let socket_override = self
+            .options
+            .read()
+            .expect("options lock poisoned")
+            .socket_override
+            .clone();
+        if let Some(s) = &socket_override {
             if !s.trim().is_empty() {
                 return Ok(s.trim().to_string());
             }
@@ -242,7 +365,8 @@ impl LocalAgentConnector {
     /// returning all keys matching the configured `KeyFilterConfig`.
     pub async fn list_filtered_keys(&self) -> Result<Vec<PublicKey>> {
         let all_keys = self.list_all_keys().await?;
-        Ok(filter_keys(all_keys, &self.filter))
+        let filter = self.filter_config();
+        Ok(filter_keys(all_keys, &filter))
     }
 
     /// Queries only the external OS SSH agent (`SSH2_AGENTC_REQUEST_IDENTITIES`).
@@ -271,7 +395,7 @@ impl LocalAgentConnector {
     /// the local OS SSH agent (when enabled and reachable).
     pub async fn list_all_keys(&self) -> Result<Vec<PublicKey>> {
         let mut keys = self.list_loaded_keys();
-        if self.disable_os_agent {
+        if self.is_os_agent_disabled() {
             return Ok(keys);
         }
 
@@ -303,15 +427,20 @@ impl LocalAgentConnector {
     /// If `key_blob` is loaded in the built-in in-memory key ring, signs directly in-process;
     /// otherwise delegates to the local OS SSH agent (`SSH2_AGENTC_SIGN_REQUEST`).
     pub async fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>> {
+        let filter = self.filter_config();
+
         // 1. Check built-in in-memory keys first
         let maybe_loaded = {
             let guard = self.loaded_keys.read().expect("loaded_keys lock poisoned");
-            guard.iter().find(|k| k.key_blob() == key_blob).cloned()
+            guard
+                .iter()
+                .find(|e| e.key.key_blob() == key_blob)
+                .map(|e| e.key.clone())
         };
 
         if let Some(loaded_key) = maybe_loaded {
-            if is_filter_active(&self.filter)
-                && !key_matches_filter(&loaded_key.public_key_proto(), &self.filter)
+            if is_filter_active(&filter)
+                && !key_matches_filter(&loaded_key.public_key_proto(), &filter)
             {
                 anyhow::bail!("requested SSH key is not permitted by client key_filter policy");
             }
@@ -320,14 +449,14 @@ impl LocalAgentConnector {
                 .context("built-in SSH key signing failed");
         }
 
-        if self.disable_os_agent {
+        if self.is_os_agent_disabled() {
             anyhow::bail!(
                 "requested SSH key is not loaded in built-in agent and OS ssh-agent is disabled"
             );
         }
 
         // 2. Fall back to local OS SSH agent
-        if is_filter_active(&self.filter) {
+        if is_filter_active(&filter) {
             let allowed = self.list_filtered_keys().await?;
             if !allowed.iter().any(|k| k.key_blob == key_blob) {
                 anyhow::bail!("requested SSH key is not permitted by client key_filter policy");
@@ -352,6 +481,223 @@ impl LocalAgentConnector {
                 })?;
             sign_over_stream(&mut client, key_blob, data, flags).await
         }
+    }
+
+    // ========================================================================
+    // UI Helpers for System Tray / Menu Bar SSH Key Management Dialogs
+    // ========================================================================
+
+    /// Returns a snapshot of all held SSH keys (`[Built-in]` and `[OS Agent]`) formatted for
+    /// display in the System Tray / Menu Bar SSH Keys management window.
+    pub fn query_held_keys_for_ui(&self) -> Vec<HeldKeyDisplayItem> {
+        let builtin_entries = self.list_loaded_key_entries();
+        let mut items = Vec::new();
+        let mut seen_blobs = Vec::new();
+
+        for entry in builtin_entries {
+            let pk = entry.key.public_key_proto();
+            seen_blobs.push(pk.key_blob.clone());
+            let comment_part = if pk.comment.is_empty() {
+                "no comment".to_string()
+            } else {
+                pk.comment.clone()
+            };
+            let display_line = format!(
+                "[Built-in] {} {} ({}) — {}",
+                pk.key_type, pk.fingerprint_sha256, comment_part, entry.source
+            );
+            items.push(HeldKeyDisplayItem {
+                is_builtin: true,
+                key_type: pk.key_type,
+                fingerprint_sha256: pk.fingerprint_sha256,
+                comment: pk.comment,
+                source: entry.source,
+                display_line,
+            });
+        }
+
+        if !self.is_os_agent_disabled() {
+            let clone_self = self.clone();
+            let os_keys = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                rt.block_on(async move {
+                    tokio::time::timeout(
+                        Duration::from_millis(1200),
+                        clone_self.list_os_agent_keys(),
+                    )
+                    .await
+                    .ok()?
+                    .ok()
+                })
+            })
+            .join()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+            for pk in os_keys {
+                if seen_blobs.iter().any(|b| b == &pk.key_blob) {
+                    continue;
+                }
+                let comment_part = if pk.comment.is_empty() {
+                    "no comment".to_string()
+                } else {
+                    pk.comment.clone()
+                };
+                let display_line = format!(
+                    "[OS Agent] {} {} ({})",
+                    pk.key_type, pk.fingerprint_sha256, comment_part
+                );
+                items.push(HeldKeyDisplayItem {
+                    is_builtin: false,
+                    key_type: pk.key_type,
+                    fingerprint_sha256: pk.fingerprint_sha256,
+                    comment: pk.comment,
+                    source: "os-agent".to_string(),
+                    display_line,
+                });
+            }
+        }
+
+        items
+    }
+
+    /// Loads an OpenSSH private key file into the built-in agent (unlocking with `passphrase` if needed)
+    /// and persists the file path into `client.toml`'s `ssh_key_files`.
+    pub fn ui_add_key_from_file(
+        &self,
+        raw_path: &str,
+        passphrase: &str,
+        cfg_path: Option<&Path>,
+    ) -> Result<PublicKey> {
+        let trimmed_path = raw_path.trim();
+        if trimmed_path.is_empty() {
+            anyhow::bail!("Please enter the path to an OpenSSH private key file (e.g. ~/.ssh/id_ed25519)");
+        }
+        let expanded = expand_tilde_path(trimmed_path);
+        let pem = std::fs::read_to_string(&expanded).with_context(|| {
+            format!(
+                "Could not read SSH private key file '{}'",
+                expanded.display()
+            )
+        })?;
+        let pass_opt = if passphrase.is_empty() {
+            None
+        } else {
+            Some(passphrase)
+        };
+        let key = LoadedSshKey::parse_openssh_pem(&pem, pass_opt).map_err(|e| match e {
+            SshKeyError::PassphraseRequired => anyhow::anyhow!(
+                "This SSH private key is encrypted. Please enter its passphrase in the Passphrase field."
+            ),
+            SshKeyError::InvalidPassphrase => {
+                anyhow::anyhow!("Incorrect passphrase for '{}'.", expanded.display())
+            }
+            other => anyhow::Error::new(other),
+        })?;
+
+        let pk = self.add_loaded_key_with_source(key, trimmed_path.to_string());
+
+        if let Ok((resolved_cfg_path, mut cfg_file)) = ClientConfigFile::load(cfg_path) {
+            if !cfg_file.ssh_key_files.iter().any(|p| p.trim() == trimmed_path) {
+                cfg_file.ssh_key_files.push(trimmed_path.to_string());
+                cfg_file.save(Some(&resolved_cfg_path))?;
+            }
+        }
+
+        Ok(pk)
+    }
+
+    /// Loads an OpenSSH private key PEM string (e.g. pasted from clipboard) into the built-in agent
+    /// and persists its unencrypted OpenSSH PEM representation in `client.toml`'s `ssh_keys_inline`.
+    pub fn ui_add_key_from_pem(
+        &self,
+        pem: &str,
+        passphrase: &str,
+        cfg_path: Option<&Path>,
+    ) -> Result<PublicKey> {
+        let trimmed = pem.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Clipboard does not contain an OpenSSH private key");
+        }
+        let pass_opt = if passphrase.is_empty() {
+            None
+        } else {
+            Some(passphrase)
+        };
+        let key = LoadedSshKey::parse_openssh_pem(trimmed, pass_opt).map_err(|e| match e {
+            SshKeyError::PassphraseRequired => anyhow::anyhow!(
+                "The pasted SSH private key is encrypted. Please enter its passphrase in the Passphrase field first."
+            ),
+            SshKeyError::InvalidPassphrase => {
+                anyhow::anyhow!("Incorrect passphrase for the pasted SSH private key.")
+            }
+            other => anyhow::Error::new(other),
+        })?;
+
+        let exported_pem = key.to_openssh_pem();
+        let pk = self.add_loaded_key_with_source(key, "inline".to_string());
+
+        if let Ok((resolved_cfg_path, mut cfg_file)) = ClientConfigFile::load(cfg_path) {
+            let fp = pk.fingerprint_sha256.clone();
+            let already_inline = cfg_file.ssh_keys_inline.iter().any(|existing| {
+                LoadedSshKey::parse_openssh_pem(existing, None)
+                    .map(|k| k.fingerprint_sha256() == fp)
+                    .unwrap_or(false)
+            });
+            if !already_inline {
+                cfg_file.ssh_keys_inline.push(exported_pem);
+                cfg_file.save(Some(&resolved_cfg_path))?;
+            }
+        }
+
+        Ok(pk)
+    }
+
+    /// Removes a built-in SSH key from memory and from `client.toml` (`ssh_key_files` and `ssh_keys_inline`).
+    pub fn ui_remove_builtin_key(
+        &self,
+        item: &HeldKeyDisplayItem,
+        cfg_path: Option<&Path>,
+    ) -> Result<bool> {
+        if !item.is_builtin {
+            anyhow::bail!(
+                "Selected key belongs to the external OS ssh-agent. Use `ssh-add -d` or check 'Use Built-in Keys Only'."
+            );
+        }
+        let removed = self.remove_loaded_key(&item.fingerprint_sha256);
+        if let Ok((resolved_cfg_path, mut cfg_file)) = ClientConfigFile::load(cfg_path) {
+            let target_expanded = expand_tilde_path(&item.source);
+            let before_files = cfg_file.ssh_key_files.len();
+            cfg_file.ssh_key_files.retain(|p| {
+                p.trim() != item.source && expand_tilde_path(p) != target_expanded
+            });
+            let before_inline = cfg_file.ssh_keys_inline.len();
+            cfg_file.ssh_keys_inline.retain(|pem| {
+                LoadedSshKey::parse_openssh_pem(pem, None)
+                    .map(|k| k.fingerprint_sha256() != item.fingerprint_sha256)
+                    .unwrap_or(true)
+            });
+            if cfg_file.ssh_key_files.len() != before_files
+                || cfg_file.ssh_keys_inline.len() != before_inline
+            {
+                cfg_file.save(Some(&resolved_cfg_path))?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Updates `disable_os_agent` in memory and persists it to `client.toml`.
+    pub fn ui_set_disable_os_agent(&self, disable: bool, cfg_path: Option<&Path>) -> Result<()> {
+        self.set_disable_os_agent(disable);
+        if let Ok((resolved_cfg_path, mut cfg_file)) = ClientConfigFile::load(cfg_path) {
+            cfg_file.disable_os_agent = disable;
+            cfg_file.save(Some(&resolved_cfg_path))?;
+        }
+        Ok(())
     }
 }
 

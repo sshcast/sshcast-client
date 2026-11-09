@@ -36,7 +36,7 @@ use crate::policy::ApprovalDecision;
 use crate::prompt::PromptDetails;
 use crate::win_dialogs::{
     cleanup_dialog_fonts, is_any_management_dialog_message, show_backends_window,
-    show_bundle_generator_window, show_enroll_window,
+    show_bundle_generator_window, show_enroll_window, show_ssh_keys_window,
 };
 
 const BTN_APPROVE_ONCE: i32 = 101;
@@ -56,6 +56,7 @@ const IDM_TOGGLE_FORCE_ACTIVE: u32 = 1005;
 const IDM_OPEN_CONFIG_DIR: u32 = 1006;
 const IDM_QUIT: u32 = 1007;
 const IDM_ZELLIJ_DASHBOARD: u32 = 1008;
+const IDM_SSH_KEYS_WINDOW: u32 = 1009;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -321,6 +322,7 @@ pub struct TraySharedContext {
     pub agent_socket_override: Option<String>,
     pub config_dir: PathBuf,
     pub active_config: Mutex<Option<ClientConfig>>,
+    pub local_agent: Arc<LocalAgentConnector>,
     pub force_active_flag: Arc<AtomicBool>,
     pub connected_count: Arc<AtomicUsize>,
     pub reload_tx: watch::Sender<u64>,
@@ -357,6 +359,7 @@ pub fn reload_tray_configuration() {
             cfg.local_agent_socket = Some(sock.clone());
         }
         cfg.force_active = ctx.force_active_flag.load(Ordering::Relaxed);
+        ctx.local_agent.sync_from_client_config(&cfg);
         if let Ok(mut guard) = ctx.active_config.lock() {
             *guard = Some(cfg);
         }
@@ -420,10 +423,7 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
         return;
     }
     std::thread::spawn(move || {
-        let local_agent = LocalAgentConnector::new(
-            cfg.local_agent_socket.clone(),
-            cfg.key_filter.clone(),
-        );
+        let local_agent = Arc::clone(&ctx.local_agent);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -444,11 +444,16 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
         } else {
             keys.iter()
                 .map(|k| {
+                    let src = if local_agent.is_loaded_key(&k.key_blob) {
+                        "Built-in"
+                    } else {
+                        "OS Agent"
+                    };
                     if k.comment.is_empty() {
-                        format!("  • {} ({})", k.fingerprint_sha256, k.key_type)
+                        format!("  • [{src}] {} ({})", k.fingerprint_sha256, k.key_type)
                     } else {
                         format!(
-                            "  • {} ({} — {})",
+                            "  • [{src}] {} ({} — {})",
                             k.fingerprint_sha256, k.key_type, k.comment
                         )
                     }
@@ -543,6 +548,7 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     let conn_label = to_wide(&conn_str);
     let zellij_label = to_wide("Open Zellij Web Dashboard...");
     let status_label = to_wide("Workstation Status & SSH Keys...");
+    let ssh_keys_label = to_wide("Manage SSH Keys (Built-in & OS Agent)...");
     let backends_label = to_wide("Coordinator Backends (Servers)...");
     let bundle_label = to_wide("Generate Enrollment Bundle (Relay / Client)...");
     let enroll_label = to_wide("Initialize / Enroll Workstation...");
@@ -579,6 +585,12 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
         enrolled_flags,
         IDM_STATUS_DIALOG as usize,
         status_label.as_ptr(),
+    );
+    AppendMenuW(
+        hmenu,
+        MF_STRING,
+        IDM_SSH_KEYS_WINDOW as usize,
+        ssh_keys_label.as_ptr(),
     );
     AppendMenuW(
         hmenu,
@@ -649,6 +661,9 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
         }
         IDM_STATUS_DIALOG => {
             spawn_status_dialog(Arc::clone(ctx));
+        }
+        IDM_SSH_KEYS_WINDOW => {
+            show_ssh_keys_window();
         }
         IDM_BACKENDS_WINDOW => {
             show_backends_window();
@@ -765,11 +780,24 @@ pub fn run_windows_tray_loop(
 
         let is_unconfigured = initial_cfg.is_none();
         let config_dir = default_config_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let local_agent = Arc::new(match &initial_cfg {
+            Some(cfg) => LocalAgentConnector::from_client_config(cfg, &[], false)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to load some built-in SSH keys on startup: {:#}", e);
+                    LocalAgentConnector::with_options(
+                        cfg.local_agent_socket.clone(),
+                        cfg.key_filter.clone(),
+                        cfg.disable_os_agent,
+                    )
+                }),
+            None => LocalAgentConnector::new(agent_socket_override.clone(), Default::default()),
+        });
         let ctx = Arc::new(TraySharedContext {
             config_path,
             agent_socket_override,
             config_dir,
             active_config: Mutex::new(initial_cfg),
+            local_agent,
             force_active_flag,
             connected_count,
             reload_tx,

@@ -99,24 +99,20 @@ fn main() -> Result<()> {
                     }
 
                     #[cfg(target_os = "windows")]
-                    let maybe_cfg = sockcast_client::win_native::get_tray_context()
-                        .and_then(|ctx| ctx.current_config());
+                    let maybe_ctx_and_cfg = sockcast_client::win_native::get_tray_context()
+                        .and_then(|ctx| {
+                            let cfg = ctx.current_config()?;
+                            Some((Arc::clone(&ctx.local_agent), cfg))
+                        });
                     #[cfg(target_os = "macos")]
-                    let maybe_cfg = sockcast_client::mac_native::get_tray_context()
-                        .and_then(|ctx| ctx.current_config());
+                    let maybe_ctx_and_cfg = sockcast_client::mac_native::get_tray_context()
+                        .and_then(|ctx| {
+                            let cfg = ctx.current_config()?;
+                            Some((Arc::clone(&ctx.local_agent), cfg))
+                        });
 
-                    if let Some(cfg) = maybe_cfg {
-                        let local_agent = Arc::new(
-                            LocalAgentConnector::from_client_config(&cfg, &[], false)
-                                .unwrap_or_else(|e| {
-                                    tracing::warn!("Failed to load some built-in SSH keys: {:#}", e);
-                                    LocalAgentConnector::with_options(
-                                        cfg.local_agent_socket.clone(),
-                                        cfg.key_filter.clone(),
-                                        cfg.disable_os_agent,
-                                    )
-                                }),
-                        );
+                    if let Some((local_agent, cfg)) = maybe_ctx_and_cfg {
+                        local_agent.sync_from_client_config(&cfg);
                         let manager = WorkstationManager::with_shared_state(
                             cfg,
                             local_agent,

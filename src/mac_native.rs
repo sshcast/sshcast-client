@@ -21,7 +21,7 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSSt
 use crate::config::{default_config_dir, ClientConfig};
 use crate::local_agent::LocalAgentConnector;
 use crate::mac_dialogs::{
-    show_backends_window, show_bundle_generator_window, show_enroll_window,
+    show_backends_window, show_bundle_generator_window, show_enroll_window, show_ssh_keys_window,
 };
 use crate::policy::ApprovalDecision;
 use crate::prompt::PromptDetails;
@@ -31,6 +31,7 @@ pub struct TraySharedContext {
     pub agent_socket_override: Option<String>,
     pub config_dir: PathBuf,
     pub active_config: Mutex<Option<ClientConfig>>,
+    pub local_agent: Arc<LocalAgentConnector>,
     pub force_active_flag: Arc<AtomicBool>,
     pub connected_count: Arc<AtomicUsize>,
     pub reload_tx: watch::Sender<u64>,
@@ -162,6 +163,7 @@ pub fn reload_tray_configuration() {
             cfg.local_agent_socket = Some(sock.clone());
         }
         cfg.force_active = ctx.force_active_flag.load(Ordering::Relaxed);
+        ctx.local_agent.sync_from_client_config(&cfg);
         if let Ok(mut guard) = ctx.active_config.lock() {
             *guard = Some(cfg);
         }
@@ -425,10 +427,7 @@ pub fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
     }
 
     std::thread::spawn(move || {
-        let local_agent = LocalAgentConnector::new(
-            cfg.local_agent_socket.clone(),
-            cfg.key_filter.clone(),
-        );
+        let local_agent = Arc::clone(&ctx.local_agent);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -449,11 +448,16 @@ pub fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
         } else {
             keys.iter()
                 .map(|k| {
+                    let src = if local_agent.is_loaded_key(&k.key_blob) {
+                        "Built-in"
+                    } else {
+                        "OS Agent"
+                    };
                     if k.comment.is_empty() {
-                        format!("  • {} ({})", k.fingerprint_sha256, k.key_type)
+                        format!("  • [{src}] {} ({})", k.fingerprint_sha256, k.key_type)
                     } else {
                         format!(
-                            "  • {} ({} — {})",
+                            "  • [{src}] {} ({} — {})",
                             k.fingerprint_sha256, k.key_type, k.comment
                         )
                     }
@@ -540,6 +544,11 @@ define_class!(
             if let Some(ctx) = get_tray_context() {
                 spawn_status_dialog(ctx);
             }
+        }
+
+        #[unsafe(method(onSshKeysWindow:))]
+        fn on_ssh_keys_window(&self, _sender: Option<&AnyObject>) {
+            show_ssh_keys_window();
         }
 
         #[unsafe(method(onBackendsWindow:))]
@@ -629,11 +638,23 @@ pub fn run_macos_tray_loop(
 
     let is_unconfigured = initial_cfg.is_none();
     let config_dir = default_config_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let local_agent = Arc::new(match &initial_cfg {
+        Some(cfg) => LocalAgentConnector::from_client_config(cfg, &[], false).unwrap_or_else(|e| {
+            tracing::warn!("Failed to load some built-in SSH keys on startup: {:#}", e);
+            LocalAgentConnector::with_options(
+                cfg.local_agent_socket.clone(),
+                cfg.key_filter.clone(),
+                cfg.disable_os_agent,
+            )
+        }),
+        None => LocalAgentConnector::new(agent_socket_override.clone(), Default::default()),
+    });
     let ctx = Arc::new(TraySharedContext {
         config_path,
         agent_socket_override,
         config_dir,
         active_config: Mutex::new(initial_cfg),
+        local_agent,
         force_active_flag,
         connected_count,
         reload_tx,
@@ -712,6 +733,11 @@ pub fn run_macos_tray_loop(
         make_action_item("Open Zellij Web Dashboard...", sel!(onZellijDashboard:), "z");
     let status_action_item =
         make_action_item("Workstation Status & SSH Keys...", sel!(onStatusDialog:), "");
+    let _ssh_keys_action_item = make_action_item(
+        "Manage SSH Keys (Built-in & OS Agent)...",
+        sel!(onSshKeysWindow:),
+        "k",
+    );
     let backends_action_item =
         make_action_item("Coordinator Backends (Servers)...", sel!(onBackendsWindow:), "");
     let bundle_action_item = make_action_item(

@@ -41,10 +41,12 @@ use crate::enroll::{
 };
 use crate::win_native::{show_tray_error_dialog, TraySharedContext};
 
+const ES_PASSWORD: u32 = 0x0020;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 const ES_READONLY: u32 = 0x0800;
 
 const BS_PUSHBUTTON: u32 = 0x0000;
+const BS_AUTOCHECKBOX: u32 = 0x0003;
 const BS_AUTORADIOBUTTON: u32 = 0x0009;
 const BS_COMMANDLINK: u32 = 0x000E;
 const BS_DEFCOMMANDLINK: u32 = 0x000F;
@@ -65,6 +67,7 @@ const LB_ERR: isize = -1;
 
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
+const BST_UNCHECKED: usize = 0;
 const BST_CHECKED: usize = 1;
 const BN_CLICKED: u32 = 0;
 
@@ -119,6 +122,17 @@ const ID_BACKENDS_BTN_ADD: i32 = 4004;
 const ID_BACKENDS_BTN_SAVE: i32 = 4005;
 const ID_BACKENDS_BTN_CLOSE: i32 = 4007;
 
+// Control IDs for SSH Keys Manager Window
+const ID_SSHKEYS_LISTBOX: i32 = 5001;
+const ID_SSHKEYS_BTN_REMOVE: i32 = 5002;
+const ID_SSHKEYS_BTN_REFRESH: i32 = 5003;
+const ID_SSHKEYS_CHK_NO_OS_AGENT: i32 = 5004;
+const ID_SSHKEYS_PATH_EDIT: i32 = 5005;
+const ID_SSHKEYS_PASS_EDIT: i32 = 5006;
+const ID_SSHKEYS_BTN_ADD_FILE: i32 = 5007;
+const ID_SSHKEYS_BTN_PASTE_PEM: i32 = 5008;
+const ID_SSHKEYS_BTN_CLOSE: i32 = 5009;
+
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
@@ -140,6 +154,7 @@ struct DialogResources {
     enroll_hwnd: isize,
     bundle_hwnd: isize,
     backends_hwnd: isize,
+    ssh_keys_hwnd: isize,
     font_title: isize,
     font_section: isize,
     font_ui: isize,
@@ -155,6 +170,7 @@ static DIALOG_RES: Mutex<DialogResources> = Mutex::new(DialogResources {
     enroll_hwnd: 0,
     bundle_hwnd: 0,
     backends_hwnd: 0,
+    ssh_keys_hwnd: 0,
     font_title: 0,
     font_section: 0,
     font_ui: 0,
@@ -321,11 +337,12 @@ pub unsafe fn cleanup_dialog_fonts() {
 }
 
 pub unsafe fn is_any_management_dialog_message(msg: &MSG) -> bool {
-    let (h1, h2, h3) = match DIALOG_RES.lock() {
+    let (h1, h2, h3, h4) = match DIALOG_RES.lock() {
         Ok(g) => (
             g.enroll_hwnd as HWND,
             g.bundle_hwnd as HWND,
             g.backends_hwnd as HWND,
+            g.ssh_keys_hwnd as HWND,
         ),
         Err(_) => return false,
     };
@@ -336,6 +353,9 @@ pub unsafe fn is_any_management_dialog_message(msg: &MSG) -> bool {
         return true;
     }
     if !h3.is_null() && IsWindow(h3) != 0 && IsDialogMessageW(h3, msg) != 0 {
+        return true;
+    }
+    if !h4.is_null() && IsWindow(h4) != 0 && IsDialogMessageW(h4, msg) != 0 {
         return true;
     }
     false
@@ -2394,6 +2414,479 @@ pub unsafe fn show_backends_window() {
     let hwnd = create_centered_dialog_window(&class_name, &title, 560, 420, dpi);
     if !hwnd.is_null() {
         DIALOG_RES.lock().unwrap().backends_hwnd = hwnd as isize;
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+// ============================================================================
+// 4. MANAGE SSH KEYS WINDOW (620 x 490 Client Area)
+// ============================================================================
+
+static SSH_KEYS_ITEMS: Mutex<Vec<crate::local_agent::HeldKeyDisplayItem>> = Mutex::new(Vec::new());
+
+unsafe fn refresh_ssh_keys_listbox(hwnd: HWND) {
+    let lb = GetDlgItem(hwnd, ID_SSHKEYS_LISTBOX);
+    if lb.is_null() {
+        return;
+    }
+    SendMessageW(lb, LB_RESETCONTENT, 0, 0);
+
+    let Some(ctx) = crate::win_native::get_tray_context() else {
+        return;
+    };
+
+    let chk = GetDlgItem(hwnd, ID_SSHKEYS_CHK_NO_OS_AGENT);
+    if !chk.is_null() {
+        let state = if ctx.local_agent.is_os_agent_disabled() {
+            BST_CHECKED
+        } else {
+            BST_UNCHECKED
+        };
+        SendMessageW(chk, BM_SETCHECK, state, 0);
+    }
+
+    let items = ctx.local_agent.query_held_keys_for_ui();
+    for item in &items {
+        let w = to_wide(&item.display_line);
+        SendMessageW(lb, LB_ADDSTRING, 0, w.as_ptr() as isize);
+    }
+    if !items.is_empty() {
+        SendMessageW(lb, LB_SETCURSEL, 0, 0);
+    }
+    if let Ok(mut guard) = SSH_KEYS_ITEMS.lock() {
+        *guard = items;
+    }
+}
+
+unsafe extern "system" fn ssh_keys_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            paint_taskdialog_frame(hwnd, &[56, 260]);
+            0
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => handle_ctlcolor(wparam, lparam),
+        WM_CREATE => {
+            let dpi = get_dpi_scale();
+            let assets = ensure_theme_assets(dpi);
+
+            create_label(
+                hwnd,
+                "Manage SSH Agent Keys (Built-in & OS Agent)",
+                62,
+                18,
+                534,
+                28,
+                ID_STYLE_MAIN_HEADER,
+                dpi,
+                assets.font_title,
+            );
+
+            create_label(
+                hwnd,
+                "Held SSH Keys ([Built-in] in-memory keys & [OS Agent] keys):",
+                24,
+                68,
+                572,
+                18,
+                ID_STYLE_SECTION_HEADER_1,
+                dpi,
+                assets.font_section,
+            );
+
+            create_child_ex(
+                hwnd,
+                WS_EX_CLIENTEDGE,
+                "LISTBOX",
+                "",
+                WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP,
+                24,
+                92,
+                436,
+                128,
+                ID_SSHKEYS_LISTBOX,
+                dpi,
+                assets.font_mono,
+            );
+
+            create_button(
+                hwnd,
+                "Remove Selected",
+                468,
+                92,
+                128,
+                30,
+                ID_SSHKEYS_BTN_REMOVE,
+                dpi,
+                assets.font_ui,
+            );
+            create_button(
+                hwnd,
+                "Refresh List",
+                468,
+                130,
+                128,
+                30,
+                ID_SSHKEYS_BTN_REFRESH,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_child_ex(
+                hwnd,
+                0,
+                "BUTTON",
+                "Use Built-in Keys Only (Disable external OS ssh-agent)",
+                BS_AUTOCHECKBOX | WS_TABSTOP,
+                24,
+                228,
+                572,
+                22,
+                ID_SSHKEYS_CHK_NO_OS_AGENT,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_label(
+                hwnd,
+                "Add OpenSSH Private Key to Built-in Agent",
+                24,
+                272,
+                572,
+                20,
+                ID_STYLE_SECTION_HEADER_2,
+                dpi,
+                assets.font_section,
+            );
+
+            create_label(
+                hwnd,
+                "Private Key File Path (e.g. ~/.ssh/id_ed25519):",
+                24,
+                298,
+                356,
+                18,
+                0,
+                dpi,
+                assets.font_ui,
+            );
+            create_label(
+                hwnd,
+                "Passphrase (if encrypted):",
+                392,
+                298,
+                204,
+                18,
+                0,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_edit(
+                hwnd,
+                "~/.ssh/id_ed25519",
+                "~/.ssh/id_ed25519",
+                false,
+                24,
+                318,
+                356,
+                26,
+                ID_SSHKEYS_PATH_EDIT,
+                dpi,
+                assets.font_mono,
+            );
+
+            let pass_hwnd = create_child_ex(
+                hwnd,
+                WS_EX_CLIENTEDGE,
+                "EDIT",
+                "",
+                ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP,
+                392,
+                318,
+                204,
+                26,
+                ID_SSHKEYS_PASS_EDIT,
+                dpi,
+                assets.font_ui,
+            );
+            if !pass_hwnd.is_null() {
+                let cue_w = to_wide("Optional passphrase");
+                SendMessageW(pass_hwnd, EM_SETCUEBANNER, 1, cue_w.as_ptr() as isize);
+            }
+
+            create_command_link(
+                hwnd,
+                "Add Key File to Built-in Agent",
+                "Load OpenSSH private key into memory and save path in client.toml",
+                true,
+                24,
+                356,
+                356,
+                58,
+                ID_SSHKEYS_BTN_ADD_FILE,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_command_link(
+                hwnd,
+                "Paste PEM Key",
+                "Import from clipboard",
+                false,
+                392,
+                356,
+                204,
+                58,
+                ID_SSHKEYS_BTN_PASTE_PEM,
+                dpi,
+                assets.font_ui,
+            );
+
+            // Footer Bar (y = 436 .. 490)
+            create_label(
+                hwnd,
+                "Manage built-in SSH private keys or view OS ssh-agent keys.",
+                24,
+                453,
+                456,
+                20,
+                ID_STYLE_FOOTER_STATUS,
+                dpi,
+                assets.font_ui,
+            );
+            create_button(
+                hwnd,
+                "Close",
+                496,
+                448,
+                100,
+                30,
+                ID_SSHKEYS_BTN_CLOSE,
+                dpi,
+                assets.font_ui,
+            );
+
+            refresh_ssh_keys_listbox(hwnd);
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam & 0xFFFF) as i32;
+            let code = ((wparam >> 16) & 0xFFFF) as u32;
+            if code == BN_CLICKED {
+                match id {
+                    ID_SSHKEYS_BTN_REFRESH => {
+                        refresh_ssh_keys_listbox(hwnd);
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_STYLE_FOOTER_STATUS,
+                            "Refreshed built-in and OS ssh-agent key list.",
+                        );
+                    }
+                    ID_SSHKEYS_CHK_NO_OS_AGENT => {
+                        let chk = GetDlgItem(hwnd, ID_SSHKEYS_CHK_NO_OS_AGENT);
+                        let checked =
+                            SendMessageW(chk, BM_GETCHECK, 0, 0) as usize == BST_CHECKED;
+                        if let Some(ctx) = crate::win_native::get_tray_context() {
+                            if let Err(e) = ctx
+                                .local_agent
+                                .ui_set_disable_os_agent(checked, ctx.config_path.as_deref())
+                            {
+                                show_tray_error_dialog(
+                                    "Failed to Save Setting",
+                                    "Could not update disable_os_agent in client.toml",
+                                    &format!("{e:#}"),
+                                );
+                            }
+                            crate::win_native::reload_tray_configuration();
+                        }
+                        refresh_ssh_keys_listbox(hwnd);
+                        let msg = if checked {
+                            "Enabled Built-in Keys Only mode (OS ssh-agent disabled)."
+                        } else {
+                            "Enabled Hybrid mode (Built-in + OS ssh-agent keys)."
+                        };
+                        set_dlg_item_string(hwnd, ID_STYLE_FOOTER_STATUS, msg);
+                    }
+                    ID_SSHKEYS_BTN_ADD_FILE => {
+                        let raw_path = get_dlg_item_string(hwnd, ID_SSHKEYS_PATH_EDIT);
+                        let passphrase = get_dlg_item_string(hwnd, ID_SSHKEYS_PASS_EDIT);
+                        let Some(ctx) = crate::win_native::get_tray_context() else {
+                            return 0;
+                        };
+                        match ctx.local_agent.ui_add_key_from_file(
+                            &raw_path,
+                            &passphrase,
+                            ctx.config_path.as_deref(),
+                        ) {
+                            Ok(pk) => {
+                                set_dlg_item_string(hwnd, ID_SSHKEYS_PASS_EDIT, "");
+                                crate::win_native::reload_tray_configuration();
+                                refresh_ssh_keys_listbox(hwnd);
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    &format!(
+                                        "Loaded built-in key {} ({})!",
+                                        pk.fingerprint_sha256, pk.comment
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                show_tray_error_dialog(
+                                    "Failed to Load SSH Key",
+                                    "Could not load OpenSSH private key file",
+                                    &format!("{e:#}"),
+                                );
+                            }
+                        }
+                    }
+                    ID_SSHKEYS_BTN_PASTE_PEM => {
+                        let Some(clip_pem) = paste_from_clipboard(hwnd) else {
+                            show_tray_error_dialog(
+                                "Clipboard Empty",
+                                "No text found on the clipboard",
+                                "Copy an OpenSSH private key (-----BEGIN OPENSSH PRIVATE KEY-----) to the clipboard first.",
+                            );
+                            return 0;
+                        };
+                        let passphrase = get_dlg_item_string(hwnd, ID_SSHKEYS_PASS_EDIT);
+                        let Some(ctx) = crate::win_native::get_tray_context() else {
+                            return 0;
+                        };
+                        match ctx.local_agent.ui_add_key_from_pem(
+                            &clip_pem,
+                            &passphrase,
+                            ctx.config_path.as_deref(),
+                        ) {
+                            Ok(pk) => {
+                                set_dlg_item_string(hwnd, ID_SSHKEYS_PASS_EDIT, "");
+                                crate::win_native::reload_tray_configuration();
+                                refresh_ssh_keys_listbox(hwnd);
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    &format!(
+                                        "Imported inline SSH key {} ({}) from clipboard!",
+                                        pk.fingerprint_sha256, pk.comment
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                show_tray_error_dialog(
+                                    "Failed to Import SSH Key",
+                                    "Clipboard does not contain a valid OpenSSH private key or passphrase is required",
+                                    &format!("{e:#}"),
+                                );
+                            }
+                        }
+                    }
+                    ID_SSHKEYS_BTN_REMOVE => {
+                        let lb = GetDlgItem(hwnd, ID_SSHKEYS_LISTBOX);
+                        let sel = SendMessageW(lb, LB_GETCURSEL, 0, 0);
+                        if sel == LB_ERR {
+                            return 0;
+                        }
+                        let maybe_item = SSH_KEYS_ITEMS
+                            .lock()
+                            .ok()
+                            .and_then(|items| items.get(sel as usize).cloned());
+                        let Some(item) = maybe_item else {
+                            return 0;
+                        };
+                        let Some(ctx) = crate::win_native::get_tray_context() else {
+                            return 0;
+                        };
+                        match ctx
+                            .local_agent
+                            .ui_remove_builtin_key(&item, ctx.config_path.as_deref())
+                        {
+                            Ok(_) => {
+                                crate::win_native::reload_tray_configuration();
+                                refresh_ssh_keys_listbox(hwnd);
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    &format!(
+                                        "Removed built-in key {} ({}).",
+                                        item.fingerprint_sha256, item.comment
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                show_tray_error_dialog(
+                                    "Cannot Remove Key",
+                                    "Selected key is managed by the external OS ssh-agent",
+                                    &format!("{e:#}"),
+                                );
+                            }
+                        }
+                    }
+                    2 | ID_SSHKEYS_BTN_CLOSE => {
+                        DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            if let Ok(mut g) = DIALOG_RES.lock() {
+                if g.ssh_keys_hwnd == hwnd as isize {
+                    g.ssh_keys_hwnd = 0;
+                }
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+pub unsafe fn show_ssh_keys_window() {
+    {
+        let g = DIALOG_RES.lock().unwrap();
+        let existing = g.ssh_keys_hwnd as HWND;
+        if !existing.is_null() && IsWindow(existing) != 0 {
+            refresh_ssh_keys_listbox(existing);
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+            return;
+        }
+    }
+
+    let dpi = get_dpi_scale();
+    let assets = ensure_theme_assets(dpi);
+    let hinstance = GetModuleHandleW(null());
+    let class_name = to_wide("SockcastSshKeysWndClassV1");
+    let title = to_wide("Sockcast — Manage SSH Keys");
+
+    let wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(ssh_keys_wnd_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: LoadIconW(null_mut(), IDI_SHIELD),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hbrBackground: assets.brush_white,
+        lpszMenuName: null(),
+        lpszClassName: class_name.as_ptr(),
+    };
+    RegisterClassW(&wc);
+
+    let hwnd = create_centered_dialog_window(&class_name, &title, 620, 490, dpi);
+    if !hwnd.is_null() {
+        DIALOG_RES.lock().unwrap().ssh_keys_hwnd = hwnd as isize;
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }

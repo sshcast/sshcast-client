@@ -817,7 +817,7 @@ async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
     let _ = shutdown_tx.send(true);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_builtin_ssh_agent_keys_without_os_agent() {
     use sockcast_proto::ssh::LoadedSshKey;
 
@@ -967,6 +967,73 @@ async fn test_builtin_ssh_agent_keys_without_os_agent() {
     builtin_key
         .verify_ssh_signature_blob(&challenge_data, &resp.signature_blob)
         .unwrap();
+
+    // Also test the Tray UI key-management helpers (add from file, paste PEM, list held keys, remove, toggle OS agent)
+    let ui_cfg_path = tmp.path().join("tray_client.toml");
+    let user_sk = SigningKey::from_bytes(&[0x80; 32]);
+    let bundle = mint_enrollment_bundle(
+        &user_sk,
+        "tray-workstation",
+        NodeRole::Client,
+        vec!["https://coord.example.com".to_string()],
+        0,
+    )
+    .unwrap();
+    write_client_config_from_bundle(&bundle, Some(&ui_cfg_path), true).unwrap();
+
+    let tray_agent = LocalAgentConnector::with_options(
+        Some(spawn_mock_local_ssh_agent(&tmp).await),
+        KeyFilterConfig::default(),
+        false,
+    );
+
+    // 1. Initially shows the 2 OS agent keys from the mock agent
+    let held_initial = tray_agent.query_held_keys_for_ui();
+    assert_eq!(held_initial.len(), 2);
+    assert!(held_initial.iter().all(|i| !i.is_builtin));
+
+    // 2. Add key from file via UI helper -> appears as [Built-in] and persists in client.toml
+    let pk_added = tray_agent
+        .ui_add_key_from_file(
+            &key_file_path.to_string_lossy(),
+            "",
+            Some(&ui_cfg_path),
+        )
+        .unwrap();
+    assert_eq!(pk_added.comment, "builtin@browser-ready");
+
+    // 3. Paste inline PEM key via UI helper -> appears as [Built-in] and persists in client.toml
+    let inline_key = LoadedSshKey::generate_ed25519("pasted@clipboard");
+    let pk_inline = tray_agent
+        .ui_add_key_from_pem(&inline_key.to_openssh_pem(), "", Some(&ui_cfg_path))
+        .unwrap();
+    assert_eq!(pk_inline.comment, "pasted@clipboard");
+
+    let held_after_add = tray_agent.query_held_keys_for_ui();
+    assert_eq!(held_after_add.len(), 4); // 2 built-in + 2 OS agent
+    assert_eq!(held_after_add.iter().filter(|i| i.is_builtin).count(), 2);
+
+    // 4. Toggle "Built-in Keys Only" (disable OS agent) via UI helper
+    tray_agent
+        .ui_set_disable_os_agent(true, Some(&ui_cfg_path))
+        .unwrap();
+    let held_builtin_only = tray_agent.query_held_keys_for_ui();
+    assert_eq!(held_builtin_only.len(), 2);
+    assert!(held_builtin_only.iter().all(|i| i.is_builtin));
+
+    // 5. Remove the first built-in key via UI helper and verify client.toml was updated
+    let removed = tray_agent
+        .ui_remove_builtin_key(&held_builtin_only[0], Some(&ui_cfg_path))
+        .unwrap();
+    assert!(removed);
+    let held_after_remove = tray_agent.query_held_keys_for_ui();
+    assert_eq!(held_after_remove.len(), 1);
+    assert_eq!(held_after_remove[0].comment, "pasted@clipboard");
+
+    let reloaded_cfg = ClientConfig::load(Some(&ui_cfg_path)).unwrap();
+    assert!(reloaded_cfg.disable_os_agent);
+    assert!(reloaded_cfg.ssh_key_files.is_empty());
+    assert_eq!(reloaded_cfg.ssh_keys_inline.len(), 1);
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), manager_handle).await;

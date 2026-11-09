@@ -290,7 +290,7 @@ fn add_action_card_button(
             mtm,
         )
     };
-    btn.setFrame(top_cgrect(win_h, x + 10.0, y + 5.0, 260.0, 28.0));
+    btn.setFrame(top_cgrect(win_h, x + 10.0, y + 5.0, (w - 20.0).min(260.0), 28.0));
     if is_default {
         btn.setKeyEquivalent(&NSString::from_str("\r"));
     }
@@ -343,6 +343,7 @@ thread_local! {
     static ENROLL_WINDOW: RefCell<Option<EnrollWindowWidgets>> = const { RefCell::new(None) };
     static BUNDLE_WINDOW: RefCell<Option<BundleWindowWidgets>> = const { RefCell::new(None) };
     static BACKENDS_WINDOW: RefCell<Option<BackendsWindowWidgets>> = const { RefCell::new(None) };
+    static SSH_KEYS_WINDOW: RefCell<Option<SshKeysWindowWidgets>> = const { RefCell::new(None) };
 }
 
 #[derive(Default)]
@@ -1942,6 +1943,544 @@ pub fn show_backends_window() {
         widgets.window.makeKeyAndOrderFront(None);
 
         BACKENDS_WINDOW.with(|cell| {
+            *cell.borrow_mut() = Some(widgets);
+        });
+    });
+}
+
+// ============================================================================
+// 4. MANAGE SSH KEYS WINDOW (620 x 490)
+// ============================================================================
+
+struct SshKeysWindowWidgets {
+    window: Retained<NSWindow>,
+    items: Vec<crate::local_agent::HeldKeyDisplayItem>,
+    keys_display: Retained<NSTextField>,
+    key_popup: Retained<NSPopUpButton>,
+    radio_hybrid: Retained<NSButton>,
+    radio_builtin_only: Retained<NSButton>,
+    path_edit: Retained<NSTextField>,
+    pass_edit: Retained<NSTextField>,
+    footer_status: Retained<NSTextField>,
+    _handler: Retained<SshKeysWindowHandler>,
+}
+
+impl SshKeysWindowWidgets {
+    fn refresh_from_agent(&mut self) {
+        if let Some(ctx) = get_tray_context() {
+            let disable_os = ctx.local_agent.is_os_agent_disabled();
+            self.radio_hybrid.setState(if disable_os {
+                NSControlStateValueOff
+            } else {
+                NSControlStateValueOn
+            });
+            self.radio_builtin_only.setState(if disable_os {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            self.items = ctx.local_agent.query_held_keys_for_ui();
+        } else {
+            self.items.clear();
+        }
+
+        self.key_popup.removeAllItems();
+        for item in &self.items {
+            self.key_popup
+                .addItemWithTitle(&NSString::from_str(&item.display_line));
+        }
+
+        let summary = if self.items.is_empty() {
+            "(No SSH keys currently loaded in Built-in Agent or available in OS ssh-agent)"
+                .to_string()
+        } else {
+            self.items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| format!("  {}. {}", i + 1, item.display_line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.keys_display
+            .setStringValue(&NSString::from_str(&summary));
+    }
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SockcastSshKeysWindowHandler"]
+    #[ivars = EmptyIvars]
+    struct SshKeysWindowHandler;
+
+    unsafe impl NSObjectProtocol for SshKeysWindowHandler {}
+
+    impl SshKeysWindowHandler {
+        #[unsafe(method(onRefreshKeys:))]
+        fn on_refresh_keys(&self, _sender: Option<&AnyObject>) {
+            SSH_KEYS_WINDOW.with(|cell| {
+                if let Some(ref mut w) = *cell.borrow_mut() {
+                    w.refresh_from_agent();
+                    w.footer_status.setStringValue(&NSString::from_str(
+                        "Refreshed built-in and OS ssh-agent key list.",
+                    ));
+                }
+            });
+        }
+
+        #[unsafe(method(onSelectHybrid:))]
+        fn on_select_hybrid(&self, _sender: Option<&AnyObject>) {
+            if let Some(ctx) = get_tray_context() {
+                if let Err(e) = ctx
+                    .local_agent
+                    .ui_set_disable_os_agent(false, ctx.config_path.as_deref())
+                {
+                    show_tray_error_dialog(
+                        "Failed to Save Setting",
+                        "Could not update disable_os_agent in client.toml",
+                        &format!("{e:#}"),
+                    );
+                }
+                reload_tray_configuration();
+            }
+            SSH_KEYS_WINDOW.with(|cell| {
+                if let Some(ref mut w) = *cell.borrow_mut() {
+                    w.refresh_from_agent();
+                    w.footer_status.setStringValue(&NSString::from_str(
+                        "Enabled Hybrid mode (Built-in + OS ssh-agent keys).",
+                    ));
+                }
+            });
+        }
+
+        #[unsafe(method(onSelectBuiltinOnly:))]
+        fn on_select_builtin_only(&self, _sender: Option<&AnyObject>) {
+            if let Some(ctx) = get_tray_context() {
+                if let Err(e) = ctx
+                    .local_agent
+                    .ui_set_disable_os_agent(true, ctx.config_path.as_deref())
+                {
+                    show_tray_error_dialog(
+                        "Failed to Save Setting",
+                        "Could not update disable_os_agent in client.toml",
+                        &format!("{e:#}"),
+                    );
+                }
+                reload_tray_configuration();
+            }
+            SSH_KEYS_WINDOW.with(|cell| {
+                if let Some(ref mut w) = *cell.borrow_mut() {
+                    w.refresh_from_agent();
+                    w.footer_status.setStringValue(&NSString::from_str(
+                        "Enabled Built-in Keys Only mode (OS ssh-agent disabled).",
+                    ));
+                }
+            });
+        }
+
+        #[unsafe(method(onRemoveKey:))]
+        fn on_remove_key(&self, _sender: Option<&AnyObject>) {
+            let selected_item = SSH_KEYS_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    let idx = w.key_popup.indexOfSelectedItem();
+                    if idx >= 0 && (idx as usize) < w.items.len() {
+                        Some(w.items[idx as usize].clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            let Some(item) = selected_item else {
+                return;
+            };
+            let Some(ctx) = get_tray_context() else {
+                return;
+            };
+            match ctx
+                .local_agent
+                .ui_remove_builtin_key(&item, ctx.config_path.as_deref())
+            {
+                Ok(_) => {
+                    reload_tray_configuration();
+                    let status = format!(
+                        "Removed built-in key {} ({}).",
+                        item.fingerprint_sha256, item.comment
+                    );
+                    SSH_KEYS_WINDOW.with(|cell| {
+                        if let Some(ref mut w) = *cell.borrow_mut() {
+                            w.refresh_from_agent();
+                            w.footer_status.setStringValue(&NSString::from_str(&status));
+                        }
+                    });
+                }
+                Err(e) => {
+                    show_tray_error_dialog(
+                        "Cannot Remove Key",
+                        "Selected key is managed by the external OS ssh-agent",
+                        &format!("{e:#}"),
+                    );
+                }
+            }
+        }
+
+        #[unsafe(method(onAddKeyFile:))]
+        fn on_add_key_file(&self, _sender: Option<&AnyObject>) {
+            let (raw_path, passphrase) = SSH_KEYS_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    (
+                        w.path_edit.stringValue().to_string(),
+                        w.pass_edit.stringValue().to_string(),
+                    )
+                } else {
+                    (String::new(), String::new())
+                }
+            });
+            let Some(ctx) = get_tray_context() else {
+                return;
+            };
+            match ctx.local_agent.ui_add_key_from_file(
+                &raw_path,
+                &passphrase,
+                ctx.config_path.as_deref(),
+            ) {
+                Ok(pk) => {
+                    reload_tray_configuration();
+                    let status = format!(
+                        "Loaded built-in key {} ({})!",
+                        pk.fingerprint_sha256, pk.comment
+                    );
+                    SSH_KEYS_WINDOW.with(|cell| {
+                        if let Some(ref mut w) = *cell.borrow_mut() {
+                            w.pass_edit.setStringValue(&NSString::from_str(""));
+                            w.refresh_from_agent();
+                            w.footer_status.setStringValue(&NSString::from_str(&status));
+                        }
+                    });
+                }
+                Err(e) => {
+                    show_tray_error_dialog(
+                        "Failed to Load SSH Key",
+                        "Could not load OpenSSH private key file",
+                        &format!("{e:#}"),
+                    );
+                }
+            }
+        }
+
+        #[unsafe(method(onPasteKeyPem:))]
+        fn on_paste_key_pem(&self, _sender: Option<&AnyObject>) {
+            let Some(clip_pem) = paste_from_clipboard() else {
+                show_tray_error_dialog(
+                    "Clipboard Empty",
+                    "No text found on the clipboard",
+                    "Copy an OpenSSH private key (-----BEGIN OPENSSH PRIVATE KEY-----) to the clipboard first.",
+                );
+                return;
+            };
+            let passphrase = SSH_KEYS_WINDOW.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .map(|w| w.pass_edit.stringValue().to_string())
+                    .unwrap_or_default()
+            });
+            let Some(ctx) = get_tray_context() else {
+                return;
+            };
+            match ctx.local_agent.ui_add_key_from_pem(
+                &clip_pem,
+                &passphrase,
+                ctx.config_path.as_deref(),
+            ) {
+                Ok(pk) => {
+                    reload_tray_configuration();
+                    let status = format!(
+                        "Imported inline SSH key {} ({}) from clipboard!",
+                        pk.fingerprint_sha256, pk.comment
+                    );
+                    SSH_KEYS_WINDOW.with(|cell| {
+                        if let Some(ref mut w) = *cell.borrow_mut() {
+                            w.pass_edit.setStringValue(&NSString::from_str(""));
+                            w.refresh_from_agent();
+                            w.footer_status.setStringValue(&NSString::from_str(&status));
+                        }
+                    });
+                }
+                Err(e) => {
+                    show_tray_error_dialog(
+                        "Failed to Import SSH Key",
+                        "Clipboard does not contain a valid OpenSSH private key or passphrase is required",
+                        &format!("{e:#}"),
+                    );
+                }
+            }
+        }
+
+        #[unsafe(method(onClose:))]
+        fn on_close(&self, _sender: Option<&AnyObject>) {
+            SSH_KEYS_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    w.window.close();
+                }
+            });
+        }
+    }
+);
+
+impl SshKeysWindowHandler {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = mtm.alloc::<Self>().set_ivars(EmptyIvars::default());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+pub fn show_ssh_keys_window() {
+    run_on_main_async(|mtm| {
+        let app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+
+        let already_created = SSH_KEYS_WINDOW.with(|cell| {
+            if let Some(ref mut w) = *cell.borrow_mut() {
+                w.refresh_from_agent();
+                w.window.makeKeyAndOrderFront(None);
+                true
+            } else {
+                false
+            }
+        });
+        if already_created {
+            return;
+        }
+
+        let win_w: CGFloat = 620.0;
+        let win_h: CGFloat = 490.0;
+        let window = create_centered_window(mtm, "Sockcast — Manage SSH Keys", win_w, win_h);
+        let content_view = window.contentView().expect("window has contentView");
+        let handler = SshKeysWindowHandler::new(mtm);
+
+        add_window_chrome(
+            mtm,
+            &content_view,
+            win_w,
+            win_h,
+            "Manage SSH Agent Keys (Built-in & OS Agent)",
+            &[56.0, 260.0],
+        );
+
+        add_section_header(
+            mtm,
+            &content_view,
+            win_h,
+            "Held SSH Keys ([Built-in] in-memory keys & [OS Agent] keys):",
+            24.0,
+            68.0,
+            572.0,
+            20.0,
+        );
+
+        let keys_display = add_edit_field(
+            mtm,
+            &content_view,
+            win_h,
+            "",
+            "",
+            true,
+            true,
+            24.0,
+            92.0,
+            572.0,
+            84.0,
+        );
+
+        let key_popup = NSPopUpButton::initWithFrame_pullsDown(
+            mtm.alloc(),
+            top_rect(win_h, 24.0, 184.0, 326.0, 28.0),
+            false,
+        );
+        content_view.addSubview(&key_popup);
+
+        add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Remove Selected",
+            &handler,
+            sel!(onRemoveKey:),
+            false,
+            358.0,
+            184.0,
+            124.0,
+            28.0,
+        );
+        add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Refresh List",
+            &handler,
+            sel!(onRefreshKeys:),
+            false,
+            488.0,
+            184.0,
+            108.0,
+            28.0,
+        );
+
+        let radio_hybrid = unsafe {
+            NSButton::radioButtonWithTitle_target_action(
+                &NSString::from_str("Hybrid Mode (Built-in + OS ssh-agent)"),
+                Some(&handler),
+                Some(sel!(onSelectHybrid:)),
+                mtm,
+            )
+        };
+        radio_hybrid.setFrame(top_cgrect(win_h, 24.0, 224.0, 280.0, 22.0));
+        radio_hybrid.setState(NSControlStateValueOn);
+        content_view.addSubview(&radio_hybrid);
+
+        let radio_builtin_only = unsafe {
+            NSButton::radioButtonWithTitle_target_action(
+                &NSString::from_str("Built-in Keys Only (Disable OS ssh-agent)"),
+                Some(&handler),
+                Some(sel!(onSelectBuiltinOnly:)),
+                mtm,
+            )
+        };
+        radio_builtin_only.setFrame(top_cgrect(win_h, 312.0, 224.0, 284.0, 22.0));
+        radio_builtin_only.setState(NSControlStateValueOff);
+        content_view.addSubview(&radio_builtin_only);
+
+        add_section_header(
+            mtm,
+            &content_view,
+            win_h,
+            "Add OpenSSH Private Key to Built-in Agent",
+            24.0,
+            272.0,
+            572.0,
+            20.0,
+        );
+
+        add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "Private Key File Path (e.g. ~/.ssh/id_ed25519):",
+            24.0,
+            298.0,
+            356.0,
+            18.0,
+        );
+        add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "Passphrase (if encrypted):",
+            392.0,
+            298.0,
+            204.0,
+            18.0,
+        );
+
+        let path_edit = add_edit_field(
+            mtm,
+            &content_view,
+            win_h,
+            "~/.ssh/id_ed25519",
+            "~/.ssh/id_ed25519",
+            false,
+            true,
+            24.0,
+            318.0,
+            356.0,
+            24.0,
+        );
+        let pass_edit = add_edit_field(
+            mtm,
+            &content_view,
+            win_h,
+            "",
+            "Optional passphrase",
+            false,
+            false,
+            392.0,
+            318.0,
+            204.0,
+            24.0,
+        );
+
+        add_action_card_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Add Key File to Built-in Agent",
+            "Load private key into memory and save path in client.toml",
+            &handler,
+            sel!(onAddKeyFile:),
+            true,
+            24.0,
+            356.0,
+            356.0,
+            58.0,
+        );
+
+        add_action_card_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Paste PEM Key",
+            "Import key from clipboard",
+            &handler,
+            sel!(onPasteKeyPem:),
+            false,
+            392.0,
+            356.0,
+            204.0,
+            58.0,
+        );
+
+        let footer_status = add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "Manage built-in SSH private keys or view OS ssh-agent keys.",
+            24.0,
+            454.0,
+            456.0,
+            20.0,
+        );
+        add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Close",
+            &handler,
+            sel!(onClose:),
+            false,
+            496.0,
+            448.0,
+            100.0,
+            28.0,
+        );
+
+        let mut widgets = SshKeysWindowWidgets {
+            window,
+            items: Vec::new(),
+            keys_display,
+            key_popup,
+            radio_hybrid,
+            radio_builtin_only,
+            path_edit,
+            pass_edit,
+            footer_status,
+            _handler: handler,
+        };
+        widgets.refresh_from_agent();
+        widgets.window.makeKeyAndOrderFront(None);
+
+        SSH_KEYS_WINDOW.with(|cell| {
             *cell.borrow_mut() = Some(widgets);
         });
     });
