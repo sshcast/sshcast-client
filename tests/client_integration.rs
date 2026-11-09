@@ -785,5 +785,25 @@ async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
     let r3_str = String::from_utf8_lossy(&r3);
     assert!(r3_str.ends_with("ZELLIJ_WEB_OK!"));
 
+    // 4. GET /__sockcast/SymbolsNerdFontMono-Regular.ttf -> served locally by sockcast-client
+    let mut s4 = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    s4.write_all(
+        format!(
+            "GET /__sockcast/SymbolsNerdFontMono-Regular.ttf HTTP/1.1\r\nHost: sunduk.localhost:{}\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+            proxy_addr.port()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut r4 = Vec::new();
+    s4.read_to_end(&mut r4).await.unwrap();
+    let r4_hdr_end = r4.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let r4_hdr = std::str::from_utf8(&r4[..r4_hdr_end]).unwrap();
+    assert!(r4_hdr.starts_with("HTTP/1.1 200 OK"));
+    assert!(r4_hdr.contains("Content-Type: font/ttf"));
+    assert!(r4_hdr.contains("Content-Encoding: gzip"));
+    assert_eq!(&r4[r4_hdr_end + 4..r4_hdr_end + 6], &[0x1f, 0x8b]);
+
     let _ = shutdown_tx.send(true);
 }

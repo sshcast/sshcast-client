@@ -10,6 +10,7 @@ use sockcast_proto::v1::{
     ZellijTunnelFrame,
 };
 use std::collections::{HashMap, HashSet};
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -95,6 +96,305 @@ fn html_escape(input: &str) -> String {
         }
     }
     out
+}
+
+const SYMBOLS_NERD_FONT_TTF_GZ: &[u8] =
+    include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf.gz");
+const IOSEVKA_TERM_REGULAR_TTF_GZ: &[u8] =
+    include_bytes!("../assets/fonts/IosevkaTerm-Regular.ttf.gz");
+const IOSEVKA_TERM_BOLD_TTF_GZ: &[u8] = include_bytes!("../assets/fonts/IosevkaTerm-Bold.ttf.gz");
+
+const SOCKCAST_FONTS_CSS: &str = r#"@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("/__sockcast/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("/__sockcast/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: block;
+}
+@font-face {
+  font-family: "Iosevka Term";
+  src: url("/__sockcast/IosevkaTerm-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: "Iosevka Term";
+  src: url("/__sockcast/IosevkaTerm-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+"#;
+
+const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
+  const SOCKCAST_DEFAULT_FONT_STACK =
+    '"Iosevka Term", "Symbols Nerd Font Mono", "Cascadia Mono", Consolas, "Liberation Mono", Menlo, monospace';
+
+  function withSockcastNerdFonts(rawFont) {
+    if (
+      typeof rawFont !== "string" ||
+      !rawFont.trim() ||
+      rawFont.trim().toLowerCase() === "monospace"
+    ) {
+      return SOCKCAST_DEFAULT_FONT_STACK;
+    }
+    const parts = rawFont
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const withoutGenericAndBundled = parts.filter((p) => {
+      const norm = p.replace(/['"]/g, "").trim().toLowerCase();
+      return (
+        norm !== "monospace" &&
+        norm !== "symbols nerd font mono" &&
+        norm !== "iosevka term"
+      );
+    });
+    return [
+      ...withoutGenericAndBundled,
+      '"Symbols Nerd Font Mono"',
+      '"Iosevka Term"',
+      "monospace",
+    ].join(", ");
+  }
+
+  function preloadSockcastFonts() {
+    if (!document.fonts || typeof document.fonts.load !== "function") {
+      return Promise.resolve();
+    }
+    const loads = Promise.allSettled([
+      document.fonts.load('400 12px "Iosevka Term"'),
+      document.fonts.load('700 12px "Iosevka Term"'),
+      document.fonts.load('400 12px "Symbols Nerd Font Mono"'),
+      document.fonts.load('700 12px "Symbols Nerd Font Mono"'),
+    ]);
+    const timeout = new Promise((resolve) => setTimeout(resolve, 1500));
+    return Promise.race([loads, timeout]);
+  }
+
+  const fontPreloadPromise = preloadSockcastFonts();
+
+  if (typeof window.fetch === "function") {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+      const urlStr =
+        typeof input === "string"
+          ? input
+          : input && typeof input.url === "string"
+          ? input.url
+          : "";
+      const isSessionBoot =
+        urlStr.includes("/session") && !urlStr.includes("/session-list");
+      if (isSessionBoot) {
+        const [resp] = await Promise.all([
+          origFetch(input, init),
+          fontPreloadPromise,
+        ]);
+        try {
+          const clone = resp.clone();
+          const data = await clone.json();
+          if (data && typeof data === "object") {
+            data.config = data.config || {};
+            data.config.font = withSockcastNerdFonts(data.config.font);
+            return new Response(JSON.stringify(data), {
+              status: resp.status,
+              statusText: resp.statusText,
+              headers: resp.headers,
+            });
+          }
+        } catch (_) {}
+        return resp;
+      }
+      return origFetch(input, init);
+    };
+  }
+
+  function refreshTermFontAtlas(term) {
+    if (!term) return;
+    try {
+      if (typeof term.clearTextureAtlas === "function") {
+        term.clearTextureAtlas();
+      }
+      if (typeof term.refresh === "function" && term.rows > 0) {
+        term.refresh(0, term.rows - 1);
+      }
+    } catch (_) {}
+  }
+
+  if (typeof window.Terminal === "function") {
+    const OrigTerminal = window.Terminal;
+    window.Terminal = new Proxy(OrigTerminal, {
+      construct(Target, args, newTarget) {
+        const opts = Object.assign({}, args[0] || {});
+        opts.fontFamily = withSockcastNerdFonts(opts.fontFamily);
+        const term = Reflect.construct(Target, [opts, ...args.slice(1)], newTarget);
+        if (term && term._publicOptions) {
+          term._publicOptions = new Proxy(term._publicOptions, {
+            set(target, prop, value) {
+              if (prop === "fontFamily") {
+                value = withSockcastNerdFonts(value);
+              }
+              target[prop] = value;
+              return true;
+            },
+          });
+        }
+        fontPreloadPromise.then(() => refreshTermFontAtlas(term));
+        if (document.fonts && typeof document.fonts.addEventListener === "function") {
+          document.fonts.addEventListener("loadingdone", () =>
+            refreshTermFontAtlas(term)
+          );
+        }
+        return term;
+      },
+    });
+  }
+
+  function installExitModalHook() {
+    const origShowError = window.showErrorModal;
+    if (typeof origShowError === "function" && !origShowError.__sockcastWrapped) {
+      const wrapped = async function (title, desc) {
+        if (title === "Disconnected") {
+          let screenText = "";
+          try {
+            if (window.term && window.term.buffer && window.term.buffer.active) {
+              const buf = window.term.buffer.active;
+              for (let r = 0; r < buf.length; r++) {
+                const line = buf.getLine(r);
+                if (line) screenText += line.translateToString(true) + "\n";
+              }
+            }
+          } catch (_) {}
+          if (screenText.includes("Web Clients are not allowed to attach")) {
+            await origShowError(
+              "Web Sharing Disabled in Session",
+              'This session was started in the terminal before web_sharing "on" was enabled. Restart the session in your terminal (or enable sharing via Zellij\'s share plugin) to attach from the web.'
+            );
+          } else {
+            await origShowError(
+              "Session Ended",
+              "The Zellij session has exited. Press Enter or Escape to return to the session list."
+            );
+          }
+          const port = window.location.port ? ":" + window.location.port : "";
+          window.location.href =
+            window.location.protocol + "//localhost" + port + "/";
+          return;
+        }
+        return origShowError(title, desc);
+      };
+      wrapped.__sockcastWrapped = true;
+      window.showErrorModal = wrapped;
+    }
+  }
+
+  installExitModalHook();
+  window.addEventListener("DOMContentLoaded", installExitModalHook);
+})();
+"#;
+
+/// Serves embedded `/__sockcast/*` static assets (Nerd Font symbols, Iosevka Term fonts, CSS, and JS hooks)
+/// directly from `sockcast-client` on loopback without traversing the network tunnel.
+pub fn try_build_sockcast_asset_http_response(req_buf: &[u8]) -> Option<Vec<u8>> {
+    let header_end = req_buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let header_str = std::str::from_utf8(&req_buf[..header_end]).ok()?;
+    let mut lines = header_str.split("\r\n");
+    let req_line = lines.next()?;
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next()?;
+    let raw_path = parts.next()?;
+    if !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD") {
+        return None;
+    }
+    let clean_path = raw_path.split('?').next().unwrap_or(raw_path);
+    if !clean_path.starts_with("/__sockcast/") {
+        return None;
+    }
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    let accepts_gzip = header_str.lines().any(|l| {
+        if let Some((k, v)) = l.split_once(':') {
+            k.trim().eq_ignore_ascii_case("accept-encoding")
+                && v.to_ascii_lowercase().contains("gzip")
+        } else {
+            false
+        }
+    });
+
+    enum AssetBody<'a> {
+        Plain(&'a [u8]),
+        GzipFont(&'a [u8]),
+    }
+
+    let (content_type, cache_control, asset_body) = match clean_path {
+        "/__sockcast/sockcast-fonts.css" => (
+            "text/css; charset=utf-8",
+            "no-cache",
+            AssetBody::Plain(SOCKCAST_FONTS_CSS.as_bytes()),
+        ),
+        "/__sockcast/sockcast-zellij.js" => (
+            "application/javascript; charset=utf-8",
+            "no-cache",
+            AssetBody::Plain(SOCKCAST_ZELLIJ_JS.as_bytes()),
+        ),
+        "/__sockcast/SymbolsNerdFontMono-Regular.ttf" => (
+            "font/ttf",
+            "public, max-age=31536000, immutable",
+            AssetBody::GzipFont(SYMBOLS_NERD_FONT_TTF_GZ),
+        ),
+        "/__sockcast/IosevkaTerm-Regular.ttf" => (
+            "font/ttf",
+            "public, max-age=31536000, immutable",
+            AssetBody::GzipFont(IOSEVKA_TERM_REGULAR_TTF_GZ),
+        ),
+        "/__sockcast/IosevkaTerm-Bold.ttf" => (
+            "font/ttf",
+            "public, max-age=31536000, immutable",
+            AssetBody::GzipFont(IOSEVKA_TERM_BOLD_TTF_GZ),
+        ),
+        _ => {
+            return Some(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            );
+        }
+    };
+
+    let (body_bytes, content_encoding): (Vec<u8>, Option<&str>) = match asset_body {
+        AssetBody::Plain(b) => (b.to_vec(), None),
+        AssetBody::GzipFont(gz_bytes) => {
+            if accepts_gzip {
+                (gz_bytes.to_vec(), Some("gzip"))
+            } else {
+                let mut decoder = flate2::read::GzDecoder::new(gz_bytes);
+                let mut raw = Vec::new();
+                decoder.read_to_end(&mut raw).ok()?;
+                (raw, None)
+            }
+        }
+    };
+
+    let encoding_header = match content_encoding {
+        Some(enc) => format!("Content-Encoding: {enc}\r\nVary: Accept-Encoding\r\n"),
+        None => String::new(),
+    };
+
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{encoding_header}Content-Length: {}\r\nCache-Control: {cache_control}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    let mut out = headers.into_bytes();
+    if !is_head {
+        out.extend_from_slice(&body_bytes);
+    }
+    Some(out)
 }
 
 pub struct ZellijProxyHub {
@@ -895,6 +1195,12 @@ impl ZellijProxyHub {
         let Some((_method, path, host_header)) = parse_http_host_and_path(&init_buf) else {
             return Ok(());
         };
+
+        if let Some(static_resp) = try_build_sockcast_asset_http_response(&init_buf) {
+            stream.write_all(&static_resp).await?;
+            let _ = stream.shutdown().await;
+            return Ok(());
+        }
 
         if let Some(target_host) = extract_relay_target_from_host_header(&host_header) {
             let relay_node_id = self.resolve_relay_node_id(&target_host).await;

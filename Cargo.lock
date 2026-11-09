@@ -3090,6 +3090,7 @@ dependencies = [
  "dispatch2",
  "ed25519-dalek",
  "eframe",
+ "flate2",
  "hex",
  "libc",
  "objc2 0.6.5",
