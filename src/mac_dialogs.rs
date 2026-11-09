@@ -14,12 +14,14 @@ use objc2_foundation::{
     NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
 };
 
-use sockcast_proto::bundle::EnrollmentBundle;
 use sockcast_proto::v1::NodeRole;
 
 use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
 use crate::enroll::{
-    load_user_signing_key, mint_enrollment_bundle, run_keygen, write_client_config_from_bundle,
+    decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
+    import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
+    write_client_config_and_optional_root_key, write_client_config_from_bundle,
+    USER_KEY_TOKEN_PREFIX,
 };
 use crate::mac_native::{
     confirm_overwrite_dialog, get_tray_context, reload_tray_configuration, run_on_main_async,
@@ -519,13 +521,13 @@ define_class!(
             if let Some(clip) = paste_from_clipboard() {
                 let token = clip
                     .split_whitespace()
-                    .find(|w| w.starts_with("sc1_"))
+                    .find(|w| w.starts_with("sc1_") || w.starts_with(USER_KEY_TOKEN_PREFIX))
                     .unwrap_or(clip.trim());
                 ENROLL_WINDOW.with(|cell| {
                     if let Some(ref w) = *cell.borrow() {
                         w.bundle_edit.setStringValue(&NSString::from_str(token));
                         w.footer_status.setStringValue(&NSString::from_str(
-                            "Pasted bundle token from clipboard.",
+                            "Pasted token from clipboard.",
                         ));
                     }
                 });
@@ -542,19 +544,52 @@ define_class!(
             });
             let token = raw_input
                 .split_whitespace()
-                .find(|w| w.starts_with("sc1_"))
+                .find(|w| w.starts_with("sc1_") || w.starts_with(USER_KEY_TOKEN_PREFIX))
                 .unwrap_or(raw_input.trim());
             if token.is_empty() {
                 show_tray_error_dialog(
                     "Validation Error",
                     "Enrollment Bundle is empty",
-                    "Please paste an sc1_<base64> client enrollment bundle first.",
+                    "Please paste an sc1_<base64> client enrollment bundle (or scu1_<base64> user root key) first.",
                 );
                 return;
             }
 
-            let decoded = match EnrollmentBundle::decode(token) {
-                Ok(b) => b,
+            let cfg_path = get_tray_context()
+                .and_then(|c| c.config_path.clone())
+                .or_else(|| default_client_config_path().ok());
+
+            if token.starts_with(USER_KEY_TOKEN_PREFIX) {
+                match import_user_root_key(token, None, cfg_path.as_deref(), true) {
+                    Ok(out) => {
+                        let allow = format!(
+                            "allowed_user_pubkeys = [\"{}\"]",
+                            out.user_pubkey_token
+                        );
+                        let msg = format!(
+                            "Imported user root key (User ID: {})!",
+                            out.user_id
+                        );
+                        ENROLL_WINDOW.with(|cell| {
+                            if let Some(ref w) = *cell.borrow() {
+                                w.root_key_edit.setStringValue(&NSString::from_str(&allow));
+                                w.footer_status.setStringValue(&NSString::from_str(&msg));
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        show_tray_error_dialog(
+                            "Root Key Import Failed",
+                            "Failed to import scu1_ user root key",
+                            &format!("{e:#}"),
+                        );
+                    }
+                }
+                return;
+            }
+
+            let (decoded, maybe_root_key) = match decode_enrollment_bundle_token(token) {
+                Ok(pair) => pair,
                 Err(e) => {
                     show_tray_error_dialog(
                         "Invalid Bundle",
@@ -564,10 +599,6 @@ define_class!(
                     return;
                 }
             };
-
-            let cfg_path = get_tray_context()
-                .and_then(|c| c.config_path.clone())
-                .or_else(|| default_client_config_path().ok());
 
             if let Some(ref p) = cfg_path {
                 if p.exists()
@@ -585,15 +616,32 @@ define_class!(
                 }
             }
 
-            match write_client_config_from_bundle(&decoded, cfg_path.as_deref(), true) {
-                Ok(_path) => {
+            match write_client_config_and_optional_root_key(
+                &decoded,
+                maybe_root_key.as_ref(),
+                cfg_path.as_deref(),
+                None,
+                true,
+            ) {
+                Ok((_cfg_path, maybe_key_path)) => {
                     reload_tray_configuration();
-                    let msg = format!(
-                        "Initialized workstation '{}' — connecting now!",
-                        decoded.grant.node_id
-                    );
+                    let msg = if maybe_key_path.is_some() {
+                        format!(
+                            "Initialized workstation '{}' (with root key) — connecting now!",
+                            decoded.grant.node_id
+                        )
+                    } else {
+                        format!(
+                            "Initialized workstation '{}' — connecting now!",
+                            decoded.grant.node_id
+                        )
+                    };
+                    let allow = format_root_key_allowlist();
                     ENROLL_WINDOW.with(|cell| {
                         if let Some(ref w) = *cell.borrow() {
+                            if let Some(ref a) = allow {
+                                w.root_key_edit.setStringValue(&NSString::from_str(a));
+                            }
                             w.footer_status.setStringValue(&NSString::from_str(&msg));
                         }
                     });
@@ -907,6 +955,7 @@ pub fn show_enroll_window() {
 struct BundleWindowWidgets {
     window: Retained<NSWindow>,
     root_pubkey_edit: Retained<NSTextField>,
+    root_key_action_btn: Retained<NSButton>,
     radio_relay: Retained<NSButton>,
     radio_client: Retained<NSButton>,
     node_edit: Retained<NSTextField>,
@@ -957,13 +1006,79 @@ define_class!(
                     "Failed to copy to clipboard."
                 }
             } else {
-                "Generate a root key first before copying."
+                "Import or generate a root key first before copying."
             };
             BUNDLE_WINDOW.with(|cell| {
                 if let Some(ref w) = *cell.borrow() {
                     w.footer_status.setStringValue(&NSString::from_str(msg));
                 }
             });
+        }
+
+        #[unsafe(method(onRootKeyAction:))]
+        fn on_root_key_action(&self, _sender: Option<&AnyObject>) {
+            if format_root_key_allowlist().is_some() {
+                match export_user_root_key(None) {
+                    Ok(tok) => {
+                        let msg = if copy_to_clipboard(&tok) {
+                            "Copied scu1_ user root key to clipboard (paste on secondary workstation)!"
+                        } else {
+                            "Failed to copy scu1_ root key to clipboard."
+                        };
+                        BUNDLE_WINDOW.with(|cell| {
+                            if let Some(ref w) = *cell.borrow() {
+                                w.footer_status.setStringValue(&NSString::from_str(msg));
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        show_tray_error_dialog(
+                            "Export Failed",
+                            "Failed to export user root key",
+                            &format!("{e:#}"),
+                        );
+                    }
+                }
+            } else {
+                let Some(clip) = paste_from_clipboard() else {
+                    show_tray_error_dialog(
+                        "Clipboard Empty",
+                        "No scu1_ root key token found on clipboard",
+                        "On your primary workstation, open 'Generate Enrollment Bundle' and click 'Copy Root Key', then click 'Paste Root Key' here.",
+                    );
+                    return;
+                };
+                let cfg_path = get_tray_context()
+                    .and_then(|c| c.config_path.clone())
+                    .or_else(|| default_client_config_path().ok());
+                match import_user_root_key(&clip, None, cfg_path.as_deref(), true) {
+                    Ok(out) => {
+                        let allow = format!(
+                            "allowed_user_pubkeys = [\"{}\"]",
+                            out.user_pubkey_token
+                        );
+                        let msg = format!(
+                            "Imported root key (User ID: {}) and saved user_key.toml!",
+                            out.user_id
+                        );
+                        BUNDLE_WINDOW.with(|cell| {
+                            if let Some(ref w) = *cell.borrow() {
+                                w.root_pubkey_edit.setStringValue(&NSString::from_str(&allow));
+                                w.root_key_action_btn
+                                    .setTitle(&NSString::from_str("Copy Root Key"));
+                                w.footer_status.setStringValue(&NSString::from_str(&msg));
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        show_tray_error_dialog(
+                            "Import Root Key Failed",
+                            "Failed to import scu1_ user root key from clipboard",
+                            &format!("{e:#}"),
+                        );
+                    }
+                }
+            }
         }
 
         #[unsafe(method(onGenerate:))]
@@ -1011,22 +1126,12 @@ define_class!(
             };
 
             if format_root_key_allowlist().is_none() {
-                if let Err(e) = run_keygen(None, false) {
-                    show_tray_error_dialog(
-                        "Keygen Failed",
-                        "Failed to generate user_key.toml",
-                        &format!("{e:#}"),
-                    );
-                    return;
-                }
-                if let Some(allow) = format_root_key_allowlist() {
-                    BUNDLE_WINDOW.with(|cell| {
-                        if let Some(ref w) = *cell.borrow() {
-                            w.root_pubkey_edit
-                                .setStringValue(&NSString::from_str(&allow));
-                        }
-                    });
-                }
+                show_tray_error_dialog(
+                    "User Root Key Required",
+                    "No user_key.toml found on this workstation",
+                    "On your primary workstation, open 'Generate Enrollment Bundle' and click 'Copy Root Key', then click 'Paste Root Key' above on this workstation.",
+                );
+                return;
             }
 
             let role = if is_relay {
@@ -1044,7 +1149,8 @@ define_class!(
                     servers,
                     expires_days,
                 )?;
-                Ok(bundle.encode()?)
+                let include_rk = if is_relay { None } else { Some(&user_sk) };
+                encode_enrollment_bundle_token(&bundle, include_rk)
             })();
 
             match res {
@@ -1142,6 +1248,11 @@ pub fn show_bundle_generator_window() {
                 if let Some(allow) = format_root_key_allowlist() {
                     w.root_pubkey_edit
                         .setStringValue(&NSString::from_str(&allow));
+                    w.root_key_action_btn
+                        .setTitle(&NSString::from_str("Copy Root Key"));
+                } else {
+                    w.root_key_action_btn
+                        .setTitle(&NSString::from_str("Paste Root Key"));
                 }
                 w.window.makeKeyAndOrderFront(None);
                 true
@@ -1184,8 +1295,10 @@ pub fn show_bundle_generator_window() {
             464.0,
             20.0,
         );
-        let root_str = format_root_key_allowlist()
-            .unwrap_or_else(|| "No user_key.toml found on this workstation".to_string());
+        let has_root_key = format_root_key_allowlist().is_some();
+        let root_str = format_root_key_allowlist().unwrap_or_else(|| {
+            "No user_key.toml found — click 'Paste Root Key' to import scu1_ key".to_string()
+        });
         let root_pubkey_edit = add_edit_field(
             mtm,
             &content_view,
@@ -1196,7 +1309,7 @@ pub fn show_bundle_generator_window() {
             true,
             24.0,
             95.0,
-            460.0,
+            376.0,
             24.0,
         );
         add_push_button(
@@ -1207,9 +1320,27 @@ pub fn show_bundle_generator_window() {
             &handler,
             sel!(onCopyPubkey:),
             false,
-            492.0,
+            408.0,
             93.0,
-            124.0,
+            102.0,
+            28.0,
+        );
+        let root_action_label = if has_root_key {
+            "Copy Root Key"
+        } else {
+            "Paste Root Key"
+        };
+        let root_key_action_btn = add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            root_action_label,
+            &handler,
+            sel!(onRootKeyAction:),
+            false,
+            514.0,
+            93.0,
+            102.0,
             28.0,
         );
 
@@ -1439,6 +1570,7 @@ pub fn show_bundle_generator_window() {
             *cell.borrow_mut() = Some(BundleWindowWidgets {
                 window,
                 root_pubkey_edit,
+                root_key_action_btn,
                 radio_relay,
                 radio_client,
                 node_edit,

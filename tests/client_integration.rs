@@ -2,7 +2,9 @@ use ed25519_dalek::SigningKey;
 use sockcast_client::config::{ClientConfig, KeyFilterConfig};
 use sockcast_client::coordinator::{handle_incoming_sign_request, WorkstationManager};
 use sockcast_client::enroll::{
-    load_user_signing_key, mint_enrollment_bundle, run_keygen, write_client_config_from_bundle,
+    decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
+    import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
+    write_client_config_and_optional_root_key, write_client_config_from_bundle,
 };
 use sockcast_client::local_agent::{
     filter_keys, LocalAgentConnector, SSH2_AGENTC_REQUEST_IDENTITIES, SSH2_AGENTC_SIGN_REQUEST,
@@ -161,6 +163,59 @@ fn test_keygen_and_grant_relay_and_client_bundles() {
     let loaded_client = ClientConfig::load(Some(&client_cfg_path)).unwrap();
     assert_eq!(loaded_client.grant.node_id, "macbook-pro");
     assert_eq!(loaded_client.grant.role, NodeRole::Client as i32);
+
+    // 3. Client bundle with embedded root key (.rk_<seed>) writes both client.toml and user_key.toml
+    let secondary_dir = tmp.path().join("secondary");
+    let sec_cfg_path = secondary_dir.join("client.toml");
+    let sec_key_path = secondary_dir.join("user_key.toml");
+    let client_token_with_rk =
+        encode_enrollment_bundle_token(&client_bundle, Some(&user_sk)).unwrap();
+    assert!(client_token_with_rk.contains(".rk_"));
+
+    // Relay bundle never embeds .rk_ even if passed Some(&user_sk)
+    let relay_token_checked =
+        encode_enrollment_bundle_token(&relay_bundle, Some(&user_sk)).unwrap();
+    assert!(!relay_token_checked.contains(".rk_"));
+
+    let (decoded_sec, maybe_rk) = decode_enrollment_bundle_token(&client_token_with_rk).unwrap();
+    assert!(maybe_rk.is_some());
+    let (written_cfg, written_key) = write_client_config_and_optional_root_key(
+        &decoded_sec,
+        maybe_rk.as_ref(),
+        Some(&sec_cfg_path),
+        Some(&sec_key_path),
+        false,
+    )
+    .unwrap();
+    assert_eq!(written_cfg, sec_cfg_path);
+    assert_eq!(written_key.as_deref(), Some(sec_key_path.as_path()));
+    let sec_loaded_sk = load_user_signing_key(Some(&sec_key_path)).unwrap();
+    assert_eq!(sec_loaded_sk.to_bytes(), user_sk.to_bytes());
+
+    // 4. Export / Import user root key (scu1_<base64>) for an already-enrolled secondary workstation
+    let exported_scu = export_user_root_key(Some(&user_key_path)).unwrap();
+    assert!(exported_scu.starts_with("scu1_"));
+    let imported_key_path = tmp.path().join("imported_user_key.toml");
+    let imported_out = import_user_root_key(
+        &exported_scu,
+        Some(&imported_key_path),
+        Some(&client_cfg_path),
+        false,
+    )
+    .unwrap();
+    assert_eq!(imported_out.user_id, kg.user_id);
+
+    // Importing a DIFFERENT user's root key onto an enrolled workstation must be rejected
+    let other_key_path = tmp.path().join("other_user_key.toml");
+    run_keygen(Some(&other_key_path), false).unwrap();
+    let other_scu = export_user_root_key(Some(&other_key_path)).unwrap();
+    assert!(import_user_root_key(
+        &other_scu,
+        Some(&imported_key_path),
+        Some(&client_cfg_path),
+        true,
+    )
+    .is_err());
 }
 
 #[test]

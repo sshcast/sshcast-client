@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{
-    default_client_config_path, default_user_key_path, ClientConfigFile, UserKeyFile,
+    default_client_config_path, default_user_key_path, ClientConfig, ClientConfigFile, UserKeyFile,
 };
+
+pub const USER_KEY_TOKEN_PREFIX: &str = "scu1_";
+pub const BUNDLE_ROOT_KEY_SUFFIX_SEP: &str = ".rk_";
 
 #[derive(Debug, Clone)]
 pub struct KeygenOutcome {
@@ -20,8 +23,12 @@ pub struct KeygenOutcome {
     pub user_pubkey_token: String,
 }
 
-/// Generates a new User Root Ed25519 keypair and saves it to `user_key.toml` with `0600` permissions.
-pub fn run_keygen(output_path: Option<&Path>, force: bool) -> Result<KeygenOutcome> {
+/// Saves a User Root Ed25519 keypair to `user_key.toml` with `0600` permissions.
+pub fn save_user_signing_key(
+    signing_key: &SigningKey,
+    output_path: Option<&Path>,
+    force: bool,
+) -> Result<KeygenOutcome> {
     let path = match output_path {
         Some(p) => p.to_path_buf(),
         None => default_user_key_path()?,
@@ -44,7 +51,6 @@ pub fn run_keygen(output_path: Option<&Path>, force: bool) -> Result<KeygenOutco
         }
     }
 
-    let signing_key = SigningKey::generate(&mut OsRng);
     let pubkey_bytes = signing_key.verifying_key().to_bytes();
     let user_id = derive_user_id(&pubkey_bytes);
     let user_pubkey_token = format!("sc_pub_{}", hex::encode(pubkey_bytes));
@@ -71,6 +77,66 @@ pub fn run_keygen(output_path: Option<&Path>, force: bool) -> Result<KeygenOutco
         user_id,
         user_pubkey_token,
     })
+}
+
+/// Generates a new User Root Ed25519 keypair and saves it to `user_key.toml` with `0600` permissions.
+pub fn run_keygen(output_path: Option<&Path>, force: bool) -> Result<KeygenOutcome> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    save_user_signing_key(&signing_key, output_path, force)
+}
+
+/// Exports the local `user_key.toml` as a compact single-line `scu1_<base64>` token.
+pub fn export_user_root_key(key_path: Option<&Path>) -> Result<String> {
+    let sk = load_user_signing_key(key_path)?;
+    Ok(format!(
+        "{USER_KEY_TOKEN_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(sk.to_bytes())
+    ))
+}
+
+/// Decodes a `scu1_<base64>` user root key token into an Ed25519 `SigningKey`.
+pub fn decode_user_root_key_token(token: &str) -> Result<SigningKey> {
+    let trimmed = token
+        .split_whitespace()
+        .find(|w| w.starts_with(USER_KEY_TOKEN_PREFIX))
+        .unwrap_or(token.trim());
+    let b64 = trimmed
+        .strip_prefix(USER_KEY_TOKEN_PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("user root key token must start with '{USER_KEY_TOKEN_PREFIX}'"))?;
+    let seed_vec = URL_SAFE_NO_PAD
+        .decode(b64.trim())
+        .context("invalid base64 in scu1_ user root key token")?;
+    let seed: [u8; 32] = seed_vec
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("scu1_ user root key token must decode to 32 bytes"))?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// Imports a `scu1_<base64>` user root key token, verifying it against `client.toml` if this
+/// workstation is already enrolled, and writes `user_key.toml`.
+pub fn import_user_root_key(
+    token: &str,
+    key_path: Option<&Path>,
+    config_path: Option<&Path>,
+    force: bool,
+) -> Result<KeygenOutcome> {
+    let signing_key = decode_user_root_key_token(token)?;
+    let pubkey_bytes = signing_key.verifying_key().to_bytes();
+    let imported_user_id = derive_user_id(&pubkey_bytes);
+
+    if let Ok(cfg) = ClientConfig::load(config_path) {
+        if !cfg.grant.user_pubkey.is_empty()
+            && cfg.grant.user_pubkey.as_slice() != pubkey_bytes.as_slice()
+        {
+            anyhow::bail!(
+                "imported root key ({}) does not match this workstation's enrolled user ({}) in client.toml",
+                imported_user_id,
+                cfg.grant.user_id
+            );
+        }
+    }
+
+    save_user_signing_key(&signing_key, key_path, force)
 }
 
 pub fn load_user_signing_key(key_path: Option<&Path>) -> Result<SigningKey> {
@@ -191,4 +257,81 @@ pub fn write_client_config_from_bundle(
     }
 
     Ok(path)
+}
+
+/// Encodes an `EnrollmentBundle` into its `sc1_<base64>` token string.
+/// If `bundle.grant.role == CLIENT` and `include_user_root_key` is `Some`, appends `.rk_<base64_seed>`
+/// so the secondary workstation also receives `user_key.toml` upon initialization.
+pub fn encode_enrollment_bundle_token(
+    bundle: &EnrollmentBundle,
+    include_user_root_key: Option<&SigningKey>,
+) -> Result<String> {
+    let base_token = bundle.encode().context("failed to encode enrollment bundle")?;
+    if bundle.grant.role == NodeRole::Client as i32 {
+        if let Some(user_sk) = include_user_root_key {
+            let rk_b64 = URL_SAFE_NO_PAD.encode(user_sk.to_bytes());
+            return Ok(format!("{base_token}{BUNDLE_ROOT_KEY_SUFFIX_SEP}{rk_b64}"));
+        }
+    }
+    Ok(base_token)
+}
+
+/// Decodes an `sc1_<base64>` client bundle token, optionally extracting an embedded `.rk_<base64_seed>`
+/// user root signing key and verifying that it matches `bundle.grant.user_pubkey`.
+pub fn decode_enrollment_bundle_token(
+    token: &str,
+) -> Result<(EnrollmentBundle, Option<SigningKey>)> {
+    let trimmed = token
+        .split_whitespace()
+        .find(|w| w.starts_with("sc1_"))
+        .unwrap_or(token.trim());
+
+    let (base_token, rk_part) = match trimmed.split_once(BUNDLE_ROOT_KEY_SUFFIX_SEP) {
+        Some((b, r)) => (b, Some(r)),
+        None => (trimmed, None),
+    };
+
+    let bundle = EnrollmentBundle::decode(base_token).context("failed to decode sc1_ bundle")?;
+
+    let root_key = if let Some(rk_b64) = rk_part {
+        let seed_vec = URL_SAFE_NO_PAD
+            .decode(rk_b64.trim())
+            .context("invalid base64 in embedded .rk_ root key suffix")?;
+        let seed: [u8; 32] = seed_vec
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("embedded .rk_ root key seed must decode to 32 bytes"))?;
+        let sk = SigningKey::from_bytes(&seed);
+        if sk.verifying_key().to_bytes().as_slice() != bundle.grant.user_pubkey.as_slice() {
+            anyhow::bail!(
+                "embedded .rk_ root key does not match the bundle's NodeGrant user_pubkey"
+            );
+        }
+        Some(sk)
+    } else {
+        None
+    };
+
+    Ok((bundle, root_key))
+}
+
+/// Writes `client.toml` from a client `EnrollmentBundle` and, if an embedded user root `SigningKey`
+/// is provided, also writes `user_key.toml`.
+pub fn write_client_config_and_optional_root_key(
+    bundle: &EnrollmentBundle,
+    root_key: Option<&SigningKey>,
+    config_path: Option<&Path>,
+    key_path: Option<&Path>,
+    force: bool,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let cfg_out = write_client_config_from_bundle(bundle, config_path, force)?;
+    let key_out = if let Some(sk) = root_key {
+        let effective_key_path = key_path.map(Path::to_path_buf).or_else(|| {
+            config_path.and_then(|c| c.parent().map(|p| p.join("user_key.toml")))
+        });
+        let out = save_user_signing_key(sk, effective_key_path.as_deref(), true)?;
+        Some(out.key_path)
+    } else {
+        None
+    };
+    Ok((cfg_out, key_out))
 }

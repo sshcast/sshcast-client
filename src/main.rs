@@ -3,13 +3,14 @@ use clap::{Parser, Subcommand};
 use sockcast_client::config::ClientConfig;
 use sockcast_client::coordinator::WorkstationManager;
 use sockcast_client::enroll::{
-    load_user_signing_key, mint_enrollment_bundle, run_keygen, write_client_config_from_bundle,
+    decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
+    import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
+    write_client_config_and_optional_root_key, write_client_config_from_bundle,
 };
 use sockcast_client::gui::run_egui_modal_process;
 use sockcast_client::local_agent::LocalAgentConnector;
 use sockcast_client::policy::{ApprovalDecision, PolicyEngine};
 use sockcast_client::prompt::{ApprovalPrompter, InteractivePrompter, PromptDetails, StaticPrompter};
-use sockcast_proto::bundle::EnrollmentBundle;
 use sockcast_proto::v1::NodeRole;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,14 +40,38 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Export the local `user_key.toml` as a compact single-line `scu1_<base64>` token for another workstation
+    ExportKey {
+        /// Optional path for `user_key.toml`
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
+    /// Import a `scu1_<base64>` user root key token into `user_key.toml` on this workstation
+    ImportKey {
+        /// User root key token (`scu1_<base64>`)
+        #[arg(long)]
+        key: String,
+
+        /// Optional path to write `user_key.toml`
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+
+        /// Optional path to `client.toml` (used to verify the key matches the enrolled user)
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Overwrite existing `user_key.toml` if present
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Mint a signed `NodeGrant` (`NODE_ROLE_RELAY`) and output an `sc1_<base64>` bundle for `sockcast-relay init`
     GrantRelay {
         /// Target relay hostname (must match `/proc` hostname on the target server, e.g. `server-x.infra.local`)
         #[arg(long)]
         node: String,
 
-        /// Coordinator server URL(s) (can be passed multiple times)
-        #[arg(long = "server", required = true)]
+        /// Coordinator server URL(s) (defaults to `servers` in `client.toml` if omitted)
+        #[arg(long = "server")]
         servers: Vec<String>,
 
         /// Optional grant expiration in days (0 = no expiration)
@@ -63,8 +88,8 @@ enum Commands {
         #[arg(long)]
         node: String,
 
-        /// Coordinator server URL(s) (can be passed multiple times)
-        #[arg(long = "server", required = true)]
+        /// Coordinator server URL(s) (defaults to `servers` in `client.toml` if omitted)
+        #[arg(long = "server")]
         servers: Vec<String>,
 
         /// Optional grant expiration in days (0 = no expiration)
@@ -83,11 +108,15 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         bundle_only: bool,
 
+        /// Omit the user root key (`.rk_<seed>`) from the emitted client bundle
+        #[arg(long, default_value_t = false)]
+        no_root_key: bool,
+
         /// Overwrite existing `client.toml` if present
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Initialize `client.toml` on a secondary workstation from an `sc1_<base64>` client bundle
+    /// Initialize `client.toml` (and `user_key.toml` if embedded) on a secondary workstation from an `sc1_<base64>` client bundle
     Init {
         /// Client enrollment bundle token (`sc1_<base64>`)
         #[arg(long)]
@@ -96,6 +125,10 @@ enum Commands {
         /// Optional path to write `client.toml` (defaults to `~/.config/sockcast/client.toml`)
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Optional path to write `user_key.toml` when embedded in the bundle
+        #[arg(long)]
+        key_file: Option<PathBuf>,
 
         /// Overwrite existing `client.toml` if present
         #[arg(long, default_value_t = false)]
@@ -166,15 +199,45 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Commands::ExportKey { key_file } => {
+            let token = export_user_root_key(key_file.as_deref())?;
+            println!("{token}");
+            Ok(())
+        }
+        Commands::ImportKey {
+            key,
+            key_file,
+            config,
+            force,
+        } => {
+            let out = import_user_root_key(&key, key_file.as_deref(), config.as_deref(), force)?;
+            println!("Imported User Root Ed25519 keypair!");
+            println!("  Saved to:          {}", out.key_path.display());
+            println!("  User ID:           {}", out.user_id);
+            println!("  Server Allowlist:  {}", out.user_pubkey_token);
+            Ok(())
+        }
         Commands::GrantRelay {
             node,
             servers,
             expires_days,
             key_file,
         } => {
+            let resolved_servers = if servers.is_empty() {
+                ClientConfig::load(None)
+                    .map(|c| c.servers)
+                    .context("no --server provided and failed to load default servers from client.toml")?
+            } else {
+                servers
+            };
             let user_sk = load_user_signing_key(key_file.as_deref())?;
-            let bundle =
-                mint_enrollment_bundle(&user_sk, &node, NodeRole::Relay, servers, expires_days)?;
+            let bundle = mint_enrollment_bundle(
+                &user_sk,
+                &node,
+                NodeRole::Relay,
+                resolved_servers,
+                expires_days,
+            )?;
             let token = bundle.encode().context("failed to encode relay bundle")?;
             println!("Enrollment bundle for relay node '{node}':\n");
             println!("{token}\n");
@@ -189,12 +252,27 @@ async fn main() -> Result<()> {
             key_file,
             config,
             bundle_only,
+            no_root_key,
             force,
         } => {
+            let resolved_servers = if servers.is_empty() {
+                ClientConfig::load(config.as_deref())
+                    .map(|c| c.servers)
+                    .context("no --server provided and failed to load default servers from client.toml")?
+            } else {
+                servers
+            };
             let user_sk = load_user_signing_key(key_file.as_deref())?;
-            let bundle =
-                mint_enrollment_bundle(&user_sk, &node, NodeRole::Client, servers, expires_days)?;
-            let token = bundle.encode().context("failed to encode client bundle")?;
+            let bundle = mint_enrollment_bundle(
+                &user_sk,
+                &node,
+                NodeRole::Client,
+                resolved_servers,
+                expires_days,
+            )?;
+            let include_rk = if no_root_key { None } else { Some(&user_sk) };
+            let token = encode_enrollment_bundle_token(&bundle, include_rk)
+                .context("failed to encode client bundle")?;
             if bundle_only {
                 println!("{token}");
             } else {
@@ -210,16 +288,26 @@ async fn main() -> Result<()> {
         Commands::Init {
             bundle,
             config,
+            key_file,
             force,
         } => {
-            let decoded =
-                EnrollmentBundle::decode(&bundle).context("failed to decode client bundle")?;
-            let path = write_client_config_from_bundle(&decoded, config.as_deref(), force)?;
+            let (decoded, maybe_root_key) =
+                decode_enrollment_bundle_token(&bundle).context("failed to decode client bundle")?;
+            let (cfg_path, key_path) = write_client_config_and_optional_root_key(
+                &decoded,
+                maybe_root_key.as_ref(),
+                config.as_deref(),
+                key_file.as_deref(),
+                force,
+            )?;
             println!(
                 "Enrolled workstation '{}' (user '{}')",
                 decoded.grant.node_id, decoded.grant.user_id
             );
-            println!("  Client config written to: {}", path.display());
+            println!("  Client config written to: {}", cfg_path.display());
+            if let Some(kp) = key_path {
+                println!("  User root key written to: {}", kp.display());
+            }
             Ok(())
         }
         Commands::ListKeys {

@@ -3,7 +3,6 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 
-use sockcast_proto::bundle::EnrollmentBundle;
 use sockcast_proto::v1::NodeRole;
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, S_OK, WPARAM};
@@ -35,7 +34,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
 use crate::enroll::{
-    load_user_signing_key, mint_enrollment_bundle, run_keygen, write_client_config_from_bundle,
+    decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
+    import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
+    write_client_config_and_optional_root_key, write_client_config_from_bundle,
+    USER_KEY_TOKEN_PREFIX,
 };
 use crate::win_native::{show_tray_error_dialog, TraySharedContext};
 
@@ -96,6 +98,7 @@ const ID_ENROLL_BTN_CLOSE: i32 = 2011;
 const ID_BUNDLE_ROOT_PUBKEY_EDIT: i32 = 1952;
 const ID_BUNDLE_BTN_KEYGEN: i32 = 3002;
 const ID_BUNDLE_BTN_COPY_PUBKEY: i32 = 3003;
+const ID_BUNDLE_BTN_ROOT_KEY_ACTION: i32 = 3016;
 const ID_BUNDLE_RADIO_RELAY: i32 = 3004;
 const ID_BUNDLE_RADIO_CLIENT: i32 = 3005;
 const ID_BUNDLE_NODE_EDIT: i32 = 3006;
@@ -1216,13 +1219,15 @@ unsafe extern "system" fn enroll_wnd_proc(
                         if let Some(clip) = paste_from_clipboard(hwnd) {
                             let token = clip
                                 .split_whitespace()
-                                .find(|w| w.starts_with("sc1_"))
+                                .find(|w| {
+                                    w.starts_with("sc1_") || w.starts_with(USER_KEY_TOKEN_PREFIX)
+                                })
                                 .unwrap_or(clip.trim());
                             set_dlg_item_string(hwnd, ID_ENROLL_BUNDLE_EDIT, token);
                             set_dlg_item_string(
                                 hwnd,
                                 ID_STYLE_FOOTER_STATUS,
-                                "Pasted bundle token from clipboard.",
+                                "Pasted token from clipboard.",
                             );
                         }
                     }
@@ -1230,19 +1235,53 @@ unsafe extern "system" fn enroll_wnd_proc(
                         let raw_input = get_dlg_item_string(hwnd, ID_ENROLL_BUNDLE_EDIT);
                         let token = raw_input
                             .split_whitespace()
-                            .find(|w| w.starts_with("sc1_"))
+                            .find(|w| {
+                                w.starts_with("sc1_") || w.starts_with(USER_KEY_TOKEN_PREFIX)
+                            })
                             .unwrap_or(raw_input.trim());
                         if token.is_empty() {
                             show_tray_error_dialog(
                                 "Validation Error",
                                 "Enrollment Bundle is empty",
-                                "Please paste an sc1_<base64> client enrollment bundle first.",
+                                "Please paste an sc1_<base64> client enrollment bundle (or scu1_<base64> user root key) first.",
                             );
                             return 0;
                         }
 
-                        let decoded = match EnrollmentBundle::decode(token) {
-                            Ok(b) => b,
+                        let cfg_path = crate::win_native::get_tray_context()
+                            .and_then(|c| c.config_path.clone())
+                            .or_else(|| default_client_config_path().ok());
+
+                        if token.starts_with(USER_KEY_TOKEN_PREFIX) {
+                            match import_user_root_key(token, None, cfg_path.as_deref(), true) {
+                                Ok(out) => {
+                                    let allow = format!(
+                                        "allowed_user_pubkeys = [\"{}\"]",
+                                        out.user_pubkey_token
+                                    );
+                                    set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &allow);
+                                    set_dlg_item_string(
+                                        hwnd,
+                                        ID_STYLE_FOOTER_STATUS,
+                                        &format!(
+                                            "Imported user root key (User ID: {})!",
+                                            out.user_id
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    show_tray_error_dialog(
+                                        "Root Key Import Failed",
+                                        "Failed to import scu1_ user root key",
+                                        &format!("{e:#}"),
+                                    );
+                                }
+                            }
+                            return 0;
+                        }
+
+                        let (decoded, maybe_root_key) = match decode_enrollment_bundle_token(token) {
+                            Ok(pair) => pair,
                             Err(e) => {
                                 show_tray_error_dialog(
                                     "Invalid Bundle",
@@ -1252,10 +1291,6 @@ unsafe extern "system" fn enroll_wnd_proc(
                                 return 0;
                             }
                         };
-
-                        let cfg_path = crate::win_native::get_tray_context()
-                            .and_then(|c| c.config_path.clone())
-                            .or_else(|| default_client_config_path().ok());
 
                         if let Some(ref p) = cfg_path {
                             if p.exists()
@@ -1274,17 +1309,30 @@ unsafe extern "system" fn enroll_wnd_proc(
                             }
                         }
 
-                        match write_client_config_from_bundle(&decoded, cfg_path.as_deref(), true) {
-                            Ok(_path) => {
+                        match write_client_config_and_optional_root_key(
+                            &decoded,
+                            maybe_root_key.as_ref(),
+                            cfg_path.as_deref(),
+                            None,
+                            true,
+                        ) {
+                            Ok((_cfg_path, maybe_key_path)) => {
+                                if let Some(allow) = format_root_key_allowlist() {
+                                    set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &allow);
+                                }
                                 crate::win_native::reload_tray_configuration();
-                                set_dlg_item_string(
-                                    hwnd,
-                                    ID_STYLE_FOOTER_STATUS,
-                                    &format!(
+                                let msg = if maybe_key_path.is_some() {
+                                    format!(
+                                        "Initialized workstation '{}' (with root key) — connecting now!",
+                                        decoded.grant.node_id
+                                    )
+                                } else {
+                                    format!(
                                         "Initialized workstation '{}' — connecting now!",
                                         decoded.grant.node_id
-                                    ),
-                                );
+                                    )
+                                };
+                                set_dlg_item_string(hwnd, ID_STYLE_FOOTER_STATUS, &msg);
                             }
                             Err(e) => {
                                 show_tray_error_dialog(
@@ -1324,6 +1372,9 @@ pub unsafe fn show_enroll_window() {
         let g = DIALOG_RES.lock().unwrap();
         let existing = g.enroll_hwnd as HWND;
         if !existing.is_null() && IsWindow(existing) != 0 {
+            if let Some(allow) = format_root_key_allowlist() {
+                set_dlg_item_string(existing, ID_ENROLL_ROOT_KEY_EDIT, &allow);
+            }
             ShowWindow(existing, SW_RESTORE);
             SetForegroundWindow(existing);
             return;
@@ -1405,8 +1456,9 @@ unsafe extern "system" fn bundle_wnd_proc(
                 dpi,
                 assets.font_section,
             );
+            let has_root_key = format_root_key_allowlist().is_some();
             let root_str = format_root_key_allowlist().unwrap_or_else(|| {
-                "No user_key.toml found on this workstation".to_string()
+                "No user_key.toml found — click 'Paste Root Key' to import scu1_ key".to_string()
             });
             create_edit(
                 hwnd,
@@ -1415,7 +1467,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                 true,
                 24,
                 96,
-                464,
+                384,
                 26,
                 ID_BUNDLE_ROOT_PUBKEY_EDIT,
                 dpi,
@@ -1424,11 +1476,27 @@ unsafe extern "system" fn bundle_wnd_proc(
             create_button(
                 hwnd,
                 "Copy Allowlist",
-                496,
+                416,
                 95,
-                120,
+                96,
                 28,
                 ID_BUNDLE_BTN_COPY_PUBKEY,
+                dpi,
+                assets.font_ui,
+            );
+            let root_action_label = if has_root_key {
+                "Copy Root Key"
+            } else {
+                "Paste Root Key"
+            };
+            create_button(
+                hwnd,
+                root_action_label,
+                518,
+                95,
+                98,
+                28,
+                ID_BUNDLE_BTN_ROOT_KEY_ACTION,
                 dpi,
                 assets.font_ui,
             );
@@ -1717,8 +1785,71 @@ unsafe extern "system" fn bundle_wnd_proc(
                             set_dlg_item_string(
                                 hwnd,
                                 ID_STYLE_FOOTER_STATUS,
-                                "Generate a root key first before copying.",
+                                "Import or generate a root key first before copying.",
                             );
+                        }
+                    }
+                    ID_BUNDLE_BTN_ROOT_KEY_ACTION => {
+                        if format_root_key_allowlist().is_some() {
+                            match export_user_root_key(None) {
+                                Ok(tok) => {
+                                    if copy_to_clipboard(hwnd, &tok) {
+                                        set_dlg_item_string(
+                                            hwnd,
+                                            ID_STYLE_FOOTER_STATUS,
+                                            "Copied scu1_ user root key to clipboard (paste on secondary workstation)!",
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    show_tray_error_dialog(
+                                        "Export Failed",
+                                        "Failed to export user root key",
+                                        &format!("{e:#}"),
+                                    );
+                                }
+                            }
+                        } else {
+                            let Some(clip) = paste_from_clipboard(hwnd) else {
+                                show_tray_error_dialog(
+                                    "Clipboard Empty",
+                                    "No scu1_ root key token found on clipboard",
+                                    "On your primary workstation, open 'Generate Enrollment Bundle' and click 'Copy Root Key', then click 'Paste Root Key' here.",
+                                );
+                                return 0;
+                            };
+                            let cfg_path = crate::win_native::get_tray_context()
+                                .and_then(|c| c.config_path.clone())
+                                .or_else(|| default_client_config_path().ok());
+                            match import_user_root_key(&clip, None, cfg_path.as_deref(), true) {
+                                Ok(out) => {
+                                    let allow = format!(
+                                        "allowed_user_pubkeys = [\"{}\"]",
+                                        out.user_pubkey_token
+                                    );
+                                    set_dlg_item_string(hwnd, ID_BUNDLE_ROOT_PUBKEY_EDIT, &allow);
+                                    set_dlg_item_string(
+                                        hwnd,
+                                        ID_BUNDLE_BTN_ROOT_KEY_ACTION,
+                                        "Copy Root Key",
+                                    );
+                                    set_dlg_item_string(
+                                        hwnd,
+                                        ID_STYLE_FOOTER_STATUS,
+                                        &format!(
+                                            "Imported root key (User ID: {}) and saved user_key.toml!",
+                                            out.user_id
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    show_tray_error_dialog(
+                                        "Import Root Key Failed",
+                                        "Failed to import scu1_ user root key from clipboard",
+                                        &format!("{e:#}"),
+                                    );
+                                }
+                            }
                         }
                     }
                     ID_BUNDLE_BTN_GENERATE => {
@@ -1756,17 +1887,12 @@ unsafe extern "system" fn bundle_wnd_proc(
                         };
 
                         if format_root_key_allowlist().is_none() {
-                            if let Err(e) = run_keygen(None, false) {
-                                show_tray_error_dialog(
-                                    "Keygen Failed",
-                                    "Failed to generate user_key.toml",
-                                    &format!("{e:#}"),
-                                );
-                                return 0;
-                            }
-                            if let Some(allow) = format_root_key_allowlist() {
-                                set_dlg_item_string(hwnd, ID_BUNDLE_ROOT_PUBKEY_EDIT, &allow);
-                            }
+                            show_tray_error_dialog(
+                                "User Root Key Required",
+                                "No user_key.toml found on this workstation",
+                                "On your primary workstation, open 'Generate Enrollment Bundle' and click 'Copy Root Key', then click 'Paste Root Key' above on this workstation.",
+                            );
+                            return 0;
                         }
 
                         let relay_radio = GetDlgItem(hwnd, ID_BUNDLE_RADIO_RELAY);
@@ -1787,7 +1913,8 @@ unsafe extern "system" fn bundle_wnd_proc(
                                 servers,
                                 expires_days,
                             )?;
-                            Ok(bundle.encode()?)
+                            let include_rk = if is_relay { None } else { Some(&user_sk) };
+                            encode_enrollment_bundle_token(&bundle, include_rk)
                         })();
 
                         match res {
@@ -1875,6 +2002,12 @@ pub unsafe fn show_bundle_generator_window() {
         let g = DIALOG_RES.lock().unwrap();
         let existing = g.bundle_hwnd as HWND;
         if !existing.is_null() && IsWindow(existing) != 0 {
+            if let Some(allow) = format_root_key_allowlist() {
+                set_dlg_item_string(existing, ID_BUNDLE_ROOT_PUBKEY_EDIT, &allow);
+                set_dlg_item_string(existing, ID_BUNDLE_BTN_ROOT_KEY_ACTION, "Copy Root Key");
+            } else {
+                set_dlg_item_string(existing, ID_BUNDLE_BTN_ROOT_KEY_ACTION, "Paste Root Key");
+            }
             ShowWindow(existing, SW_RESTORE);
             SetForegroundWindow(existing);
             return;
