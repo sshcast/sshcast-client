@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Endpoint;
+use tonic::transport::{ClientTlsConfig, Endpoint};
 
 use crate::config::ClientConfig;
 use crate::local_agent::LocalAgentConnector;
@@ -86,16 +86,17 @@ impl WorkstationManager {
     }
 
     /// Maintains persistent bidirectional `ConnectWorkstation` gRPC streams to all configured
-    /// `sshcast-server` instances concurrently until `shutdown_rx` signals true.
-    pub async fn run(&self, shutdown_rx: watch::Receiver<bool>) -> Result<()> {
-        let mut handles = Vec::with_capacity(self.cfg.servers.len() + 1);
+    /// `sshcast-server` instances (including dynamic discovery via `_sshcast.<domain>` DNS TXT records)
+    /// concurrently until `shutdown_rx` signals true.
+    pub async fn run(&self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+        let mut zellij_handle = None;
         if self.cfg.zellij_listen_port > 0 {
             let bind_addr = format!("127.0.0.1:{}", self.cfg.zellij_listen_port);
             match tokio::net::TcpListener::bind(&bind_addr).await {
                 Ok(listener) => {
                     let hub = Arc::clone(&self.zellij_hub);
                     let shutdown = shutdown_rx.clone();
-                    handles.push(tokio::spawn(async move {
+                    zellij_handle = Some(tokio::spawn(async move {
                         let _ = serve_zellij_proxy_with_listener(listener, hub, shutdown).await;
                     }));
                 }
@@ -108,76 +109,196 @@ impl WorkstationManager {
                 }
             }
         }
-        for server_url in &self.cfg.servers {
-            let url = server_url.clone();
-            let cfg = self.cfg.clone();
-            let local_agent = Arc::clone(&self.local_agent);
-            let policy = Arc::clone(&self.policy);
-            let prompter = Arc::clone(&self.prompter);
-            let cancellations = Arc::clone(&self.cancellations);
-            let force_active_flag = Arc::clone(&self.force_active_flag);
-            let connected_count = Arc::clone(&self.connected_count);
-            let zellij_hub = Arc::clone(&self.zellij_hub);
-            let mut shutdown = shutdown_rx.clone();
 
-            handles.push(tokio::spawn(async move {
-                let mut backoff = Duration::from_millis(500);
-                let max_backoff = Duration::from_secs(30);
+        let configured_entries = self.cfg.servers.clone();
+        let has_dns_entries = configured_entries
+            .iter()
+            .any(|s| sshcast_proto::dns::is_dns_discovery_entry(s).is_some());
 
+        let initial_urls = tokio::task::spawn_blocking({
+            let entries = configured_entries.clone();
+            move || sshcast_proto::dns::resolve_coordinator_servers(&entries)
+        })
+        .await
+        .unwrap_or_else(|_| configured_entries.clone());
+
+        let mut active_streams: HashMap<String, (watch::Sender<bool>, tokio::task::JoinHandle<()>)> =
+            HashMap::new();
+
+        for server_url in initial_urls {
+            let (stop_tx, handle) = self.spawn_coordinator_worker(server_url.clone(), shutdown_rx.clone());
+            active_streams.insert(server_url, (stop_tx, handle));
+        }
+
+        if has_dns_entries {
+            let mut dns_ticker = tokio::time::interval(Duration::from_secs(60));
+            dns_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            dns_ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = dns_ticker.tick() => {
+                        let entries = configured_entries.clone();
+                        if let Ok(resolved) = tokio::task::spawn_blocking(move || {
+                            sshcast_proto::dns::resolve_coordinator_servers(&entries)
+                        }).await {
+                            if !resolved.is_empty() {
+                                for url in &resolved {
+                                    if !active_streams.contains_key(url) {
+                                        tracing::info!(
+                                            "Discovered new coordinator via _sshcast DNS TXT: {}",
+                                            url
+                                        );
+                                        let (stop_tx, handle) = self.spawn_coordinator_worker(
+                                            url.clone(),
+                                            shutdown_rx.clone(),
+                                        );
+                                        active_streams.insert(url.clone(), (stop_tx, handle));
+                                    }
+                                }
+                                let to_remove: Vec<String> = active_streams
+                                    .keys()
+                                    .filter(|k| !resolved.contains(k))
+                                    .cloned()
+                                    .collect();
+                                for old_url in to_remove {
+                                    tracing::info!(
+                                        "Coordinator removed from _sshcast DNS TXT: {}; disconnecting",
+                                        old_url
+                                    );
+                                    if let Some((stop_tx, _handle)) = active_streams.remove(&old_url) {
+                                        let _ = stop_tx.send(true);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            while !*shutdown_rx.borrow() {
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        for (_, (stop_tx, handle)) in active_streams {
+            let _ = stop_tx.send(true);
+            let _ = handle.await;
+        }
+        if let Some(zh) = zellij_handle {
+            let _ = zh.await;
+        }
+        Ok(())
+    }
+
+    fn spawn_coordinator_worker(
+        &self,
+        url: String,
+        mut global_shutdown: watch::Receiver<bool>,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let cfg = self.cfg.clone();
+        let local_agent = Arc::clone(&self.local_agent);
+        let policy = Arc::clone(&self.policy);
+        let prompter = Arc::clone(&self.prompter);
+        let cancellations = Arc::clone(&self.cancellations);
+        let force_active_flag = Arc::clone(&self.force_active_flag);
+        let connected_count = Arc::clone(&self.connected_count);
+        let zellij_hub = Arc::clone(&self.zellij_hub);
+
+        let handle = tokio::spawn(async move {
+            let (combined_tx, combined_rx) = watch::channel(false);
+            let mut gs_clone = global_shutdown.clone();
+            let mut sr_clone = stop_rx.clone();
+            let c_tx = combined_tx.clone();
+            tokio::spawn(async move {
                 loop {
-                    if *shutdown.borrow() {
+                    if *gs_clone.borrow() || *sr_clone.borrow() {
+                        let _ = c_tx.send(true);
                         break;
                     }
-
-                    let conn_res = run_single_coordinator_stream(
-                        &url,
-                        &cfg,
-                        &local_agent,
-                        &policy,
-                        &prompter,
-                        &cancellations,
-                        &force_active_flag,
-                        &connected_count,
-                        &zellij_hub,
-                        shutdown.clone(),
-                    )
-                    .await;
-
-                    if *shutdown.borrow() {
-                        break;
-                    }
-
-                    match conn_res {
-                        Ok(()) => {
-                            backoff = Duration::from_millis(500);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Coordinator stream {} disconnected ({:#}); reconnecting in {:?}",
-                                url,
-                                e,
-                                backoff
-                            );
-                        }
-                    }
-
                     tokio::select! {
-                        _ = shutdown.changed() => {
-                            if *shutdown.borrow() {
+                        res = gs_clone.changed() => {
+                            if res.is_err() || *gs_clone.borrow() {
+                                let _ = c_tx.send(true);
                                 break;
                             }
                         }
-                        _ = tokio::time::sleep(backoff) => {}
+                        res = sr_clone.changed() => {
+                            if res.is_err() || *sr_clone.borrow() {
+                                let _ = c_tx.send(true);
+                                break;
+                            }
+                        }
                     }
-                    backoff = (backoff * 2).min(max_backoff);
                 }
-            }));
-        }
+            });
 
-        for h in handles {
-            let _ = h.await;
-        }
-        Ok(())
+            let mut backoff = Duration::from_millis(500);
+            let max_backoff = Duration::from_secs(30);
+
+            loop {
+                if *global_shutdown.borrow() || *stop_rx.borrow() {
+                    break;
+                }
+
+                let conn_res = run_single_coordinator_stream(
+                    &url,
+                    &cfg,
+                    &local_agent,
+                    &policy,
+                    &prompter,
+                    &cancellations,
+                    &force_active_flag,
+                    &connected_count,
+                    &zellij_hub,
+                    combined_rx.clone(),
+                )
+                .await;
+
+                if *global_shutdown.borrow() || *stop_rx.borrow() {
+                    break;
+                }
+
+                match conn_res {
+                    Ok(()) => {
+                        backoff = Duration::from_millis(500);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Coordinator stream {} disconnected ({:#}); reconnecting in {:?}",
+                            url,
+                            e,
+                            backoff
+                        );
+                    }
+                }
+
+                tokio::select! {
+                    _ = global_shutdown.changed() => {
+                        if *global_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        });
+
+        (stop_tx, handle)
     }
 }
 
@@ -209,12 +330,18 @@ async fn run_single_coordinator_stream(
     zellij_hub: &Arc<ZellijProxyHub>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let endpoint = Endpoint::new(server_url.to_string())
+    let mut endpoint = Endpoint::new(server_url.to_string())
         .with_context(|| format!("invalid coordinator URL {server_url}"))?
         .connect_timeout(Duration::from_secs(5))
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .http2_keep_alive_interval(Duration::from_secs(25))
         .keep_alive_timeout(Duration::from_secs(10));
+
+    if server_url.trim().starts_with("https://") {
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .with_context(|| format!("failed to configure TLS roots for {server_url}"))?;
+    }
 
     let channel = endpoint.connect().await?;
     let mut client = SshcastServiceClient::new(channel);

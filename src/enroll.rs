@@ -3,9 +3,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use sshcast_proto::bundle::EnrollmentBundle;
-use sshcast_proto::crypto::{derive_user_id, sign_node_grant, verify_node_grant};
-use sshcast_proto::v1::{NodeGrant, NodeRole};
+use prost::Message;
+use sshcast_proto::bundle::{
+    decode_user_cert_token, encode_user_cert_token, EnrollmentBundle,
+};
+use sshcast_proto::crypto::{
+    derive_user_id, sign_node_grant, verify_node_grant, verify_user_cert,
+};
+use sshcast_proto::v1::{NodeGrant, NodeRole, UserCert};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,10 +60,21 @@ pub fn save_user_signing_key(
     let user_id = derive_user_id(&pubkey_bytes);
     let user_pubkey_token = format!("sc_pub_{}", hex::encode(pubkey_bytes));
 
+    let existing_cert_token = UserKeyFile::load(Some(&path))
+        .ok()
+        .and_then(|(_, f)| {
+            if f.user_id == user_id {
+                f.user_cert_token
+            } else {
+                None
+            }
+        });
+
     let file = UserKeyFile {
         user_id: user_id.clone(),
         user_pubkey_token: user_pubkey_token.clone(),
         user_privkey_seed_b64: URL_SAFE_NO_PAD.encode(signing_key.to_bytes()),
+        user_cert_token: existing_cert_token,
     };
 
     let toml_str = toml::to_string_pretty(&file).context("failed to serialize user_key.toml")?;
@@ -161,6 +177,94 @@ pub fn load_user_signing_key(key_path: Option<&Path>) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&seed))
 }
 
+pub fn load_user_cert(key_path: Option<&Path>, config_path: Option<&Path>) -> Option<UserCert> {
+    if let Ok((_, file)) = UserKeyFile::load(key_path) {
+        if let Some(tok) = &file.user_cert_token {
+            if let Ok(cert) = decode_user_cert_token(tok) {
+                return Some(cert);
+            }
+        }
+    }
+    if let Ok(cfg) = ClientConfig::load(config_path) {
+        if let Some(cert) = cfg.grant.user_cert {
+            return Some(cert);
+        }
+    }
+    None
+}
+
+/// Imports an operator-signed `sc_cert_<base64>` certificate into `user_key.toml` (if present)
+/// and updates `client.toml`'s `grant_proto_b64` (if present) so this workstation and all future
+/// `grant-relay` / `grant-client` bundles carry the operator signature.
+pub fn import_user_cert(
+    cert_token: &str,
+    key_path: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, UserCert)> {
+    let cert = decode_user_cert_token(cert_token)
+        .context("failed to decode sc_cert_ user certificate token")?;
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    verify_user_cert(&cert, &[], now_sec)
+        .context("operator signature or expiration verification failed on user certificate")?;
+
+    let canonical_token = encode_user_cert_token(&cert);
+    let mut updated_key_path = None;
+    let mut updated_cfg_path = None;
+
+    if let Ok((kp, mut key_file)) = UserKeyFile::load(key_path) {
+        let sk = load_user_signing_key(Some(&kp))?;
+        let pk_bytes = sk.verifying_key().to_bytes();
+        if cert.user_pubkey.as_slice() != pk_bytes.as_slice() {
+            anyhow::bail!(
+                "certificate user_pubkey ({}) does not match local user_key.toml ({})",
+                derive_user_id(&cert.user_pubkey),
+                key_file.user_id
+            );
+        }
+        key_file.user_cert_token = Some(canonical_token);
+        let toml_str =
+            toml::to_string_pretty(&key_file).context("failed to serialize user_key.toml")?;
+        std::fs::write(&kp, &toml_str)
+            .with_context(|| format!("failed to write {}", kp.display()))?;
+        updated_key_path = Some(kp);
+    }
+
+    if let Ok((cp, mut cfg_file)) = ClientConfigFile::load(config_path) {
+        let grant_bytes = URL_SAFE_NO_PAD
+            .decode(cfg_file.grant_proto_b64.trim())
+            .context("invalid base64 in client.toml grant_proto_b64")?;
+        let mut grant = NodeGrant::decode(grant_bytes.as_slice())
+            .context("failed to decode NodeGrant in client.toml")?;
+        if grant.user_pubkey.as_slice() != cert.user_pubkey.as_slice() {
+            anyhow::bail!(
+                "certificate user_pubkey ({}) does not match enrolled workstation user ({}) in {}",
+                derive_user_id(&cert.user_pubkey),
+                grant.user_id,
+                cp.display()
+            );
+        }
+        grant.user_cert = Some(cert.clone());
+        let mut new_grant_bytes = Vec::new();
+        grant
+            .encode(&mut new_grant_bytes)
+            .expect("prost encode cannot fail on Vec");
+        cfg_file.grant_proto_b64 = URL_SAFE_NO_PAD.encode(new_grant_bytes);
+        cfg_file.save(Some(&cp))?;
+        updated_cfg_path = Some(cp);
+    }
+
+    if updated_key_path.is_none() && updated_cfg_path.is_none() {
+        anyhow::bail!(
+            "neither user_key.toml nor client.toml was found; run `sshcast-client keygen` first"
+        );
+    }
+
+    Ok((updated_key_path, updated_cfg_path, cert))
+}
+
 /// Mints a signed `NodeGrant` and returns an `EnrollmentBundle` (`sc1_<base64>`) for a target relay or workstation.
 pub fn mint_enrollment_bundle(
     user_signing_key: &SigningKey,
@@ -169,11 +273,29 @@ pub fn mint_enrollment_bundle(
     servers: Vec<String>,
     expires_in_days: u64,
 ) -> Result<EnrollmentBundle> {
+    mint_enrollment_bundle_with_cert(
+        user_signing_key,
+        node_id,
+        role,
+        servers,
+        expires_in_days,
+        load_user_cert(None, None),
+    )
+}
+
+pub fn mint_enrollment_bundle_with_cert(
+    user_signing_key: &SigningKey,
+    node_id: &str,
+    role: NodeRole,
+    servers: Vec<String>,
+    expires_in_days: u64,
+    user_cert: Option<UserCert>,
+) -> Result<EnrollmentBundle> {
     if node_id.trim().is_empty() {
         anyhow::bail!("node_id cannot be empty");
     }
     if servers.is_empty() {
-        anyhow::bail!("at least one --server URL is required");
+        anyhow::bail!("at least one --server URL or --domain is required");
     }
 
     let node_signing_key = SigningKey::generate(&mut OsRng);
@@ -187,6 +309,9 @@ pub fn mint_enrollment_bundle(
         now_sec + expires_in_days * 86_400
     };
 
+    let pub_bytes = user_signing_key.verifying_key().to_bytes();
+    let verified_cert = user_cert.filter(|c| c.user_pubkey.as_slice() == pub_bytes.as_slice());
+
     let mut grant = NodeGrant {
         user_id: String::new(),
         user_pubkey: Vec::new(),
@@ -196,6 +321,7 @@ pub fn mint_enrollment_bundle(
         issued_at_unix_sec: now_sec,
         expires_at_unix_sec,
         user_signature: Vec::new(),
+        user_cert: verified_cert,
     };
     sign_node_grant(&mut grant, user_signing_key);
 
@@ -329,6 +455,10 @@ pub fn write_client_config_and_optional_root_key(
             config_path.and_then(|c| c.parent().map(|p| p.join("user_key.toml")))
         });
         let out = save_user_signing_key(sk, effective_key_path.as_deref(), true)?;
+        if let Some(cert) = &bundle.grant.user_cert {
+            let tok = encode_user_cert_token(cert);
+            let _ = import_user_cert(&tok, Some(&out.key_path), Some(&cfg_out));
+        }
         Some(out.key_path)
     } else {
         None

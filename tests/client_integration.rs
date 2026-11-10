@@ -452,6 +452,7 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         issued_at_unix_sec: now_sec - 60,
         expires_at_unix_sec: 0,
         user_signature: Vec::new(),
+        user_cert: None,
     };
     sign_node_grant(&mut relay_grant, &user_sk);
 
@@ -464,6 +465,7 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         issued_at_unix_sec: now_sec - 60,
         expires_at_unix_sec: 0,
         user_signature: Vec::new(),
+        user_cert: None,
     };
     sign_node_grant(&mut client_grant, &user_sk);
 
@@ -658,6 +660,7 @@ async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
         issued_at_unix_sec: now_sec - 60,
         expires_at_unix_sec: 0,
         user_signature: Vec::new(),
+        user_cert: None,
     };
     sign_node_grant(&mut client_grant, &user_sk);
 
@@ -847,6 +850,7 @@ async fn test_builtin_ssh_agent_keys_without_os_agent() {
         issued_at_unix_sec: now_sec - 60,
         expires_at_unix_sec: 0,
         user_signature: Vec::new(),
+        user_cert: None,
     };
     sign_node_grant(&mut relay_grant, &user_sk);
 
@@ -859,6 +863,7 @@ async fn test_builtin_ssh_agent_keys_without_os_agent() {
         issued_at_unix_sec: now_sec - 60,
         expires_at_unix_sec: 0,
         user_signature: Vec::new(),
+        user_cert: None,
     };
     sign_node_grant(&mut client_grant, &user_sk);
 

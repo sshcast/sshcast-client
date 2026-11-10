@@ -39,10 +39,13 @@ pub struct KeyFilterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserKeyFile {
     pub user_id: String,
-    /// `sc_pub_<hex>` representation for `server.toml` `allowed_user_pubkeys`
+    /// `sc_pub_<hex>` representation for `server.toml` `allowed_user_pubkeys` or operator signing
     pub user_pubkey_token: String,
     /// Base64 URL-safe encoded 32-byte Ed25519 root private key seed
     pub user_privkey_seed_b64: String,
+    /// Optional operator-signed `sc_cert_<base64>` user certificate token
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_cert_token: Option<String>,
 }
 
 impl UserKeyFile {

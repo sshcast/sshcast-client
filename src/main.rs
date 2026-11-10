@@ -4,8 +4,9 @@ use sshcast_client::config::{expand_tilde_path, ClientConfig, ClientConfigFile};
 use sshcast_client::coordinator::WorkstationManager;
 use sshcast_client::enroll::{
     decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
-    import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
-    write_client_config_and_optional_root_key, write_client_config_from_bundle,
+    import_user_cert, import_user_root_key, load_user_cert, load_user_signing_key,
+    mint_enrollment_bundle_with_cert, run_keygen, write_client_config_and_optional_root_key,
+    write_client_config_from_bundle,
 };
 use sshcast_client::gui::run_egui_modal_process;
 use sshcast_client::local_agent::LocalAgentConnector;
@@ -64,15 +65,33 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Import an operator-signed `sc_cert_<base64>` certificate into `user_key.toml` and `client.toml`
+    ImportCert {
+        /// Operator-signed user certificate token (`sc_cert_<base64>`)
+        #[arg(long)]
+        cert: String,
+
+        /// Optional path to `user_key.toml`
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+
+        /// Optional path to `client.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Mint a signed `NodeGrant` (`NODE_ROLE_RELAY`) and output an `sc1_<base64>` bundle for `sshcast-relay init`
     GrantRelay {
         /// Target relay hostname (must match `/proc` hostname on the target server, e.g. `server-x.infra.local`)
         #[arg(long)]
         node: String,
 
-        /// Coordinator server URL(s) (defaults to `servers` in `client.toml` if omitted)
+        /// Coordinator server URL(s) or swarm domain(s) (defaults to `servers` in `client.toml` if omitted)
         #[arg(long = "server")]
         servers: Vec<String>,
+
+        /// Swarm domain(s) to resolve via `_sshcast.<domain>` DNS TXT records (e.g. `sshcast.net`)
+        #[arg(long = "domain")]
+        domains: Vec<String>,
 
         /// Optional grant expiration in days (0 = no expiration)
         #[arg(long, default_value_t = 0)]
@@ -88,9 +107,13 @@ enum Commands {
         #[arg(long)]
         node: String,
 
-        /// Coordinator server URL(s) (defaults to `servers` in `client.toml` if omitted)
+        /// Coordinator server URL(s) or swarm domain(s) (defaults to `servers` in `client.toml` if omitted)
         #[arg(long = "server")]
         servers: Vec<String>,
+
+        /// Swarm domain(s) to resolve via `_sshcast.<domain>` DNS TXT records (e.g. `sshcast.net`)
+        #[arg(long = "domain")]
+        domains: Vec<String>,
 
         /// Optional grant expiration in days (0 = no expiration)
         #[arg(long, default_value_t = 0)]
@@ -268,26 +291,63 @@ async fn main() -> Result<()> {
             println!("  Server Allowlist:  {}", out.user_pubkey_token);
             Ok(())
         }
+        Commands::ImportCert {
+            cert,
+            key_file,
+            config,
+        } => {
+            let (updated_key, updated_cfg, parsed_cert) =
+                import_user_cert(&cert, key_file.as_deref(), config.as_deref())?;
+            println!(
+                "Imported Operator-Signed User Certificate for '{}'!",
+                parsed_cert.user_id
+            );
+            println!(
+                "  Operator Pubkey:   sc_op_pub_{}",
+                hex::encode(&parsed_cert.operator_pubkey)
+            );
+            if let Some(kp) = updated_key {
+                println!("  Updated root key:  {}", kp.display());
+            }
+            if let Some(cp) = updated_cfg {
+                println!("  Updated config:    {}", cp.display());
+            }
+            Ok(())
+        }
         Commands::GrantRelay {
             node,
-            servers,
+            mut servers,
+            domains,
             expires_days,
             key_file,
         } => {
+            for d in domains {
+                let clean = d
+                    .trim()
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_end_matches('/')
+                    .to_string();
+                if !clean.is_empty() && !servers.contains(&clean) {
+                    servers.push(clean);
+                }
+            }
             let resolved_servers = if servers.is_empty() {
                 ClientConfig::load(None)
                     .map(|c| c.servers)
-                    .context("no --server provided and failed to load default servers from client.toml")?
+                    .context("no --server or --domain provided and failed to load default servers from client.toml")?
             } else {
                 servers
             };
             let user_sk = load_user_signing_key(key_file.as_deref())?;
-            let bundle = mint_enrollment_bundle(
+            let user_cert = load_user_cert(key_file.as_deref(), None);
+            let bundle = mint_enrollment_bundle_with_cert(
                 &user_sk,
                 &node,
                 NodeRole::Relay,
                 resolved_servers,
                 expires_days,
+                user_cert,
             )?;
             let token = bundle.encode().context("failed to encode relay bundle")?;
             println!("Enrollment bundle for relay node '{node}':\n");
@@ -298,7 +358,8 @@ async fn main() -> Result<()> {
         }
         Commands::GrantClient {
             node,
-            servers,
+            mut servers,
+            domains,
             expires_days,
             key_file,
             config,
@@ -306,20 +367,33 @@ async fn main() -> Result<()> {
             no_root_key,
             force,
         } => {
+            for d in domains {
+                let clean = d
+                    .trim()
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_end_matches('/')
+                    .to_string();
+                if !clean.is_empty() && !servers.contains(&clean) {
+                    servers.push(clean);
+                }
+            }
             let resolved_servers = if servers.is_empty() {
                 ClientConfig::load(config.as_deref())
                     .map(|c| c.servers)
-                    .context("no --server provided and failed to load default servers from client.toml")?
+                    .context("no --server or --domain provided and failed to load default servers from client.toml")?
             } else {
                 servers
             };
             let user_sk = load_user_signing_key(key_file.as_deref())?;
-            let bundle = mint_enrollment_bundle(
+            let user_cert = load_user_cert(key_file.as_deref(), config.as_deref());
+            let bundle = mint_enrollment_bundle_with_cert(
                 &user_sk,
                 &node,
                 NodeRole::Client,
                 resolved_servers,
                 expires_days,
+                user_cert,
             )?;
             let include_rk = if no_root_key { None } else { Some(&user_sk) };
             let token = encode_enrollment_bundle_token(&bundle, include_rk)

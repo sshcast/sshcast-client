@@ -141,11 +141,19 @@ impl WasmWorkstationEngine {
                 }
                 let coordinator_url = bundle.servers.first().cloned().unwrap_or_default();
                 let ws_url = Self::derive_ws_url(&coordinator_url);
+                let dns_domains: Vec<String> = bundle
+                    .servers
+                    .iter()
+                    .filter_map(|s| sshcast_proto::dns::is_dns_discovery_entry(s))
+                    .collect();
+                let has_user_cert = bundle.grant.user_cert.is_some();
                 let resp = json!({
                     "ok": true,
                     "coordinator_url": coordinator_url,
                     "ws_url": ws_url,
                     "servers": bundle.servers,
+                    "dns_domains": dns_domains,
+                    "has_user_cert": has_user_cert,
                     "user_id": bundle.grant.user_id,
                     "node_id": bundle.grant.node_id,
                     "role": "CLIENT",
@@ -156,6 +164,29 @@ impl WasmWorkstationEngine {
                     self.bundle = Some(bundle);
                 }
                 resp
+            }
+            "parse_txt_records" => {
+                let raw_records: Vec<String> = req
+                    .get("txt_records")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let coordinators =
+                    sshcast_proto::dns::parse_txt_coordinator_records(&raw_records);
+                let ws_urls: Vec<String> = coordinators
+                    .iter()
+                    .map(|u| Self::derive_ws_url(u))
+                    .collect();
+                json!({
+                    "ok": true,
+                    "coordinators": coordinators,
+                    "ws_urls": ws_urls,
+                })
             }
             "add_ssh_key" => {
                 let pem = req.get("pem").and_then(Value::as_str).unwrap_or("");
@@ -717,6 +748,7 @@ mod tests {
             issued_at_unix_sec: 1_700_000_000,
             expires_at_unix_sec: 0,
             user_signature: Vec::new(),
+            user_cert: None,
         };
         sign_node_grant(&mut client_grant, &user_sk);
 
@@ -770,6 +802,7 @@ mod tests {
             issued_at_unix_sec: 1_700_000_000,
             expires_at_unix_sec: 0,
             user_signature: Vec::new(),
+            user_cert: None,
         };
         sign_node_grant(&mut relay_grant, &user_sk);
 
