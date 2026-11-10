@@ -7,9 +7,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/theraphim/sshcast-client"
 default-run = "sshcast-client"
 
-[lib]
-crate-type = ["rlib", "cdylib"]
-
 [[bin]]
 name = "sshcast-client"
 path = "src/main.rs"

@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use sshcast_client::config::ClientConfig;
 use sshcast_client::coordinator::WorkstationManager;
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 use sshcast_client::local_agent::LocalAgentConnector;
 use sshcast_client::policy::{ApprovalDecision, PolicyEngine};
 use sshcast_client::prompt::{ApprovalPrompter, InteractivePrompter, StaticPrompter};
