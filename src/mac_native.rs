@@ -351,6 +351,11 @@ pub fn run_macos_modal_process(details: PromptDetails) -> ApprovalDecision {
     map_modal_response(resp)
 }
 
+struct MacModalCancelState {
+    app_ptr: Option<usize>,
+    canceled: bool,
+}
+
 /// Displays a native macOS `NSAlert` approval modal on the AppKit main thread and automatically
 /// aborts the modal if `cancel_rx` fires (`CancelSignRequest` from coordinator).
 pub async fn prompt_macos_dialog(
@@ -365,20 +370,52 @@ pub async fn prompt_macos_dialog(
         return None;
     }
 
-    let modal_active = Arc::new(AtomicBool::new(false));
-    let modal_active_for_cancel = Arc::clone(&modal_active);
+    let state = Arc::new(Mutex::new(MacModalCancelState {
+        app_ptr: None,
+        canceled: false,
+    }));
+    let state_for_cancel = Arc::clone(&state);
     let mut cancel_watch = cancel_rx.clone();
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
 
     let cancel_task = tokio::spawn(async move {
-        tokio::select! {
-            _ = &mut done_rx => {}
-            _ = cancel_watch.changed() => {
-                if modal_active_for_cancel.swap(false, Ordering::SeqCst) {
-                    run_on_main_async(|mtm| {
-                        let app = NSApplication::sharedApplication(mtm);
-                        app.abortModal();
-                    });
+        loop {
+            tokio::select! {
+                _ = &mut done_rx => break,
+                res = cancel_watch.changed() => {
+                    if res.is_err() || cancel_watch.borrow().is_some() {
+                        let maybe_app_ptr = if let Ok(mut guard) = state_for_cancel.lock() {
+                            guard.canceled = true;
+                            guard.app_ptr
+                        } else {
+                            None
+                        };
+                        if let Some(ptr) = maybe_app_ptr {
+                            // `NSAlert::runModal()` spins `NSModalPanelRunLoopMode`, which blocks
+                            // `DispatchQueue::main()`. `-[NSApplication abortModal]` and
+                            // `-[NSApplication postEvent:atStart:]` are thread-safe in AppKit and
+                            // must be invoked directly from the background thread to wake and exit
+                            // the modal runloop immediately.
+                            unsafe {
+                                let app_ref = &*(ptr as *const NSApplication);
+                                app_ref.abortModal();
+                                if let Some(wake_event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                                    NSEventType::ApplicationDefined,
+                                    NSPoint::new(0.0, 0.0),
+                                    NSEventModifierFlags::empty(),
+                                    0.0,
+                                    0,
+                                    None,
+                                    0,
+                                    0,
+                                    0,
+                                ) {
+                                    app_ref.postEvent_atStart(&wake_event, true);
+                                }
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -386,22 +423,31 @@ pub async fn prompt_macos_dialog(
 
     let details_cloned = details.clone();
     let cancel_rx_check = cancel_rx.clone();
-    let modal_active_for_main = Arc::clone(&modal_active);
+    let state_for_main = Arc::clone(&state);
 
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<isize>();
     run_on_main_async(move |mtm| {
-        if cancel_rx_check.borrow().is_some() {
-            let _ = resp_tx.send(0);
-            return;
-        }
         let app = NSApplication::sharedApplication(mtm);
+        {
+            let Ok(mut guard) = state_for_main.lock() else {
+                let _ = resp_tx.send(0);
+                return;
+            };
+            if guard.canceled || cancel_rx_check.borrow().is_some() {
+                let _ = resp_tx.send(0);
+                return;
+            }
+            guard.app_ptr = Some(Retained::as_ptr(&app) as usize);
+        }
+
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
 
         let alert = build_approval_alert(mtm, &details_cloned);
-        modal_active_for_main.store(true, Ordering::SeqCst);
         let resp = alert.runModal();
-        modal_active_for_main.store(false, Ordering::SeqCst);
+        if let Ok(mut guard) = state_for_main.lock() {
+            guard.app_ptr = None;
+        }
         let _ = resp_tx.send(resp);
     });
 

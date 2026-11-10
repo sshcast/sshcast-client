@@ -11,9 +11,9 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
     TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS, TDCBF_CANCEL_BUTTON, TDCBF_OK_BUTTON,
-    TDF_ALLOW_DIALOG_CANCELLATION, TDF_EXPANDED_BY_DEFAULT, TDF_SIZE_TO_CONTENT,
-    TDF_USE_COMMAND_LINKS, TDM_CLICK_BUTTON, TDN_CREATED, TD_ERROR_ICON, TD_INFORMATION_ICON,
-    TD_SHIELD_ICON,
+    TDF_ALLOW_DIALOG_CANCELLATION, TDF_CALLBACK_TIMER, TDF_EXPANDED_BY_DEFAULT,
+    TDF_SIZE_TO_CONTENT, TDF_USE_COMMAND_LINKS, TDM_CLICK_BUTTON, TDN_CREATED, TDN_DESTROYED,
+    TDN_TIMER, TD_ERROR_ICON, TD_INFORMATION_ICON, TD_SHIELD_ICON,
 };
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -21,13 +21,13 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowPos,
-    TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, HICON, HWND_TOPMOST, IDCANCEL,
-    IDI_APPLICATION, IDI_SHIELD, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, MSG, SWP_NOMOVE, SWP_NOSIZE, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
-    WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    DispatchMessageW, EndDialog, GetCursorPos, GetMessageW, LoadIconW, MessageBoxW, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW, SendNotifyMessageW,
+    SetForegroundWindow, SetWindowPos, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, HICON,
+    HWND_TOPMOST, IDCANCEL, IDI_APPLICATION, IDI_SHIELD, MB_ICONERROR, MB_OK, MF_CHECKED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SWP_NOMOVE, SWP_NOSIZE, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::config::{default_config_dir, ClientConfig};
@@ -63,8 +63,9 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 struct DialogCancelState {
-    hwnd: Option<isize>,
-    canceled: bool,
+    hwnd: Mutex<Option<isize>>,
+    canceled: AtomicBool,
+    close_sent: AtomicBool,
 }
 
 unsafe extern "system" fn task_dialog_callback(
@@ -74,14 +75,20 @@ unsafe extern "system" fn task_dialog_callback(
     _lparam: LPARAM,
     lprefdata: isize,
 ) -> windows_sys::core::HRESULT {
-    if msg == TDN_CREATED && lprefdata != 0 {
-        let state_ptr = lprefdata as *const Mutex<DialogCancelState>;
-        if let Ok(mut guard) = (*state_ptr).lock() {
-            if guard.canceled {
-                PostMessageW(hwnd, TDM_CLICK_BUTTON as u32, IDCANCEL as usize, 0);
-                return S_OK;
-            }
-            guard.hwnd = Some(hwnd as isize);
+    if lprefdata == 0 {
+        return S_OK;
+    }
+    let state = &*(lprefdata as *const DialogCancelState);
+
+    if msg == TDN_CREATED {
+        if let Ok(mut guard) = state.hwnd.lock() {
+            *guard = Some(hwnd as isize);
+        }
+        if state.canceled.load(Ordering::Acquire) {
+            state.close_sent.store(true, Ordering::Release);
+            PostMessageW(hwnd, TDM_CLICK_BUTTON as u32, BTN_DENY as usize, 0);
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return S_OK;
         }
         SetWindowPos(
             hwnd,
@@ -93,6 +100,19 @@ unsafe extern "system" fn task_dialog_callback(
             SWP_NOMOVE | SWP_NOSIZE,
         );
         SetForegroundWindow(hwnd);
+    } else if msg == TDN_TIMER {
+        if state.canceled.load(Ordering::Acquire) {
+            if !state.close_sent.swap(true, Ordering::AcqRel) {
+                SendMessageW(hwnd, TDM_CLICK_BUTTON as u32, BTN_DENY as usize, 0);
+            } else {
+                let _ = EndDialog(hwnd, IDCANCEL as isize);
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+        }
+    } else if msg == TDN_DESTROYED {
+        if let Ok(mut guard) = state.hwnd.lock() {
+            *guard = None;
+        }
     }
     S_OK
 }
@@ -107,30 +127,36 @@ pub async fn prompt_task_dialog(
         return Some(ApprovalDecision::Deny);
     }
 
-    let state = Arc::new(Mutex::new(DialogCancelState {
-        hwnd: None,
-        canceled: false,
-    }));
+    let state = Arc::new(DialogCancelState {
+        hwnd: Mutex::new(None),
+        canceled: AtomicBool::new(false),
+        close_sent: AtomicBool::new(false),
+    });
 
     let state_for_cancel = Arc::clone(&state);
     let mut cancel_watch = cancel_rx.clone();
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
 
     let cancel_task = tokio::spawn(async move {
-        tokio::select! {
-            _ = &mut done_rx => {}
-            _ = cancel_watch.changed() => {
-                if let Ok(mut guard) = state_for_cancel.lock() {
-                    guard.canceled = true;
-                    if let Some(hwnd_raw) = guard.hwnd {
-                        unsafe {
-                            PostMessageW(
-                                hwnd_raw as HWND,
-                                TDM_CLICK_BUTTON as u32,
-                                IDCANCEL as usize,
-                                0,
-                            );
+        loop {
+            tokio::select! {
+                _ = &mut done_rx => break,
+                res = cancel_watch.changed() => {
+                    if res.is_err() || cancel_watch.borrow().is_some() {
+                        state_for_cancel.canceled.store(true, Ordering::Release);
+                        let maybe_hwnd = state_for_cancel.hwnd.lock().ok().and_then(|g| *g);
+                        if let Some(hwnd_raw) = maybe_hwnd {
+                            unsafe {
+                                SendNotifyMessageW(
+                                    hwnd_raw as HWND,
+                                    TDM_CLICK_BUTTON as u32,
+                                    BTN_DENY as usize,
+                                    0,
+                                );
+                                PostMessageW(hwnd_raw as HWND, WM_CLOSE, 0, 0);
+                            }
                         }
+                        break;
                     }
                 }
             }
@@ -212,6 +238,7 @@ pub async fn prompt_task_dialog(
             hInstance: null_mut(),
             dwFlags: TDF_USE_COMMAND_LINKS
                 | TDF_ALLOW_DIALOG_CANCELLATION
+                | TDF_CALLBACK_TIMER
                 | TDF_SIZE_TO_CONTENT
                 | TDF_EXPANDED_BY_DEFAULT,
             dwCommonButtons: TDCBF_CANCEL_BUTTON,

@@ -155,7 +155,16 @@ impl ApprovalPrompter for InteractivePrompter {
         details: PromptDetails,
         mut cancel_rx: watch::Receiver<Option<String>>,
     ) -> ApprovalDecision {
-        let _guard = self.prompt_lock.lock().await;
+        if cancel_rx.borrow().is_some() {
+            return ApprovalDecision::Deny;
+        }
+
+        let _guard = tokio::select! {
+            guard = self.prompt_lock.lock() => guard,
+            _ = cancel_rx.changed() => {
+                return ApprovalDecision::Deny;
+            }
+        };
 
         if cancel_rx.borrow().is_some() {
             return ApprovalDecision::Deny;
@@ -205,6 +214,10 @@ async fn try_native_gui_dialog(
     details: &PromptDetails,
     cancel_rx: &mut watch::Receiver<Option<String>>,
 ) -> Option<ApprovalDecision> {
+    if cancel_rx.borrow().is_some() {
+        return Some(ApprovalDecision::Deny);
+    }
+
     // On Windows, prefer the in-process native Win32 TaskDialogIndirect (comctl32 v6) with Command-Link buttons
     #[cfg(target_os = "windows")]
     {
@@ -474,6 +487,10 @@ async fn prompt_terminal_interactive(
     details: &PromptDetails,
     cancel_rx: &mut watch::Receiver<Option<String>>,
 ) -> ApprovalDecision {
+    if cancel_rx.borrow().is_some() {
+        return ApprovalDecision::Deny;
+    }
+
     eprintln!("\n+=========================================================================+");
     eprintln!("|                 SSHCAST SSH AGENT SIGNATURE REQUEST                    |");
     eprintln!("+=========================================================================+");

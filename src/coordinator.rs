@@ -6,10 +6,10 @@ use sshcast_proto::v1::sshcast_service_client::SshcastServiceClient;
 use sshcast_proto::v1::{
     ClientStreamMessage, SignAck, SignRequest, SignResponse, WorkstationStatus,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{ClientTlsConfig, Endpoint};
@@ -21,12 +21,158 @@ use crate::presence::{current_os_name, now_unix_ms, query_last_input_epoch_ms};
 use crate::prompt::{ApprovalPrompter, PromptDetails};
 use crate::zellij_proxy::{serve_zellij_proxy_with_listener, ZellijProxyHub};
 
+const RECENT_CANCEL_TTL: Duration = Duration::from_secs(120);
+const MAX_RECENT_CANCELS: usize = 256;
+const PROMPT_SAFETY_TIMEOUT: Duration = Duration::from_secs(90);
+
+struct InFlightSignRequest {
+    generation: u64,
+    cancel_tx: watch::Sender<Option<String>>,
+    responders: HashMap<u64, mpsc::Sender<ClientStreamMessage>>,
+}
+
+enum RegisterRequestOutcome {
+    AlreadyCanceled,
+    AttachedExisting,
+    Registered {
+        generation: u64,
+        cancel_rx: watch::Receiver<Option<String>>,
+    },
+}
+
+#[derive(Default)]
+struct ActiveSignRequests {
+    next_generation: u64,
+    in_flight: HashMap<String, InFlightSignRequest>,
+    recently_canceled: VecDeque<(String, Instant)>,
+}
+
+impl ActiveSignRequests {
+    fn prune_expired_cancels(&mut self, now: Instant) {
+        while let Some((_, ts)) = self.recently_canceled.front() {
+            if now.duration_since(*ts) > RECENT_CANCEL_TTL {
+                self.recently_canceled.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn is_recently_canceled(&mut self, request_id: &str) -> bool {
+        let now = Instant::now();
+        self.prune_expired_cancels(now);
+        self.recently_canceled
+            .iter()
+            .any(|(id, _)| id == request_id)
+    }
+
+    fn cancel_request(&mut self, request_id: &str, reason: String) {
+        let now = Instant::now();
+        self.prune_expired_cancels(now);
+        if !self
+            .recently_canceled
+            .iter()
+            .any(|(id, _)| id == request_id)
+        {
+            if self.recently_canceled.len() >= MAX_RECENT_CANCELS {
+                self.recently_canceled.pop_front();
+            }
+            self.recently_canceled
+                .push_back((request_id.to_string(), now));
+        }
+        if let Some(entry) = self.in_flight.remove(request_id) {
+            let _ = entry.cancel_tx.send(Some(reason));
+        }
+    }
+
+    fn timeout_request(&mut self, request_id: &str, generation: u64) {
+        if self
+            .in_flight
+            .get(request_id)
+            .map(|e| e.generation == generation)
+            .unwrap_or(false)
+        {
+            if let Some(entry) = self.in_flight.remove(request_id) {
+                let _ = entry
+                    .cancel_tx
+                    .send(Some("Approval prompt timed out".to_string()));
+            }
+        }
+    }
+
+    fn register_or_attach(
+        &mut self,
+        request_id: &str,
+        stream_id: u64,
+        tx: mpsc::Sender<ClientStreamMessage>,
+    ) -> RegisterRequestOutcome {
+        if self.is_recently_canceled(request_id) {
+            return RegisterRequestOutcome::AlreadyCanceled;
+        }
+        if let Some(existing) = self.in_flight.get_mut(request_id) {
+            existing.responders.insert(stream_id, tx);
+            return RegisterRequestOutcome::AttachedExisting;
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        let (cancel_tx, cancel_rx) = watch::channel(None);
+        let mut responders = HashMap::new();
+        responders.insert(stream_id, tx);
+        self.in_flight.insert(
+            request_id.to_string(),
+            InFlightSignRequest {
+                generation,
+                cancel_tx,
+                responders,
+            },
+        );
+        RegisterRequestOutcome::Registered {
+            generation,
+            cancel_rx,
+        }
+    }
+
+    fn complete_request(
+        &mut self,
+        request_id: &str,
+        generation: u64,
+    ) -> Vec<mpsc::Sender<ClientStreamMessage>> {
+        if self
+            .in_flight
+            .get(request_id)
+            .map(|e| e.generation == generation)
+            .unwrap_or(false)
+        {
+            if let Some(entry) = self.in_flight.remove(request_id) {
+                return entry.responders.into_values().collect();
+            }
+        }
+        Vec::new()
+    }
+
+    fn detach_stream(&mut self, stream_id: u64) {
+        let mut to_cancel = Vec::new();
+        self.in_flight.retain(|_req_id, entry| {
+            entry.responders.remove(&stream_id);
+            if entry.responders.is_empty() {
+                to_cancel.push(entry.cancel_tx.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for cancel_tx in to_cancel {
+            let _ = cancel_tx.send(Some("Coordinator stream disconnected".to_string()));
+        }
+    }
+}
+
 pub struct WorkstationManager {
     cfg: ClientConfig,
     local_agent: Arc<LocalAgentConnector>,
     policy: Arc<PolicyEngine>,
     prompter: Arc<dyn ApprovalPrompter>,
-    cancellations: Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
+    active_requests: Arc<Mutex<ActiveSignRequests>>,
     force_active_flag: Arc<AtomicBool>,
     connected_count: Arc<AtomicUsize>,
     zellij_hub: Arc<ZellijProxyHub>,
@@ -66,7 +212,7 @@ impl WorkstationManager {
             local_agent,
             policy,
             prompter,
-            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            active_requests: Arc::new(Mutex::new(ActiveSignRequests::default())),
             force_active_flag,
             connected_count,
             zellij_hub,
@@ -208,7 +354,7 @@ impl WorkstationManager {
         let local_agent = Arc::clone(&self.local_agent);
         let policy = Arc::clone(&self.policy);
         let prompter = Arc::clone(&self.prompter);
-        let cancellations = Arc::clone(&self.cancellations);
+        let active_requests = Arc::clone(&self.active_requests);
         let force_active_flag = Arc::clone(&self.force_active_flag);
         let connected_count = Arc::clone(&self.connected_count);
         let zellij_hub = Arc::clone(&self.zellij_hub);
@@ -255,7 +401,7 @@ impl WorkstationManager {
                     &local_agent,
                     &policy,
                     &prompter,
-                    &cancellations,
+                    &active_requests,
                     &force_active_flag,
                     &connected_count,
                     &zellij_hub,
@@ -324,7 +470,7 @@ async fn run_single_coordinator_stream(
     local_agent: &Arc<LocalAgentConnector>,
     policy: &Arc<PolicyEngine>,
     prompter: &Arc<dyn ApprovalPrompter>,
-    cancellations: &Arc<Mutex<HashMap<String, watch::Sender<Option<String>>>>>,
+    active_requests: &Arc<Mutex<ActiveSignRequests>>,
     force_active_flag: &Arc<AtomicBool>,
     connected_count: &Arc<AtomicUsize>,
     zellij_hub: &Arc<ZellijProxyHub>,
@@ -350,21 +496,25 @@ async fn run_single_coordinator_stream(
     let sender_reg_id = zellij_hub.register_coordinator_sender(tx.clone()).await;
     struct SenderRegGuard {
         hub: Arc<ZellijProxyHub>,
+        active_requests: Arc<Mutex<ActiveSignRequests>>,
         id: u64,
     }
     impl Drop for SenderRegGuard {
         fn drop(&mut self) {
             let hub = Arc::clone(&self.hub);
+            let active_requests = Arc::clone(&self.active_requests);
             let id = self.id;
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     hub.unregister_coordinator_sender(id).await;
+                    active_requests.lock().await.detach_stream(id);
                 });
             }
         }
     }
     let _sender_guard = SenderRegGuard {
         hub: Arc::clone(zellij_hub),
+        active_requests: Arc::clone(active_requests),
         id: sender_reg_id,
     };
 
@@ -436,9 +586,10 @@ async fn run_single_coordinator_stream(
                             cancel.request_id,
                             cancel.reason
                         );
-                        if let Some(cancel_tx) = cancellations.lock().await.remove(&cancel.request_id) {
-                            let _ = cancel_tx.send(Some(cancel.reason));
-                        }
+                        active_requests
+                            .lock()
+                            .await
+                            .cancel_request(&cancel.request_id, cancel.reason);
                     }
                     Some(ServerPayload::SignRequest(sign_req)) => {
                         let req_id = sign_req.request_id.clone();
@@ -453,26 +604,75 @@ async fn run_single_coordinator_stream(
                             }
                         }
 
+                        let reg_outcome = active_requests
+                            .lock()
+                            .await
+                            .register_or_attach(&req_id, sender_reg_id, tx.clone());
+
+                        let (generation, cancel_rx) = match reg_outcome {
+                            RegisterRequestOutcome::AlreadyCanceled => {
+                                tracing::info!(
+                                    "Ignoring SignRequest {} because it was already canceled",
+                                    req_id
+                                );
+                                continue;
+                            }
+                            RegisterRequestOutcome::AttachedExisting => {
+                                // Two-Phase Delivery Step 1: Reply with SignAck (<1.5s) without spawning a duplicate prompt
+                                if tx.send(ClientStreamMessage {
+                                    payload: Some(ClientPayload::SignAck(SignAck {
+                                        request_id: req_id.clone(),
+                                    })),
+                                }).await.is_err() {
+                                    anyhow::bail!("outbound stream closed while sending SignAck");
+                                }
+                                tracing::info!(
+                                    "SignRequest {} is already prompting on this workstation; attached stream",
+                                    req_id
+                                );
+                                continue;
+                            }
+                            RegisterRequestOutcome::Registered {
+                                generation,
+                                cancel_rx,
+                            } => (generation, cancel_rx),
+                        };
+
                         // Two-Phase Delivery Step 1: Immediately reply with SignAck (<1.5s)
                         if tx.send(ClientStreamMessage {
                             payload: Some(ClientPayload::SignAck(SignAck {
                                 request_id: req_id.clone(),
                             })),
                         }).await.is_err() {
+                            active_requests
+                                .lock()
+                                .await
+                                .complete_request(&req_id, generation);
                             anyhow::bail!("outbound stream closed while sending SignAck");
                         }
 
                         // Spawn async task to verify end-to-end signature, evaluate policy/prompt, and sign
-                        let tx_clone = tx.clone();
                         let cfg_clone = cfg.clone();
                         let agent_clone = Arc::clone(local_agent);
                         let policy_clone = Arc::clone(policy);
                         let prompter_clone = Arc::clone(prompter);
-                        let cancels_clone = Arc::clone(cancellations);
+                        let active_clone = Arc::clone(active_requests);
 
                         tokio::spawn(async move {
-                            let (cancel_tx, cancel_rx) = watch::channel(None);
-                            cancels_clone.lock().await.insert(req_id.clone(), cancel_tx);
+                            let timeout_active = Arc::clone(&active_clone);
+                            let timeout_req_id = req_id.clone();
+                            let timeout_handle = tokio::spawn(async move {
+                                tokio::time::sleep(PROMPT_SAFETY_TIMEOUT).await;
+                                tracing::info!(
+                                    "Auto-dismissing unanswered SignRequest {} after {:?}",
+                                    timeout_req_id,
+                                    PROMPT_SAFETY_TIMEOUT
+                                );
+                                timeout_active
+                                    .lock()
+                                    .await
+                                    .timeout_request(&timeout_req_id, generation);
+                            });
 
                             let sign_resp = handle_incoming_sign_request(
                                 sign_req,
@@ -480,17 +680,28 @@ async fn run_single_coordinator_stream(
                                 &agent_clone,
                                 &policy_clone,
                                 &prompter_clone,
-                                cancel_rx,
+                                cancel_rx.clone(),
                             )
                             .await;
 
-                            cancels_clone.lock().await.remove(&req_id);
+                            timeout_handle.abort();
 
-                            let _ = tx_clone
-                                .send(ClientStreamMessage {
-                                    payload: Some(ClientPayload::SignResponse(sign_resp)),
-                                })
-                                .await;
+                            let responders = active_clone
+                                .lock()
+                                .await
+                                .complete_request(&req_id, generation);
+
+                            if cancel_rx.borrow().is_none() {
+                                for resp_tx in responders {
+                                    let _ = resp_tx
+                                        .send(ClientStreamMessage {
+                                            payload: Some(ClientPayload::SignResponse(
+                                                sign_resp.clone(),
+                                            )),
+                                        })
+                                        .await;
+                                }
+                            }
                         });
                     }
                     Some(ServerPayload::ZellijHostList(list)) => {
@@ -640,5 +851,76 @@ pub async fn handle_incoming_sign_request(
                 handled_by_node_id,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_active_sign_requests_dedup_escalation_and_cancel() {
+        let mut active = ActiveSignRequests::default();
+        let (tx1, _rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+
+        let (gen1, mut cancel_rx) = match active.register_or_attach("req-1", 10, tx1) {
+            RegisterRequestOutcome::Registered {
+                generation,
+                cancel_rx,
+            } => (generation, cancel_rx),
+            _ => panic!("expected initial registration"),
+        };
+
+        // Re-delivery (broadcast escalation or second coordinator) attaches without dropping cancel_tx
+        assert!(matches!(
+            active.register_or_attach("req-1", 20, tx2),
+            RegisterRequestOutcome::AttachedExisting
+        ));
+        assert!(cancel_rx.borrow().is_none());
+
+        // Canceling after approval on another client immediately notifies the open prompt
+        active.cancel_request("req-1", "Handled by another workstation".to_string());
+        cancel_rx.changed().await.unwrap();
+        assert_eq!(
+            cancel_rx.borrow().as_deref(),
+            Some("Handled by another workstation")
+        );
+        assert!(active.complete_request("req-1", gen1).is_empty());
+
+        // Late SignRequest arriving after CancelSignRequest is suppressed
+        let (tx3, _rx3) = mpsc::channel(4);
+        assert!(matches!(
+            active.register_or_attach("req-1", 30, tx3),
+            RegisterRequestOutcome::AlreadyCanceled
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_active_sign_requests_stream_disconnect_cancels_only_when_orphaned() {
+        let mut active = ActiveSignRequests::default();
+        let (tx1, _rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+
+        let mut cancel_rx = match active.register_or_attach("req-2", 1, tx1) {
+            RegisterRequestOutcome::Registered { cancel_rx, .. } => cancel_rx,
+            _ => panic!("expected registration"),
+        };
+        assert!(matches!(
+            active.register_or_attach("req-2", 2, tx2),
+            RegisterRequestOutcome::AttachedExisting
+        ));
+
+        // Disconnecting stream 1 leaves stream 2 attached; prompt stays open
+        active.detach_stream(1);
+        assert!(cancel_rx.borrow().is_none());
+
+        // Disconnecting stream 2 orphans the request; prompt is automatically canceled
+        active.detach_stream(2);
+        cancel_rx.changed().await.unwrap();
+        assert_eq!(
+            cancel_rx.borrow().as_deref(),
+            Some("Coordinator stream disconnected")
+        );
     }
 }
