@@ -128,11 +128,23 @@ pub fn extract_verified_host(req: &SignRequest) -> String {
 }
 
 pub fn extract_target_ssh_user(req: &SignRequest) -> String {
-    req.ssh_auth_context
-        .as_ref()
-        .filter(|sc| sc.is_userauth_request)
-        .map(|sc| sc.target_username.clone())
-        .unwrap_or_default()
+    let parsed = req
+        .ssh_auth_context
+        .clone()
+        .unwrap_or_else(|| sockcast_proto::ssh::parse_ssh_auth_context(&req.data));
+    if parsed.is_userauth_request {
+        parsed.target_username
+    } else {
+        String::new()
+    }
+}
+
+fn base_tool_name(comm: &str) -> &str {
+    comm.trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(comm)
+        .trim_start_matches('-')
 }
 
 /// Identifies the primary invoking tool binary.
@@ -143,21 +155,22 @@ pub fn extract_primary_tool_binary(req: &SignRequest) -> String {
     let Some(pc) = &req.process_context else {
         return "unknown".to_string();
     };
-    if pc.comm == "ssh" {
+    let leaf = base_tool_name(&pc.comm);
+    if leaf == "ssh" {
         if let Some(parent) = pc.ancestors.first() {
-            let pcomm = parent.comm.as_str();
+            let pcomm = base_tool_name(&parent.comm);
             if matches!(
                 pcomm,
                 "scp" | "rsync" | "git" | "git-remote-ext" | "sftp" | "borg" | "restic" | "ansible-playbook"
             ) {
-                return parent.comm.clone();
+                return pcomm.to_string();
             }
         }
     }
-    if pc.comm.is_empty() {
+    if leaf.is_empty() {
         "unknown".to_string()
     } else {
-        pc.comm.clone()
+        leaf.to_string()
     }
 }
 
@@ -167,16 +180,17 @@ pub fn extract_primary_command(req: &SignRequest) -> String {
         return String::new();
     };
     let tool = extract_primary_tool_binary(req);
-    if tool != pc.comm {
+    let leaf = base_tool_name(&pc.comm);
+    if tool != leaf {
         if let Some(parent) = pc.ancestors.first() {
-            if !parent.cmdline.is_empty() {
-                return parent.cmdline.clone();
+            if !parent.cmdline.trim().is_empty() {
+                return parent.cmdline.trim().to_string();
             }
         }
     }
-    if !pc.cmdline.is_empty() {
-        pc.cmdline.clone()
+    if !pc.cmdline.trim().is_empty() {
+        pc.cmdline.trim().to_string()
     } else {
-        pc.comm.clone()
+        pc.comm.trim().to_string()
     }
 }

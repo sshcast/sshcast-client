@@ -1,15 +1,22 @@
 use serde::{Deserialize, Serialize};
 use sockcast_proto::ssh::{extract_key_type, fingerprint_sha256};
 use sockcast_proto::v1::{PublicKey, SignRequest};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::process::Command;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::watch;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::policy::ApprovalDecision;
 use crate::policy::{
     extract_primary_command, extract_primary_tool_binary, extract_target_ssh_user,
-    extract_verified_host, ApprovalDecision,
+    extract_verified_host,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,16 +80,31 @@ impl PromptDetails {
     }
 }
 
-/// Pluggable approval prompter trait so unit/integration tests and different desktop/TUI frontends
-/// can handle interactive `SignRequest` prompts and cancellation cleanly.
-#[tonic::async_trait]
-pub trait ApprovalPrompter: Send + Sync {
-    async fn prompt_user(
-        &self,
-        details: PromptDetails,
-        cancel_rx: watch::Receiver<Option<String>>,
-    ) -> ApprovalDecision;
+pub fn format_prompt_summary_lines(details: &PromptDetails) -> Vec<String> {
+    vec![
+        format!("Verified Source Host: {}", details.verified_host),
+        format!("Target SSH User:      {}", details.target_ssh_user),
+        format!("Primary Tool & Cmd:   {}", details.primary_command),
+        format!("Process Ancestry:     {}", details.ancestry_chain),
+        format!("Working Directory:    {}", details.cwd),
+        format!("SSH Key:              {}", details.key_summary),
+    ]
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+mod native_prompter {
+    use super::*;
+
+    /// Pluggable approval prompter trait so unit/integration tests and different desktop/TUI frontends
+    /// can handle interactive `SignRequest` prompts and cancellation cleanly.
+    #[tonic::async_trait]
+    pub trait ApprovalPrompter: Send + Sync {
+        async fn prompt_user(
+            &self,
+            details: PromptDetails,
+            cancel_rx: watch::Receiver<Option<String>>,
+        ) -> ApprovalDecision;
+    }
 
 /// Static prompter used for automated `--auto-approve` or `--auto-deny` modes and integration tests.
 pub struct StaticPrompter {
@@ -495,14 +517,7 @@ async fn prompt_terminal_interactive(
         }
     }
 }
-
-pub fn format_prompt_summary_lines(details: &PromptDetails) -> Vec<String> {
-    vec![
-        format!("Verified Source Host: {}", details.verified_host),
-        format!("Target SSH User:      {}", details.target_ssh_user),
-        format!("Primary Tool & Cmd:   {}", details.primary_command),
-        format!("Process Ancestry:     {}", details.ancestry_chain),
-        format!("Working Directory:    {}", details.cwd),
-        format!("SSH Key:              {}", details.key_summary),
-    ]
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_prompter::{ApprovalPrompter, InteractivePrompter, StaticPrompter};
