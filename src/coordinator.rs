@@ -443,6 +443,16 @@ async fn run_single_coordinator_stream(
                     Some(ServerPayload::SignRequest(sign_req)) => {
                         let req_id = sign_req.request_id.clone();
 
+                        if let Ok(local_keys) = local_agent.list_filtered_keys().await {
+                            if !local_keys.iter().any(|k| k.key_blob == sign_req.key_blob) {
+                                tracing::info!(
+                                    "Ignoring SignRequest {} because requested key is not loaded on this workstation",
+                                    req_id
+                                );
+                                continue;
+                            }
+                        }
+
                         // Two-Phase Delivery Step 1: Immediately reply with SignAck (<1.5s)
                         if tx.send(ClientStreamMessage {
                             payload: Some(ClientPayload::SignAck(SignAck {
