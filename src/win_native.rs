@@ -141,7 +141,7 @@ pub async fn prompt_task_dialog(
     let state_for_dialog = Arc::clone(&state);
 
     let join_res = tokio::task::spawn_blocking(move || unsafe {
-        let window_title = to_wide("Sockcast SSH Agent Approval");
+        let window_title = to_wide("Sshcast SSH Agent Approval");
         let main_instruction = to_wide(&format!(
             "SSH Agent Signature Request from {}",
             details_cloned.verified_host
@@ -349,7 +349,7 @@ pub fn get_tray_context() -> Option<Arc<TraySharedContext>> {
 }
 
 /// Reloads `client.toml` from disk, updates the tray icon tooltip, and notifies the background
-/// Tokio runtime in `sockcast-tray.exe` to reconnect to all configured coordinator backends.
+/// Tokio runtime in `sshcast-tray.exe` to reconnect to all configured coordinator backends.
 pub fn reload_tray_configuration() {
     let Some(ctx) = get_tray_context() else {
         return;
@@ -393,8 +393,8 @@ unsafe fn add_or_update_tray_icon(hwnd: HWND, ctx: &TraySharedContext, modify: b
     nid.hIcon = ctx.hicon_raw as HICON;
 
     let tip = match ctx.current_config() {
-        Some(cfg) => format!("Sockcast — {} ({})", cfg.grant.node_id, cfg.grant.user_id),
-        None => "Sockcast — Not Enrolled (Click to Setup)".to_string(),
+        Some(cfg) => format!("Sshcast — {} ({})", cfg.grant.node_id, cfg.grant.user_id),
+        None => "Sshcast — Not Enrolled (Click to Setup)".to_string(),
     };
     let tip_wide = to_wide(&tip);
     let copy_len = tip_wide.len().min(nid.szTip.len() - 1);
@@ -463,7 +463,7 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
         };
 
         unsafe {
-            let title_w = to_wide("Sockcast Workstation Status");
+            let title_w = to_wide("Sshcast Workstation Status");
             let instr_w = to_wide(&format!(
                 "Workstation '{}' ({}/{total} coordinators connected)",
                 cfg.grant.node_id, connected
@@ -536,8 +536,8 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     let force_active = ctx.force_active_flag.load(Ordering::Relaxed);
 
     let header_str = match &maybe_cfg {
-        Some(cfg) => format!("Sockcast: {} ({})", cfg.grant.node_id, cfg.grant.user_id),
-        None => "Sockcast: Workstation Not Enrolled".to_string(),
+        Some(cfg) => format!("Sshcast: {} ({})", cfg.grant.node_id, cfg.grant.user_id),
+        None => "Sshcast: Workstation Not Enrolled".to_string(),
     };
     let conn_str = match &maybe_cfg {
         Some(cfg) => format!("Coordinators: {connected}/{} connected", cfg.servers.len()),
@@ -554,7 +554,7 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     let enroll_label = to_wide("Initialize / Enroll Workstation...");
     let force_label = to_wide("Force Active Workstation");
     let open_cfg_label = to_wide("Open Config Folder");
-    let quit_label = to_wide("Quit Sockcast");
+    let quit_label = to_wide("Quit Sshcast");
 
     AppendMenuW(hmenu, MF_STRING | MF_GRAYED, 0, header_label.as_ptr());
     AppendMenuW(hmenu, MF_STRING | MF_GRAYED, 0, conn_label.as_ptr());
@@ -758,8 +758,8 @@ pub fn run_windows_tray_loop(
 ) -> anyhow::Result<()> {
     unsafe {
         let hinstance = GetModuleHandleW(null());
-        let class_name = to_wide("SockcastTrayHiddenWindowClass");
-        let window_name = to_wide("Sockcast System Tray");
+        let class_name = to_wide("SshcastTrayHiddenWindowClass");
+        let window_name = to_wide("Sshcast System Tray");
         let taskbar_created_name = to_wide("TaskbarCreated");
         let taskbar_created_msg = RegisterWindowMessageW(taskbar_created_name.as_ptr());
         let hicon = load_tray_icon();

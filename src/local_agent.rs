@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use sockcast_proto::ssh::{parse_public_key_blob, LoadedSshKey, SshKeyError};
-use sockcast_proto::v1::PublicKey;
+use sshcast_proto::ssh::{parse_public_key_blob, LoadedSshKey, SshKeyError};
+use sshcast_proto::v1::PublicKey;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -210,7 +210,7 @@ impl LocalAgentConnector {
         Ok(self.add_loaded_key_with_source(key, path.display().to_string()))
     }
 
-    /// Loads an OpenSSH private key file from disk, checking `SOCKCAST_SSH_PASSPHRASE` or prompting
+    /// Loads an OpenSSH private key file from disk, checking `SSHCAST_SSH_PASSPHRASE` or prompting
     /// interactively on the terminal if the key is passphrase-protected.
     pub fn load_private_key_file_interactive(
         &self,
@@ -243,12 +243,12 @@ impl LocalAgentConnector {
         match LoadedSshKey::parse_openssh_pem(pem, None) {
             Ok(key) => Ok(self.add_loaded_key_with_source(key, source)),
             Err(SshKeyError::PassphraseRequired) => {
-                if let Ok(env_pass) = std::env::var("SOCKCAST_SSH_PASSPHRASE") {
+                if let Ok(env_pass) = std::env::var("SSHCAST_SSH_PASSPHRASE") {
                     if !env_pass.is_empty() {
                         let key = LoadedSshKey::parse_openssh_pem(pem, Some(&env_pass))
                             .with_context(|| {
                                 format!(
-                                    "failed to unlock SSH private key {label} with SOCKCAST_SSH_PASSPHRASE"
+                                    "failed to unlock SSH private key {label} with SSHCAST_SSH_PASSPHRASE"
                                 )
                             })?;
                         return Ok(self.add_loaded_key_with_source(key, source));
@@ -256,7 +256,7 @@ impl LocalAgentConnector {
                 }
                 if !allow_prompt {
                     anyhow::bail!(
-                        "SSH private key {label} is encrypted; set SOCKCAST_SSH_PASSPHRASE or unlock interactively"
+                        "SSH private key {label} is encrypted; set SSHCAST_SSH_PASSPHRASE or unlock interactively"
                     );
                 }
                 let pass = prompt_key_passphrase(label)?;

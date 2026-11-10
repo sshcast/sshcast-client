@@ -1,4 +1,4 @@
-use sockcast_proto::v1::SignRequest;
+use sshcast_proto::v1::SignRequest;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ struct SessionRule {
     expires_at: Instant,
 }
 
-/// Thread-safe 15-minute session trust rule engine for `sockcast-client`.
+/// Thread-safe 15-minute session trust rule engine for `sshcast-client`.
 pub struct PolicyEngine {
     ttl: Duration,
     rules: Mutex<Vec<SessionRule>>,
@@ -131,7 +131,7 @@ pub fn extract_target_ssh_user(req: &SignRequest) -> String {
     let parsed = req
         .ssh_auth_context
         .clone()
-        .unwrap_or_else(|| sockcast_proto::ssh::parse_ssh_auth_context(&req.data));
+        .unwrap_or_else(|| sshcast_proto::ssh::parse_ssh_auth_context(&req.data));
     if parsed.is_userauth_request {
         parsed.target_username
     } else {

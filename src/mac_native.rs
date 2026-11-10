@@ -104,7 +104,7 @@ struct StatusBarWidgets {
     backends_action_item: Retained<NSMenuItem>,
     bundle_action_item: Retained<NSMenuItem>,
     force_active_item: Retained<NSMenuItem>,
-    _menu_target: Retained<SockcastMenuTarget>,
+    _menu_target: Retained<SshcastMenuTarget>,
 }
 
 fn refresh_status_bar_widgets(mtm: MainThreadMarker) {
@@ -119,12 +119,12 @@ fn refresh_status_bar_widgets(mtm: MainThreadMarker) {
     let has_root_key = crate::config::UserKeyFile::load(None).is_ok();
 
     let tip = match &maybe_cfg {
-        Some(cfg) => format!("Sockcast — {} ({})", cfg.grant.node_id, cfg.grant.user_id),
-        None => "Sockcast — Not Enrolled (Click to Setup)".to_string(),
+        Some(cfg) => format!("Sshcast — {} ({})", cfg.grant.node_id, cfg.grant.user_id),
+        None => "Sshcast — Not Enrolled (Click to Setup)".to_string(),
     };
     let header_str = match &maybe_cfg {
-        Some(cfg) => format!("Sockcast: {} ({})", cfg.grant.node_id, cfg.grant.user_id),
-        None => "Sockcast: Workstation Not Enrolled".to_string(),
+        Some(cfg) => format!("Sshcast: {} ({})", cfg.grant.node_id, cfg.grant.user_id),
+        None => "Sshcast: Workstation Not Enrolled".to_string(),
     };
     let conn_str = match &maybe_cfg {
         Some(cfg) => format!("Coordinators: {connected}/{} connected", cfg.servers.len()),
@@ -153,7 +153,7 @@ fn refresh_status_bar_widgets(mtm: MainThreadMarker) {
 }
 
 /// Reloads `client.toml` from disk, updates the status bar tooltip/menu, and notifies the
-/// background Tokio runtime in `sockcast-tray` to reconnect to all configured coordinator backends.
+/// background Tokio runtime in `sshcast-tray` to reconnect to all configured coordinator backends.
 pub fn reload_tray_configuration() {
     let Some(ctx) = get_tray_context() else {
         return;
@@ -230,7 +230,7 @@ fn create_shield_icon(description: &str) -> Option<Retained<NSImage>> {
 fn build_approval_alert(mtm: MainThreadMarker, details: &PromptDetails) -> Retained<NSAlert> {
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(NSAlertStyle::Informational);
-    if let Some(icon) = create_shield_icon("Sockcast SSH Agent Approval") {
+    if let Some(icon) = create_shield_icon("Sshcast SSH Agent Approval") {
         unsafe {
             alert.setIcon(Some(&icon));
         }
@@ -332,7 +332,7 @@ fn map_modal_response(resp: isize) -> ApprovalDecision {
 }
 
 /// Runs the native macOS `NSAlert` approval dialog in a standalone helper process
-/// (`sockcast-client internal-gui-prompt --payload-json <json>`).
+/// (`sshcast-client internal-gui-prompt --payload-json <json>`).
 pub fn run_macos_modal_process(details: PromptDetails) -> ApprovalDecision {
     let Some(mtm) = MainThreadMarker::new() else {
         return ApprovalDecision::Deny;
@@ -495,7 +495,7 @@ pub fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
 
             let alert = NSAlert::new(mtm);
             alert.setAlertStyle(NSAlertStyle::Informational);
-            if let Some(icon) = create_shield_icon("Sockcast Workstation Status") {
+            if let Some(icon) = create_shield_icon("Sshcast Workstation Status") {
                 unsafe {
                     alert.setIcon(Some(&icon));
                 }
@@ -516,20 +516,20 @@ struct MenuTargetIvars {}
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "SockcastMenuTarget"]
+    #[name = "SshcastMenuTarget"]
     #[ivars = MenuTargetIvars]
-    struct SockcastMenuTarget;
+    struct SshcastMenuTarget;
 
-    unsafe impl NSObjectProtocol for SockcastMenuTarget {}
+    unsafe impl NSObjectProtocol for SshcastMenuTarget {}
 
-    unsafe impl NSMenuDelegate for SockcastMenuTarget {
+    unsafe impl NSMenuDelegate for SshcastMenuTarget {
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
             refresh_status_bar_widgets(self.mtm());
         }
     }
 
-    impl SockcastMenuTarget {
+    impl SshcastMenuTarget {
         #[unsafe(method(onZellijDashboard:))]
         fn on_zellij_dashboard(&self, _sender: Option<&AnyObject>) {
             let port = get_tray_context()
@@ -595,7 +595,7 @@ define_class!(
     }
 );
 
-impl SockcastMenuTarget {
+impl SshcastMenuTarget {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = mtm.alloc::<Self>().set_ivars(MenuTargetIvars::default());
         unsafe { msg_send![super(this), init] }
@@ -673,7 +673,7 @@ pub fn run_macos_tray_loop(
     let status_bar = NSStatusBar::systemStatusBar();
     let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
     if let Some(button) = status_item.button(mtm) {
-        if let Some(img) = create_shield_icon("Sockcast") {
+        if let Some(img) = create_shield_icon("Sshcast") {
             img.setTemplate(true);
             button.setImage(Some(&img));
         } else {
@@ -681,7 +681,7 @@ pub fn run_macos_tray_loop(
         }
     }
 
-    let menu_target = SockcastMenuTarget::new(mtm);
+    let menu_target = SshcastMenuTarget::new(mtm);
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);
     let delegate_proto = ProtocolObject::from_ref(&*menu_target);
@@ -692,7 +692,7 @@ pub fn run_macos_tray_loop(
     let header_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc(),
-            &NSString::from_str("Sockcast"),
+            &NSString::from_str("Sshcast"),
             None,
             &empty_key,
         )
@@ -756,7 +756,7 @@ pub fn run_macos_tray_loop(
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    let _quit_item = make_action_item("Quit Sockcast", sel!(onQuit:), "q");
+    let _quit_item = make_action_item("Quit Sshcast", sel!(onQuit:), "q");
 
     status_item.setMenu(Some(&menu));
 

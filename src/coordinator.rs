@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use sockcast_proto::crypto::{create_node_auth, verify_sign_request};
-use sockcast_proto::v1::client_stream_message::Payload as ClientPayload;
-use sockcast_proto::v1::server_stream_message::Payload as ServerPayload;
-use sockcast_proto::v1::sockcast_service_client::SockcastServiceClient;
-use sockcast_proto::v1::{
+use sshcast_proto::crypto::{create_node_auth, verify_sign_request};
+use sshcast_proto::v1::client_stream_message::Payload as ClientPayload;
+use sshcast_proto::v1::server_stream_message::Payload as ServerPayload;
+use sshcast_proto::v1::sshcast_service_client::SshcastServiceClient;
+use sshcast_proto::v1::{
     ClientStreamMessage, SignAck, SignRequest, SignResponse, WorkstationStatus,
 };
 use std::collections::HashMap;
@@ -86,7 +86,7 @@ impl WorkstationManager {
     }
 
     /// Maintains persistent bidirectional `ConnectWorkstation` gRPC streams to all configured
-    /// `sockcast-server` instances concurrently until `shutdown_rx` signals true.
+    /// `sshcast-server` instances concurrently until `shutdown_rx` signals true.
     pub async fn run(&self, shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut handles = Vec::with_capacity(self.cfg.servers.len() + 1);
         if self.cfg.zellij_listen_port > 0 {
@@ -217,7 +217,7 @@ async fn run_single_coordinator_stream(
         .keep_alive_timeout(Duration::from_secs(10));
 
     let channel = endpoint.connect().await?;
-    let mut client = SockcastServiceClient::new(channel);
+    let mut client = SshcastServiceClient::new(channel);
 
     let (tx, rx) = mpsc::channel::<ClientStreamMessage>(1024);
     let sender_reg_id = zellij_hub.register_coordinator_sender(tx.clone()).await;

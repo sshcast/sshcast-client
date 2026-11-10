@@ -5,7 +5,7 @@ use crate::policy::ApprovalDecision;
 use crate::prompt::PromptDetails;
 
 /// Runs a native approval modal window in a fresh child process
-/// (invoked via `sockcast-client internal-gui-prompt --payload-json <json>`),
+/// (invoked via `sshcast-client internal-gui-prompt --payload-json <json>`),
 /// printing the chosen `ApprovalDecision` token (`ONCE`, `TOOL_15M`, `HOST_15M`, `DENY`) to stdout.
 #[cfg(target_os = "macos")]
 pub fn run_egui_modal_process(details: PromptDetails) -> anyhow::Result<ApprovalDecision> {
@@ -21,7 +21,7 @@ pub fn run_egui_modal_process(details: PromptDetails) -> anyhow::Result<Approval
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Sockcast — Roaming SSH Agent Approval")
+            .with_title("Sshcast — Roaming SSH Agent Approval")
             .with_inner_size([620.0, 370.0])
             .with_min_inner_size([520.0, 320.0])
             .with_always_on_top()
@@ -35,7 +35,7 @@ pub fn run_egui_modal_process(details: PromptDetails) -> anyhow::Result<Approval
     };
 
     eframe::run_native(
-        "Sockcast — SSH Agent Approval",
+        "Sshcast — SSH Agent Approval",
         options,
         Box::new(|_cc| Ok(Box::new(app))),
     )
@@ -80,7 +80,7 @@ impl eframe::App for ApprovalModalApp {
             ui.add_space(10.0);
 
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                egui::Grid::new("sockcast_approval_grid")
+                egui::Grid::new("sshcast_approval_grid")
                     .num_columns(2)
                     .spacing([14.0, 8.0])
                     .striped(true)

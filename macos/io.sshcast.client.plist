@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.sockcast.client</string>
+    <string>io.sshcast.client</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/sockcast-tray</string>
+        <string>/usr/local/bin/sshcast-tray</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -15,8 +15,8 @@
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>/tmp/sockcast-client.out.log</string>
+    <string>/tmp/sshcast-client.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/sockcast-client.err.log</string>
+    <string>/tmp/sshcast-client.err.log</string>
 </dict>
 </plist>

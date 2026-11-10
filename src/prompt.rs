@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use sockcast_proto::ssh::{extract_key_type, fingerprint_sha256};
-use sockcast_proto::v1::{PublicKey, SignRequest};
+use sshcast_proto::ssh::{extract_key_type, fingerprint_sha256};
+use sshcast_proto::v1::{PublicKey, SignRequest};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
 #[cfg(not(target_arch = "wasm32"))]
@@ -170,7 +170,7 @@ impl ApprovalPrompter for InteractivePrompter {
                     "critical",
                     "-t",
                     "10000",
-                    "Sockcast SSH Signature Request",
+                    "Sshcast SSH Signature Request",
                     &format!(
                         "Host: {}\nTarget User: {}\nCommand: {}",
                         details.verified_host, details.target_ssh_user, details.primary_command
@@ -182,7 +182,7 @@ impl ApprovalPrompter for InteractivePrompter {
         #[cfg(target_os = "macos")]
         {
             let notif_script = format!(
-                "display notification \"Host: {} | User: {} | Cmd: {}\" with title \"Sockcast SSH Signature Request\"",
+                "display notification \"Host: {} | User: {} | Cmd: {}\" with title \"Sshcast SSH Signature Request\"",
                 details.verified_host.replace('"', "'"),
                 details.target_ssh_user.replace('"', "'"),
                 details.primary_command.replace('"', "'")
@@ -213,7 +213,7 @@ async fn try_native_gui_dialog(
         }
     }
 
-    // On macOS, prefer the in-process native AppKit NSAlert modal when sockcast-tray's NSApplication loop is running
+    // On macOS, prefer the in-process native AppKit NSAlert modal when sshcast-tray's NSApplication loop is running
     #[cfg(target_os = "macos")]
     {
         if let Some(decision) = crate::mac_native::prompt_macos_dialog(details, cancel_rx).await {
@@ -279,7 +279,7 @@ async fn try_native_gui_dialog(
     {
         let script = format!(
             "choose from list {{\"1. Approve Once\", \"2. Approve '{}' on '{}' for 15m\", \"3. Approve all on '{}' for 15m\", \"4. Deny\"}} \
-             with title \"Sockcast SSH Agent Approval\" \
+             with title \"Sshcast SSH Agent Approval\" \
              with prompt \"Verified Host: {}\\nTarget SSH User: {}\\nCommand: {}\\nAncestry: {}\\nDirectory: {}\\nKey: {}\" \
              default items {{\"1. Approve Once\"}}",
             details.primary_tool.replace('"', "'"),
@@ -360,7 +360,7 @@ async fn try_native_gui_dialog(
         let mut child = Command::new("zenity")
             .args([
                 "--list",
-                "--title=Sockcast SSH Agent Approval",
+                "--title=Sshcast SSH Agent Approval",
                 "--width=680",
                 "--height=380",
                 &format!("--text={text}"),
@@ -420,7 +420,7 @@ async fn try_native_gui_dialog(
         let ps_script = format!(
             "Add-Type -AssemblyName System.Windows.Forms; \
              $msg = '{}' -replace '\\\\n', \"`r`n\"; \
-             $res = [System.Windows.Forms.MessageBox]::Show($msg, 'Sockcast SSH Agent Approval', 'YesNoCancel', 'Warning'); \
+             $res = [System.Windows.Forms.MessageBox]::Show($msg, 'Sshcast SSH Agent Approval', 'YesNoCancel', 'Warning'); \
              Write-Output $res",
             body
         );
@@ -475,7 +475,7 @@ async fn prompt_terminal_interactive(
     cancel_rx: &mut watch::Receiver<Option<String>>,
 ) -> ApprovalDecision {
     eprintln!("\n+=========================================================================+");
-    eprintln!("|                 SOCKCAST SSH AGENT SIGNATURE REQUEST                    |");
+    eprintln!("|                 SSHCAST SSH AGENT SIGNATURE REQUEST                    |");
     eprintln!("+=========================================================================+");
     eprintln!("  Verified Source Host : {}", details.verified_host);
     eprintln!("  Target SSH User      : {}", details.target_ssh_user);

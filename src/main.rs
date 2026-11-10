@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sockcast_client::config::{expand_tilde_path, ClientConfig, ClientConfigFile};
-use sockcast_client::coordinator::WorkstationManager;
-use sockcast_client::enroll::{
+use sshcast_client::config::{expand_tilde_path, ClientConfig, ClientConfigFile};
+use sshcast_client::coordinator::WorkstationManager;
+use sshcast_client::enroll::{
     decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
     import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
     write_client_config_and_optional_root_key, write_client_config_from_bundle,
 };
-use sockcast_client::gui::run_egui_modal_process;
-use sockcast_client::local_agent::LocalAgentConnector;
-use sockcast_client::policy::{ApprovalDecision, PolicyEngine};
-use sockcast_client::prompt::{ApprovalPrompter, InteractivePrompter, PromptDetails, StaticPrompter};
-use sockcast_proto::v1::NodeRole;
+use sshcast_client::gui::run_egui_modal_process;
+use sshcast_client::local_agent::LocalAgentConnector;
+use sshcast_client::policy::{ApprovalDecision, PolicyEngine};
+use sshcast_client::prompt::{ApprovalPrompter, InteractivePrompter, PromptDetails, StaticPrompter};
+use sshcast_proto::v1::NodeRole;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -19,9 +19,9 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "sockcast-client",
+    name = "sshcast-client",
     version,
-    about = "Sockcast Roaming SSH Agent Workstation Client & Enrollment CLI"
+    about = "Sshcast Roaming SSH Agent Workstation Client & Enrollment CLI"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -32,7 +32,7 @@ struct Cli {
 enum Commands {
     /// Generate a new User Root Ed25519 keypair (`user_key.toml`)
     Keygen {
-        /// Optional path for `user_key.toml` (defaults to `~/.config/sockcast/user_key.toml`)
+        /// Optional path for `user_key.toml` (defaults to `~/.config/sshcast/user_key.toml`)
         #[arg(long)]
         key_file: Option<PathBuf>,
 
@@ -64,7 +64,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Mint a signed `NodeGrant` (`NODE_ROLE_RELAY`) and output an `sc1_<base64>` bundle for `sockcast-relay init`
+    /// Mint a signed `NodeGrant` (`NODE_ROLE_RELAY`) and output an `sc1_<base64>` bundle for `sshcast-relay init`
     GrantRelay {
         /// Target relay hostname (must match `/proc` hostname on the target server, e.g. `server-x.infra.local`)
         #[arg(long)]
@@ -100,7 +100,7 @@ enum Commands {
         #[arg(long)]
         key_file: Option<PathBuf>,
 
-        /// Optional path to write `client.toml` (defaults to `~/.config/sockcast/client.toml`)
+        /// Optional path to write `client.toml` (defaults to `~/.config/sshcast/client.toml`)
         #[arg(long)]
         config: Option<PathBuf>,
 
@@ -122,7 +122,7 @@ enum Commands {
         #[arg(long)]
         bundle: String,
 
-        /// Optional path to write `client.toml` (defaults to `~/.config/sockcast/client.toml`)
+        /// Optional path to write `client.toml` (defaults to `~/.config/sshcast/client.toml`)
         #[arg(long)]
         config: Option<PathBuf>,
 
@@ -144,7 +144,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         inline: bool,
 
-        /// Optional path to `client.toml` (defaults to `~/.config/sockcast/client.toml`)
+        /// Optional path to `client.toml` (defaults to `~/.config/sshcast/client.toml`)
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -168,7 +168,7 @@ enum Commands {
     },
     /// Run the workstation client daemon (connects to all coordinators, sends 25s heartbeats, prompts & bridges to built-in/OS SSH agent)
     Run {
-        /// Optional path to `client.toml` (defaults to `~/.config/sockcast/client.toml`)
+        /// Optional path to `client.toml` (defaults to `~/.config/sshcast/client.toml`)
         #[arg(long)]
         config: Option<PathBuf>,
 
@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
             println!("  User ID:           {}", out.user_id);
             println!("  Server Allowlist:  {}", out.user_pubkey_token);
             println!(
-                "\nAdd the following to `/etc/sockcast/server.toml` on your coordinator(s):\n  allowed_user_pubkeys = [\"{}\"]",
+                "\nAdd the following to `/etc/sshcast/server.toml` on your coordinator(s):\n  allowed_user_pubkeys = [\"{}\"]",
                 out.user_pubkey_token
             );
             Ok(())
@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
             println!("Enrollment bundle for relay node '{node}':\n");
             println!("{token}\n");
             println!("Run this on '{node}':");
-            println!("  sockcast-relay init --bundle {token}");
+            println!("  sshcast-relay init --bundle {token}");
             Ok(())
         }
         Commands::GrantClient {
@@ -467,7 +467,7 @@ async fn main() -> Result<()> {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("Shutting down sockcast-client...");
+                tracing::info!("Shutting down sshcast-client...");
                 let _ = shutdown_tx.send(true);
             });
 

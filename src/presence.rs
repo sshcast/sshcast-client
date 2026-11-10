@@ -20,7 +20,7 @@ pub fn now_unix_ms() -> u64 {
 }
 
 /// Returns the estimated timestamp (epoch milliseconds) of the user's most recent keyboard/mouse input
-/// on this workstation. Used by `sockcast-server` to route prompts to the workstation currently in use.
+/// on this workstation. Used by `sshcast-server` to route prompts to the workstation currently in use.
 pub fn query_last_input_epoch_ms() -> u64 {
     let now = now_unix_ms();
     let idle_ms = query_os_idle_ms().unwrap_or(0);

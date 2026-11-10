@@ -1,12 +1,12 @@
 %global debug_package %{nil}
 %global rustflags_codegen_units 16
 
-Name:           sockcast-client
+Name:           sshcast-client
 Version:        0.1.0
 Release:        1%{?dist}
-Summary:        Workstation GUI and Enrollment CLI for Sockcast Roaming SSH Agent
+Summary:        Workstation GUI and Enrollment CLI for Sshcast Roaming SSH Agent
 License:        MIT OR Apache-2.0
-URL:            https://github.com/theraphim/sockcast-client
+URL:            https://github.com/theraphim/sshcast-client
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
@@ -15,8 +15,8 @@ BuildRequires:  systemd-rpm-macros
 Requires:       systemd
 
 %description
-Sockcast Workstation Client (sockcast-client) maintains persistent outbound
-bidirectional gRPC streams to sockcast-server coordinators, verifies relay
+Sshcast Workstation Client (sshcast-client) maintains persistent outbound
+bidirectional gRPC streams to sshcast-server coordinators, verifies relay
 NodeGrants and end-to-end SignRequest signatures, pops a native egui approval
 window (displaying verified hostname, target SSH user, and 6-level /proc
 ancestry), and bridges approved requests to the local OS SSH agent.
@@ -33,20 +33,20 @@ export CARGO_BUILD_JOBS="${RPM_BUILD_NCPUS:-$(nproc)}"
 cargo test %{?_smp_mflags} --release --locked
 
 %install
-install -D -m 0755 target/release/sockcast-client %{buildroot}%{_bindir}/sockcast-client
-install -D -m 0644 systemd/sockcast-client.service %{buildroot}%{_userunitdir}/sockcast-client.service
+install -D -m 0755 target/release/sshcast-client %{buildroot}%{_bindir}/sshcast-client
+install -D -m 0644 systemd/sshcast-client.service %{buildroot}%{_userunitdir}/sshcast-client.service
 
 %post
-%systemd_user_post sockcast-client.service
+%systemd_user_post sshcast-client.service
 
 %preun
-%systemd_user_preun sockcast-client.service
+%systemd_user_preun sshcast-client.service
 
 %files
 %doc README.md
-%{_bindir}/sockcast-client
-%{_userunitdir}/sockcast-client.service
+%{_bindir}/sshcast-client
+%{_userunitdir}/sshcast-client.service
 
 %changelog
 * Sun Nov 08 2026 Paul Komkoff <i@stingr.net> - 0.1.0-1
-- Initial Fedora RPM package for sockcast-client
+- Initial Fedora RPM package for sshcast-client

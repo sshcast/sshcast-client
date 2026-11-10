@@ -2,11 +2,11 @@
 
 use anyhow::Result;
 use clap::Parser;
-use sockcast_client::config::ClientConfig;
-use sockcast_client::coordinator::WorkstationManager;
-use sockcast_client::local_agent::LocalAgentConnector;
-use sockcast_client::policy::{ApprovalDecision, PolicyEngine};
-use sockcast_client::prompt::{ApprovalPrompter, InteractivePrompter, StaticPrompter};
+use sshcast_client::config::ClientConfig;
+use sshcast_client::coordinator::WorkstationManager;
+use sshcast_client::local_agent::LocalAgentConnector;
+use sshcast_client::policy::{ApprovalDecision, PolicyEngine};
+use sshcast_client::prompt::{ApprovalPrompter, InteractivePrompter, StaticPrompter};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -15,12 +15,12 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "sockcast-tray",
+    name = "sshcast-tray",
     version,
-    about = "Sockcast Roaming SSH Agent System Tray / Menu Bar Application"
+    about = "Sshcast Roaming SSH Agent System Tray / Menu Bar Application"
 )]
 struct TrayArgs {
-    /// Optional path to `client.toml` (defaults to `~/.config/sockcast/client.toml`)
+    /// Optional path to `client.toml` (defaults to `~/.config/sshcast/client.toml`)
     #[arg(long)]
     config: Option<PathBuf>,
 
@@ -99,13 +99,13 @@ fn main() -> Result<()> {
                     }
 
                     #[cfg(target_os = "windows")]
-                    let maybe_ctx_and_cfg = sockcast_client::win_native::get_tray_context()
+                    let maybe_ctx_and_cfg = sshcast_client::win_native::get_tray_context()
                         .and_then(|ctx| {
                             let cfg = ctx.current_config()?;
                             Some((Arc::clone(&ctx.local_agent), cfg))
                         });
                     #[cfg(target_os = "macos")]
-                    let maybe_ctx_and_cfg = sockcast_client::mac_native::get_tray_context()
+                    let maybe_ctx_and_cfg = sshcast_client::mac_native::get_tray_context()
                         .and_then(|ctx| {
                             let cfg = ctx.current_config()?;
                             Some((Arc::clone(&ctx.local_agent), cfg))
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
         });
 
         #[cfg(target_os = "windows")]
-        sockcast_client::win_native::run_windows_tray_loop(
+        sshcast_client::win_native::run_windows_tray_loop(
             args.config,
             args.agent_socket,
             initial_cfg,
@@ -164,7 +164,7 @@ fn main() -> Result<()> {
         )?;
 
         #[cfg(target_os = "macos")]
-        sockcast_client::mac_native::run_macos_tray_loop(
+        sshcast_client::mac_native::run_macos_tray_loop(
             args.config,
             args.agent_socket,
             initial_cfg,
@@ -184,7 +184,7 @@ fn main() -> Result<()> {
         let _ = reload_tx;
         let _ = reload_rx.borrow_and_update();
         let cfg = initial_cfg.ok_or_else(|| {
-            anyhow::anyhow!("failed to load client.toml (run `sockcast-client init` first)")
+            anyhow::anyhow!("failed to load client.toml (run `sshcast-client init` first)")
         })?;
         let local_agent = Arc::new(LocalAgentConnector::from_client_config(&cfg, &[], true)?);
         let policy = Arc::new(PolicyEngine::default());

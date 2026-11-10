@@ -1,31 +1,31 @@
 use ed25519_dalek::SigningKey;
-use sockcast_client::config::{ClientConfig, KeyFilterConfig};
-use sockcast_client::coordinator::{handle_incoming_sign_request, WorkstationManager};
-use sockcast_client::enroll::{
+use sshcast_client::config::{ClientConfig, KeyFilterConfig};
+use sshcast_client::coordinator::{handle_incoming_sign_request, WorkstationManager};
+use sshcast_client::enroll::{
     decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
     import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
     write_client_config_and_optional_root_key, write_client_config_from_bundle,
 };
-use sockcast_client::local_agent::{
+use sshcast_client::local_agent::{
     filter_keys, LocalAgentConnector, SSH2_AGENTC_REQUEST_IDENTITIES, SSH2_AGENTC_SIGN_REQUEST,
     SSH2_AGENT_IDENTITIES_ANSWER, SSH2_AGENT_SIGN_RESPONSE,
 };
-use sockcast_client::policy::{ApprovalDecision, PolicyEngine};
-use sockcast_client::prompt::{ApprovalPrompter, PromptDetails, StaticPrompter};
-use sockcast_client::zellij_proxy::{
+use sshcast_client::policy::{ApprovalDecision, PolicyEngine};
+use sshcast_client::prompt::{ApprovalPrompter, PromptDetails, StaticPrompter};
+use sshcast_client::zellij_proxy::{
     extract_relay_target_from_host_header, parse_http_host_and_path,
     serve_zellij_proxy_with_listener, ZellijProxyHub,
 };
-use sockcast_proto::bundle::EnrollmentBundle;
-use sockcast_proto::crypto::{
+use sshcast_proto::bundle::EnrollmentBundle;
+use sshcast_proto::crypto::{
     sign_node_grant, sign_sign_request, verify_node_auth, verify_zellij_tunnel_frame,
     DEFAULT_MAX_CLOCK_SKEW_MS,
 };
-use sockcast_proto::ssh::parse_public_key_blob;
-use sockcast_proto::v1::client_stream_message::Payload as ClientPayload;
-use sockcast_proto::v1::server_stream_message::Payload as ServerPayload;
-use sockcast_proto::v1::sockcast_service_server::{SockcastService, SockcastServiceServer};
-use sockcast_proto::v1::{
+use sshcast_proto::ssh::parse_public_key_blob;
+use sshcast_proto::v1::client_stream_message::Payload as ClientPayload;
+use sshcast_proto::v1::server_stream_message::Payload as ServerPayload;
+use sshcast_proto::v1::sshcast_service_server::{SshcastService, SshcastServiceServer};
+use sshcast_proto::v1::{
     ClientStreamMessage, GetIdentitiesRequest, GetIdentitiesResponse, NodeGrant, NodeRole,
     ProcessAncestor, ProcessContext, RelayStreamMessage, RelayZellijStatus, ServerStreamMessage,
     ServerToRelayMessage, SignAck, SignRequest, SignResponse, SshAuthContext, WorkstationStatus,
@@ -106,7 +106,7 @@ async fn spawn_mock_local_ssh_agent(tmp: &TempDir) -> String {
 #[cfg(windows)]
 async fn spawn_mock_local_ssh_agent(_tmp: &TempDir) -> String {
     use tokio::net::windows::named_pipe::ServerOptions;
-    let pipe_name = format!(r"\\.\pipe\sockcast-mock-agent-{}", std::process::id());
+    let pipe_name = format!(r"\\.\pipe\sshcast-mock-agent-{}", std::process::id());
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(&pipe_name)
@@ -329,7 +329,7 @@ struct MockCoordinatorStreamServer {
 }
 
 #[tonic::async_trait]
-impl SockcastService for MockCoordinatorStreamServer {
+impl SshcastService for MockCoordinatorStreamServer {
     async fn get_identities(
         &self,
         _request: Request<GetIdentitiesRequest>,
@@ -561,7 +561,7 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
     let addr = tcp_listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(SockcastServiceServer::new(mock_server))
+            .add_service(SshcastServiceServer::new(mock_server))
             .serve_with_incoming(TcpListenerStream::new(tcp_listener))
             .await;
     });
@@ -794,11 +794,11 @@ async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
     let r3_str = String::from_utf8_lossy(&r3);
     assert!(r3_str.ends_with("ZELLIJ_WEB_OK!"));
 
-    // 4. GET /__sockcast/SymbolsNerdFontMono-Regular.ttf -> served locally by sockcast-client
+    // 4. GET /__sshcast/SymbolsNerdFontMono-Regular.ttf -> served locally by sshcast-client
     let mut s4 = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
     s4.write_all(
         format!(
-            "GET /__sockcast/SymbolsNerdFontMono-Regular.ttf HTTP/1.1\r\nHost: sunduk.localhost:{}\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+            "GET /__sshcast/SymbolsNerdFontMono-Regular.ttf HTTP/1.1\r\nHost: sunduk.localhost:{}\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
             proxy_addr.port()
         )
         .as_bytes(),
@@ -819,7 +819,7 @@ async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_builtin_ssh_agent_keys_without_os_agent() {
-    use sockcast_proto::ssh::LoadedSshKey;
+    use sshcast_proto::ssh::LoadedSshKey;
 
     let tmp = TempDir::new().unwrap();
     let key_file_path = tmp.path().join("id_ed25519_builtin");
@@ -906,7 +906,7 @@ async fn test_builtin_ssh_agent_keys_without_os_agent() {
     let addr = tcp_listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(SockcastServiceServer::new(mock_server))
+            .add_service(SshcastServiceServer::new(mock_server))
             .serve_with_incoming(TcpListenerStream::new(tcp_listener))
             .await;
     });

@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use sockcast_proto::crypto::{sign_zellij_tunnel_frame, verify_zellij_tunnel_frame};
-use sockcast_proto::p2p::{
+use sshcast_proto::crypto::{sign_zellij_tunnel_frame, verify_zellij_tunnel_frame};
+use sshcast_proto::p2p::{
     build_stun_binding_request, derive_p2p_session_keys, parse_stun_binding_response,
     P2pEndpointHandshake, P2pStreamCipher,
 };
-use sockcast_proto::v1::client_stream_message::Payload as ClientPayload;
-use sockcast_proto::v1::{
+use sshcast_proto::v1::client_stream_message::Payload as ClientPayload;
+use sshcast_proto::v1::{
     ClientStreamMessage, NodeRole, RelayZellijStatus, ZellijFrameType, ZellijHostList,
     ZellijTunnelFrame,
 };
@@ -104,47 +104,47 @@ const IOSEVKA_TERM_REGULAR_TTF_GZ: &[u8] =
     include_bytes!("../assets/fonts/IosevkaTerm-Regular.ttf.gz");
 const IOSEVKA_TERM_BOLD_TTF_GZ: &[u8] = include_bytes!("../assets/fonts/IosevkaTerm-Bold.ttf.gz");
 
-const SOCKCAST_FONTS_CSS: &str = r#"@font-face {
+const SSHCAST_FONTS_CSS: &str = r#"@font-face {
   font-family: "Symbols Nerd Font Mono";
-  src: url("/__sockcast/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  src: url("/__sshcast/SymbolsNerdFontMono-Regular.ttf") format("truetype");
   font-weight: 100 900;
   font-style: normal;
   font-display: block;
 }
 @font-face {
   font-family: "Symbols Nerd Font Mono";
-  src: url("/__sockcast/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  src: url("/__sshcast/SymbolsNerdFontMono-Regular.ttf") format("truetype");
   font-weight: 100 900;
   font-style: italic;
   font-display: block;
 }
 @font-face {
   font-family: "Iosevka Term";
-  src: url("/__sockcast/IosevkaTerm-Regular.ttf") format("truetype");
+  src: url("/__sshcast/IosevkaTerm-Regular.ttf") format("truetype");
   font-weight: 400;
   font-style: normal;
   font-display: block;
 }
 @font-face {
   font-family: "Iosevka Term";
-  src: url("/__sockcast/IosevkaTerm-Bold.ttf") format("truetype");
+  src: url("/__sshcast/IosevkaTerm-Bold.ttf") format("truetype");
   font-weight: 700;
   font-style: normal;
   font-display: block;
 }
 "#;
 
-const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
-  const SOCKCAST_DEFAULT_FONT_STACK =
+const SSHCAST_ZELLIJ_JS: &str = r#"(function () {
+  const SSHCAST_DEFAULT_FONT_STACK =
     '"Iosevka Term", "Symbols Nerd Font Mono", "Cascadia Mono", Consolas, "Liberation Mono", Menlo, monospace';
 
-  function withSockcastNerdFonts(rawFont) {
+  function withSshcastNerdFonts(rawFont) {
     if (
       typeof rawFont !== "string" ||
       !rawFont.trim() ||
       rawFont.trim().toLowerCase() === "monospace"
     ) {
-      return SOCKCAST_DEFAULT_FONT_STACK;
+      return SSHCAST_DEFAULT_FONT_STACK;
     }
     const parts = rawFont
       .split(",")
@@ -166,7 +166,7 @@ const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
     ].join(", ");
   }
 
-  function preloadSockcastFonts() {
+  function preloadSshcastFonts() {
     if (!document.fonts || typeof document.fonts.load !== "function") {
       return Promise.resolve();
     }
@@ -180,7 +180,7 @@ const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
     return Promise.race([loads, timeout]);
   }
 
-  const fontPreloadPromise = preloadSockcastFonts();
+  const fontPreloadPromise = preloadSshcastFonts();
 
   if (typeof window.fetch === "function") {
     const origFetch = window.fetch.bind(window);
@@ -203,7 +203,7 @@ const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
           const data = await clone.json();
           if (data && typeof data === "object") {
             data.config = data.config || {};
-            data.config.font = withSockcastNerdFonts(data.config.font);
+            data.config.font = withSshcastNerdFonts(data.config.font);
             return new Response(JSON.stringify(data), {
               status: resp.status,
               statusText: resp.statusText,
@@ -234,13 +234,13 @@ const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
     window.Terminal = new Proxy(OrigTerminal, {
       construct(Target, args, newTarget) {
         const opts = Object.assign({}, args[0] || {});
-        opts.fontFamily = withSockcastNerdFonts(opts.fontFamily);
+        opts.fontFamily = withSshcastNerdFonts(opts.fontFamily);
         const term = Reflect.construct(Target, [opts, ...args.slice(1)], newTarget);
         if (term && term._publicOptions) {
           term._publicOptions = new Proxy(term._publicOptions, {
             set(target, prop, value) {
               if (prop === "fontFamily") {
-                value = withSockcastNerdFonts(value);
+                value = withSshcastNerdFonts(value);
               }
               target[prop] = value;
               return true;
@@ -260,7 +260,7 @@ const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
 
   function installExitModalHook() {
     const origShowError = window.showErrorModal;
-    if (typeof origShowError === "function" && !origShowError.__sockcastWrapped) {
+    if (typeof origShowError === "function" && !origShowError.__sshcastWrapped) {
       const wrapped = async function (title, desc) {
         if (title === "Disconnected") {
           let screenText = "";
@@ -291,7 +291,7 @@ const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
         }
         return origShowError(title, desc);
       };
-      wrapped.__sockcastWrapped = true;
+      wrapped.__sshcastWrapped = true;
       window.showErrorModal = wrapped;
     }
   }
@@ -301,9 +301,9 @@ const SOCKCAST_ZELLIJ_JS: &str = r#"(function () {
 })();
 "#;
 
-/// Serves embedded `/__sockcast/*` static assets (Nerd Font symbols, Iosevka Term fonts, CSS, and JS hooks)
-/// directly from `sockcast-client` on loopback without traversing the network tunnel.
-pub fn try_build_sockcast_asset_http_response(req_buf: &[u8]) -> Option<Vec<u8>> {
+/// Serves embedded `/__sshcast/*` static assets (Nerd Font symbols, Iosevka Term fonts, CSS, and JS hooks)
+/// directly from `sshcast-client` on loopback without traversing the network tunnel.
+pub fn try_build_sshcast_asset_http_response(req_buf: &[u8]) -> Option<Vec<u8>> {
     let header_end = req_buf.windows(4).position(|w| w == b"\r\n\r\n")?;
     let header_str = std::str::from_utf8(&req_buf[..header_end]).ok()?;
     let mut lines = header_str.split("\r\n");
@@ -315,7 +315,7 @@ pub fn try_build_sockcast_asset_http_response(req_buf: &[u8]) -> Option<Vec<u8>>
         return None;
     }
     let clean_path = raw_path.split('?').next().unwrap_or(raw_path);
-    if !clean_path.starts_with("/__sockcast/") {
+    if !clean_path.starts_with("/__sshcast/") {
         return None;
     }
     let is_head = method.eq_ignore_ascii_case("HEAD");
@@ -334,27 +334,27 @@ pub fn try_build_sockcast_asset_http_response(req_buf: &[u8]) -> Option<Vec<u8>>
     }
 
     let (content_type, cache_control, asset_body) = match clean_path {
-        "/__sockcast/sockcast-fonts.css" => (
+        "/__sshcast/sshcast-fonts.css" => (
             "text/css; charset=utf-8",
             "no-cache",
-            AssetBody::Plain(SOCKCAST_FONTS_CSS.as_bytes()),
+            AssetBody::Plain(SSHCAST_FONTS_CSS.as_bytes()),
         ),
-        "/__sockcast/sockcast-zellij.js" => (
+        "/__sshcast/sshcast-zellij.js" => (
             "application/javascript; charset=utf-8",
             "no-cache",
-            AssetBody::Plain(SOCKCAST_ZELLIJ_JS.as_bytes()),
+            AssetBody::Plain(SSHCAST_ZELLIJ_JS.as_bytes()),
         ),
-        "/__sockcast/SymbolsNerdFontMono-Regular.ttf" => (
+        "/__sshcast/SymbolsNerdFontMono-Regular.ttf" => (
             "font/ttf",
             "public, max-age=31536000, immutable",
             AssetBody::GzipFont(SYMBOLS_NERD_FONT_TTF_GZ),
         ),
-        "/__sockcast/IosevkaTerm-Regular.ttf" => (
+        "/__sshcast/IosevkaTerm-Regular.ttf" => (
             "font/ttf",
             "public, max-age=31536000, immutable",
             AssetBody::GzipFont(IOSEVKA_TERM_REGULAR_TTF_GZ),
         ),
-        "/__sockcast/IosevkaTerm-Bold.ttf" => (
+        "/__sshcast/IosevkaTerm-Bold.ttf" => (
             "font/ttf",
             "public, max-age=31536000, immutable",
             AssetBody::GzipFont(IOSEVKA_TERM_BOLD_TTF_GZ),
@@ -781,7 +781,7 @@ impl ZellijProxyHub {
             .await
         {
             self.active_tunnels.lock().await.remove(&tunnel_id);
-            let body = format!("Sockcast coordinator offline: {e}");
+            let body = format!("Sshcast coordinator offline: {e}");
             let resp = format!(
                 "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -834,7 +834,7 @@ impl ZellijProxyHub {
                 closed_by_relay = true;
                 if !received_any_data && !frame.error_message.is_empty() {
                     let body = format!(
-                        "<!doctype html><html><body style=\"font-family:sans-serif;background:#0f172a;color:#f8fafc;padding:2rem;\"><h2>Zellij Web Tunnel Error</h2><p>{}</p><p><a href=\"http://localhost:{}/\" style=\"color:#38bdf8;\">&larr; Back to Sockcast Zellij Dashboard</a></p></body></html>",
+                        "<!doctype html><html><body style=\"font-family:sans-serif;background:#0f172a;color:#f8fafc;padding:2rem;\"><h2>Zellij Web Tunnel Error</h2><p>{}</p><p><a href=\"http://localhost:{}/\" style=\"color:#38bdf8;\">&larr; Back to Sshcast Zellij Dashboard</a></p></body></html>",
                         html_escape(&frame.error_message),
                         self.cfg.zellij_listen_port
                     );
@@ -889,7 +889,7 @@ impl ZellijProxyHub {
                 r#"<div class="empty">
                     <h3>No Zellij-enabled relay hosts currently online</h3>
                     <p>To advertise Zellij sessions from a remote Linux relay host, run on that host:</p>
-                    <pre>sockcast-relay zellij enable</pre>
+                    <pre>sshcast-relay zellij enable</pre>
                     <p>Or jump directly to a host and session via URL: <code>http://localhost:PORT/&lt;hostname&gt;/&lt;session&gt;</code></p>
                 </div>"#,
             );
@@ -962,7 +962,7 @@ impl ZellijProxyHub {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Sockcast — Zellij Web Sessions</title>
+<title>Sshcast — Zellij Web Sessions</title>
 <style>
   :root {{
     color-scheme: dark;
@@ -1160,8 +1160,8 @@ impl ZellijProxyHub {
   <div class="container">
     <header>
       <div>
-        <h1>Sockcast Zellij Web</h1>
-        <p class="subtitle">Zero-config authenticated Zellij Web sessions over STUN Direct P2P &amp; Sockcast</p>
+        <h1>Sshcast Zellij Web</h1>
+        <p class="subtitle">Zero-config authenticated Zellij Web sessions over STUN Direct P2P &amp; Sshcast</p>
       </div>
       <a class="btn-refresh" href="/?refresh=1">&#x21bb; Refresh Sessions</a>
     </header>
@@ -1196,7 +1196,7 @@ impl ZellijProxyHub {
             return Ok(());
         };
 
-        if let Some(static_resp) = try_build_sockcast_asset_http_response(&init_buf) {
+        if let Some(static_resp) = try_build_sshcast_asset_http_response(&init_buf) {
             stream.write_all(&static_resp).await?;
             let _ = stream.shutdown().await;
             return Ok(());

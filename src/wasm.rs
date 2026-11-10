@@ -5,12 +5,12 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sockcast_proto::bundle::EnrollmentBundle;
-use sockcast_proto::crypto::{
+use sshcast_proto::bundle::EnrollmentBundle;
+use sshcast_proto::crypto::{
     create_node_auth_with_nonce, verify_node_grant, verify_sign_request,
 };
-use sockcast_proto::ssh::{parse_public_key_blob, parse_ssh_auth_context, LoadedSshKey};
-use sockcast_proto::v1::{
+use sshcast_proto::ssh::{parse_public_key_blob, parse_ssh_auth_context, LoadedSshKey};
+use sshcast_proto::v1::{
     client_stream_message, server_stream_message, ClientStreamMessage, NodeRole, PublicKey,
     ServerStreamMessage, SignAck, SignRequest, SignResponse, WorkstationStatus,
 };
@@ -169,7 +169,7 @@ impl WasmWorkstationEngine {
                         return json!({
                             "ok": false,
                             "error": e.to_string(),
-                            "needs_passphrase": matches!(e, sockcast_proto::ssh::SshKeyError::PassphraseRequired)
+                            "needs_passphrase": matches!(e, sshcast_proto::ssh::SshKeyError::PassphraseRequired)
                         })
                     }
                 };
@@ -229,7 +229,7 @@ impl WasmWorkstationEngine {
                     hex::decode(hex_str).unwrap_or_else(|_| vec![1, 2, 3, 4, 5, 6, 7, 8])
                 } else {
                     let mut h = Sha256::new();
-                    h.update(b"sockcast-wasm-nonce-v1");
+                    h.update(b"sshcast-wasm-nonce-v1");
                     h.update(now_unix_ms.to_be_bytes());
                     h.update(self.nonce_counter.to_be_bytes());
                     h.update(&bundle.grant.node_pubkey);
@@ -634,7 +634,7 @@ pub fn wasm_call_json(request_json: &str) -> String {
 }
 
 #[no_mangle]
-pub extern "C" fn sockcast_wasm_alloc(size: usize) -> *mut u8 {
+pub extern "C" fn sshcast_wasm_alloc(size: usize) -> *mut u8 {
     let mut buf = Vec::<u8>::with_capacity(size);
     let ptr = buf.as_mut_ptr();
     std::mem::forget(buf);
@@ -642,9 +642,9 @@ pub extern "C" fn sockcast_wasm_alloc(size: usize) -> *mut u8 {
 }
 
 /// # Safety
-/// `ptr` and `size` must have been allocated via `sockcast_wasm_alloc(size)`.
+/// `ptr` and `size` must have been allocated via `sshcast_wasm_alloc(size)`.
 #[no_mangle]
-pub unsafe extern "C" fn sockcast_wasm_free(ptr: *mut u8, size: usize) {
+pub unsafe extern "C" fn sshcast_wasm_free(ptr: *mut u8, size: usize) {
     if !ptr.is_null() && size > 0 {
         let _ = Vec::from_raw_parts(ptr, 0, size);
     }
@@ -652,12 +652,12 @@ pub unsafe extern "C" fn sockcast_wasm_free(ptr: *mut u8, size: usize) {
 
 /// Executes a JSON command stored at `req_ptr..req_ptr+req_len` and stores the UTF-8 JSON response
 /// inside the engine buffer. Returns the byte length of the response (retrieve pointer with
-/// `sockcast_wasm_result_ptr`).
+/// `sshcast_wasm_result_ptr`).
 ///
 /// # Safety
 /// `req_ptr` must point to `req_len` valid bytes in WASM linear memory.
 #[no_mangle]
-pub unsafe extern "C" fn sockcast_wasm_call(req_ptr: *const u8, req_len: usize) -> usize {
+pub unsafe extern "C" fn sshcast_wasm_call(req_ptr: *const u8, req_len: usize) -> usize {
     let slice = if req_ptr.is_null() || req_len == 0 {
         &[][..]
     } else {
@@ -673,7 +673,7 @@ pub unsafe extern "C" fn sockcast_wasm_call(req_ptr: *const u8, req_len: usize) 
 }
 
 #[no_mangle]
-pub extern "C" fn sockcast_wasm_result_ptr() -> *const u8 {
+pub extern "C" fn sshcast_wasm_result_ptr() -> *const u8 {
     let guard = global_engine()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -681,7 +681,7 @@ pub extern "C" fn sockcast_wasm_result_ptr() -> *const u8 {
 }
 
 #[no_mangle]
-pub extern "C" fn sockcast_wasm_result_len() -> usize {
+pub extern "C" fn sshcast_wasm_result_len() -> usize {
     let guard = global_engine()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -692,11 +692,11 @@ pub extern "C" fn sockcast_wasm_result_len() -> usize {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use sockcast_proto::crypto::{
+    use sshcast_proto::crypto::{
         derive_user_id, sign_node_grant, sign_sign_request, verify_node_auth,
         DEFAULT_MAX_CLOCK_SKEW_MS,
     };
-    use sockcast_proto::v1::{NodeGrant, ProcessAncestor, ProcessContext};
+    use sshcast_proto::v1::{NodeGrant, ProcessAncestor, ProcessContext};
 
     #[test]
     fn test_wasm_workstation_engine_shares_native_prompt_and_policy() {

@@ -3,7 +3,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 
-use sockcast_proto::v1::NodeRole;
+use sshcast_proto::v1::NodeRole;
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, S_OK, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -830,7 +830,7 @@ fn default_servers_csv(ctx: &TraySharedContext) -> String {
             return cfg.servers.join(", ");
         }
     }
-    "https://sockcast.stingr.net".to_string()
+    "https://sshcast.stingr.net".to_string()
 }
 
 // ============================================================================
@@ -882,7 +882,7 @@ unsafe extern "system" fn enroll_wnd_proc(
             );
             create_label(
                 hwnd,
-                "User Root Key (for /etc/sockcast/server.toml):",
+                "User Root Key (for /etc/sshcast/server.toml):",
                 24,
                 96,
                 400,
@@ -974,11 +974,11 @@ unsafe extern "system" fn enroll_wnd_proc(
             let servers_default = maybe_ctx
                 .as_ref()
                 .map(|c| default_servers_csv(c))
-                .unwrap_or_else(|| "https://sockcast.stingr.net".to_string());
+                .unwrap_or_else(|| "https://sshcast.stingr.net".to_string());
             create_edit(
                 hwnd,
                 &servers_default,
-                "https://sockcast.example.com",
+                "https://sshcast.example.com",
                 false,
                 228,
                 174,
@@ -992,7 +992,7 @@ unsafe extern "system" fn enroll_wnd_proc(
             create_command_link(
                 hwnd,
                 "Enroll This Workstation",
-                "Mint a signed client grant using your local root key and save ~/.config/sockcast/client.toml",
+                "Mint a signed client grant using your local root key and save ~/.config/sshcast/client.toml",
                 true,
                 24,
                 214,
@@ -1054,7 +1054,7 @@ unsafe extern "system" fn enroll_wnd_proc(
             create_command_link(
                 hwnd,
                 "Initialize Workstation from Bundle",
-                "Verify the pasted sc1_ token, write ~/.config/sockcast/client.toml, and connect immediately",
+                "Verify the pasted sc1_ token, write ~/.config/sshcast/client.toml, and connect immediately",
                 false,
                 24,
                 404,
@@ -1162,7 +1162,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                             show_tray_error_dialog(
                                 "Validation Error",
                                 "At least one Coordinator Server URL is required",
-                                "Please enter your coordinator URL (e.g. 'https://sockcast.stingr.net').",
+                                "Please enter your coordinator URL (e.g. 'https://sshcast.stingr.net').",
                             );
                             return 0;
                         }
@@ -1404,8 +1404,8 @@ pub unsafe fn show_enroll_window() {
     let dpi = get_dpi_scale();
     let assets = ensure_theme_assets(dpi);
     let hinstance = GetModuleHandleW(null());
-    let class_name = to_wide("SockcastEnrollWndClassV2");
-    let title = to_wide("Sockcast — Initialize / Enroll Workstation");
+    let class_name = to_wide("SshcastEnrollWndClassV2");
+    let title = to_wide("Sshcast — Initialize / Enroll Workstation");
 
     let wc = WNDCLASSW {
         style: 0,
@@ -1467,7 +1467,7 @@ unsafe extern "system" fn bundle_wnd_proc(
             // Section 1: Root Key Allowlist
             create_label(
                 hwnd,
-                "User Root Key (for /etc/sockcast/server.toml):",
+                "User Root Key (for /etc/sshcast/server.toml):",
                 24,
                 70,
                 464,
@@ -1537,7 +1537,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                 hwnd,
                 0,
                 "BUTTON",
-                "Remote Linux Server Relay (sockcast-relay)",
+                "Remote Linux Server Relay (sshcast-relay)",
                 BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
                 24,
                 188,
@@ -1551,7 +1551,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                 hwnd,
                 0,
                 "BUTTON",
-                "Secondary Workstation (sockcast-client)",
+                "Secondary Workstation (sshcast-client)",
                 BS_AUTORADIOBUTTON | WS_TABSTOP,
                 326,
                 188,
@@ -1613,11 +1613,11 @@ unsafe extern "system" fn bundle_wnd_proc(
             let servers_default = maybe_ctx
                 .as_ref()
                 .map(|c| default_servers_csv(c))
-                .unwrap_or_else(|| "https://sockcast.stingr.net".to_string());
+                .unwrap_or_else(|| "https://sshcast.stingr.net".to_string());
             create_edit(
                 hwnd,
                 &servers_default,
-                "https://sockcast.example.com",
+                "https://sshcast.example.com",
                 false,
                 226,
                 240,
@@ -1890,7 +1890,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                             show_tray_error_dialog(
                                 "Validation Error",
                                 "At least one Coordinator URL is required",
-                                "Enter at least one coordinator URL (e.g. 'https://sockcast.stingr.net').",
+                                "Enter at least one coordinator URL (e.g. 'https://sshcast.stingr.net').",
                             );
                             return 0;
                         }
@@ -1940,9 +1940,9 @@ unsafe extern "system" fn bundle_wnd_proc(
                         match res {
                             Ok(token) => {
                                 let cli_cmd = if is_relay {
-                                    format!("sockcast-relay init --bundle {token}")
+                                    format!("sshcast-relay init --bundle {token}")
                                 } else {
-                                    format!("sockcast-client init --bundle {token}")
+                                    format!("sshcast-client init --bundle {token}")
                                 };
                                 set_dlg_item_string(hwnd, ID_BUNDLE_TOKEN_OUT_EDIT, &token);
                                 set_dlg_item_string(hwnd, ID_BUNDLE_CMD_OUT_EDIT, &cli_cmd);
@@ -2037,8 +2037,8 @@ pub unsafe fn show_bundle_generator_window() {
     let dpi = get_dpi_scale();
     let assets = ensure_theme_assets(dpi);
     let hinstance = GetModuleHandleW(null());
-    let class_name = to_wide("SockcastBundleWndClassV2");
-    let title = to_wide("Sockcast — Generate Enrollment Bundle");
+    let class_name = to_wide("SshcastBundleWndClassV2");
+    let title = to_wide("Sshcast — Generate Enrollment Bundle");
 
     let wc = WNDCLASSW {
         style: 0,
@@ -2182,7 +2182,7 @@ unsafe extern "system" fn backends_wnd_proc(
             create_edit(
                 hwnd,
                 "https://",
-                "https://sockcast.example.com",
+                "https://sshcast.example.com",
                 false,
                 24,
                 246,
@@ -2258,7 +2258,7 @@ unsafe extern "system" fn backends_wnd_proc(
                             show_tray_error_dialog(
                                 "Invalid Server URL",
                                 "Coordinator URL must start with http:// or https://",
-                                "Example: https://sockcast.stingr.net",
+                                "Example: https://sshcast.stingr.net",
                             );
                             return 0;
                         }
@@ -2394,8 +2394,8 @@ pub unsafe fn show_backends_window() {
     let dpi = get_dpi_scale();
     let assets = ensure_theme_assets(dpi);
     let hinstance = GetModuleHandleW(null());
-    let class_name = to_wide("SockcastBackendsWndClassV2");
-    let title = to_wide("Sockcast — Manage Coordinator Backends");
+    let class_name = to_wide("SshcastBackendsWndClassV2");
+    let title = to_wide("Sshcast — Manage Coordinator Backends");
 
     let wc = WNDCLASSW {
         style: 0,
@@ -2867,8 +2867,8 @@ pub unsafe fn show_ssh_keys_window() {
     let dpi = get_dpi_scale();
     let assets = ensure_theme_assets(dpi);
     let hinstance = GetModuleHandleW(null());
-    let class_name = to_wide("SockcastSshKeysWndClassV1");
-    let title = to_wide("Sockcast — Manage SSH Keys");
+    let class_name = to_wide("SshcastSshKeysWndClassV1");
+    let title = to_wide("Sshcast — Manage SSH Keys");
 
     let wc = WNDCLASSW {
         style: 0,

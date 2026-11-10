@@ -1,22 +1,22 @@
 [package]
-name = "sockcast-client"
+name = "sshcast-client"
 version = "0.1.0"
 edition = "2021"
-description = "Sockcast Roaming SSH Agent Workstation Client & Enrollment CLI"
+description = "Sshcast Roaming SSH Agent Workstation Client & Enrollment CLI"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/theraphim/sockcast-client"
-default-run = "sockcast-client"
+repository = "https://github.com/theraphim/sshcast-client"
+default-run = "sshcast-client"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
-name = "sockcast-client"
+name = "sshcast-client"
 path = "src/main.rs"
 
 [[bin]]
-name = "sockcast-tray"
-path = "src/bin/sockcast-tray.rs"
+name = "sshcast-tray"
+path = "src/bin/sshcast-tray.rs"
 
 [dependencies]
 anyhow = "1"
@@ -27,7 +27,7 @@ prost = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sockcast-proto = { path = "sockcast-proto" }
+sshcast-proto = { path = "sshcast-proto" }
 thiserror = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

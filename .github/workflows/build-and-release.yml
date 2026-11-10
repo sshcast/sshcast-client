@@ -3,7 +3,7 @@ name: Cross-Platform Build & Release
 on:
   push:
     branches: [main]
-    tags: ["v*", "sockcast-client-*"]
+    tags: ["v*", "sshcast-client-*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -21,20 +21,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive_name: sockcast-client-linux-x86_64.tar.gz
-            bin_name: sockcast-client
+            archive_name: sshcast-client-linux-x86_64.tar.gz
+            bin_name: sshcast-client
           - os: macos-latest
             target: aarch64-apple-darwin
-            archive_name: sockcast-client-macos-arm64.tar.gz
-            bin_name: sockcast-client
+            archive_name: sshcast-client-macos-arm64.tar.gz
+            bin_name: sshcast-client
           - os: macos-latest
             target: x86_64-apple-darwin
-            archive_name: sockcast-client-macos-x86_64.tar.gz
-            bin_name: sockcast-client
+            archive_name: sshcast-client-macos-x86_64.tar.gz
+            bin_name: sshcast-client
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive_name: sockcast-client-windows-x86_64.zip
-            bin_name: sockcast-client.exe
+            archive_name: sshcast-client-windows-x86_64.zip
+            bin_name: sshcast-client.exe
 
     steps:
       - name: Checkout repository
@@ -60,7 +60,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" dist/
           cp README.md dist/
           if [ "${{ runner.os }}" = "macOS" ]; then
-            cp "target/${{ matrix.target }}/release/sockcast-tray" dist/
+            cp "target/${{ matrix.target }}/release/sshcast-tray" dist/
             cp -r macos dist/
           else
             cp -r systemd dist/
@@ -72,8 +72,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/sockcast-client.exe" -Destination dist/
-          Copy-Item "target/${{ matrix.target }}/release/sockcast-tray.exe" -Destination dist/
+          Copy-Item "target/${{ matrix.target }}/release/sshcast-client.exe" -Destination dist/
+          Copy-Item "target/${{ matrix.target }}/release/sshcast-tray.exe" -Destination dist/
           Copy-Item README.md -Destination dist/
           Copy-Item -Recurse windows -Destination dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive_name }}" -Force

@@ -3008,56 +3008,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sockcast-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "dispatch2",
- "ed25519-dalek",
- "eframe",
- "flate2",
- "hex",
- "libc",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "objc2-core-foundation",
- "objc2-foundation 0.3.2",
- "prost",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "sockcast-proto",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "sockcast-proto"
-version = "0.1.0"
-dependencies = [
- "base64",
- "ed25519-dalek",
- "hex",
- "prost",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
- "tonic",
-]
-
-[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3094,6 +3044,56 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sshcast-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "dispatch2",
+ "ed25519-dalek",
+ "eframe",
+ "flate2",
+ "hex",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "prost",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sshcast-proto",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "sshcast-proto"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "hex",
+ "prost",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "tonic",
 ]
 
 [[package]]

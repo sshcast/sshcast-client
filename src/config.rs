@@ -4,8 +4,8 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sockcast_proto::bundle::EnrollmentBundle;
-use sockcast_proto::v1::NodeGrant;
+use sshcast_proto::bundle::EnrollmentBundle;
+use sshcast_proto::v1::NodeGrant;
 use std::path::{Path, PathBuf};
 
 fn default_heartbeat_secs() -> u64 {
@@ -17,7 +17,7 @@ pub fn default_zellij_listen_port() -> u16 {
 }
 
 pub fn default_stun_servers() -> Vec<String> {
-    sockcast_proto::p2p::DEFAULT_STUN_SERVERS
+    sshcast_proto::p2p::DEFAULT_STUN_SERVERS
         .iter()
         .map(|s| (*s).to_string())
         .collect()
@@ -248,10 +248,10 @@ pub fn home_dir() -> Result<PathBuf> {
 pub fn default_config_dir() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("sockcast"));
+            return Ok(PathBuf::from(xdg).join("sshcast"));
         }
     }
-    Ok(home_dir()?.join(".config").join("sockcast"))
+    Ok(home_dir()?.join(".config").join("sshcast"))
 }
 
 pub fn default_user_key_path() -> Result<PathBuf> {

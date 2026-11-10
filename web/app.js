@@ -1,12 +1,12 @@
-// Sockcast Browser Workstation (WASM + WebSocket Client)
-// Supports both Rust wasm32-unknown-unknown (sockcast_proto.wasm) and Go wasm (sockcast_wasm.wasm).
+// Sshcast Browser Workstation (WASM + WebSocket Client)
+// Supports both Rust wasm32-unknown-unknown (sshcast_proto.wasm) and Go wasm (sshcast_wasm.wasm).
 
 (() => {
   "use strict";
 
-  const STORAGE_BUNDLE_KEY = "sockcast_wasm_bundle_v1";
-  const STORAGE_WS_URL_KEY = "sockcast_wasm_ws_url_v1";
-  const STORAGE_KEYS_KEY = "sockcast_wasm_ssh_keys_v1";
+  const STORAGE_BUNDLE_KEY = "sshcast_wasm_bundle_v1";
+  const STORAGE_WS_URL_KEY = "sshcast_wasm_ws_url_v1";
+  const STORAGE_KEYS_KEY = "sshcast_wasm_ssh_keys_v1";
 
   let wasmEngine = null; // { type: "rust-wasm" | "go-wasm", call(reqObj): respObj }
   let ws = null;
@@ -61,7 +61,7 @@
 
   async function tryLoadRustWasm() {
     try {
-      const resp = await fetch("./sockcast_proto.wasm", { cache: "no-cache" });
+      const resp = await fetch("./sshcast_proto.wasm", { cache: "no-cache" });
       if (!resp.ok) return null;
       const buf = await resp.arrayBuffer();
       const magic = new Uint8Array(buf, 0, 4);
@@ -77,22 +77,22 @@
       const { instance } = await WebAssembly.instantiate(buf, {});
       const ex = instance.exports;
       if (
-        typeof ex.sockcast_wasm_alloc !== "function" ||
-        typeof ex.sockcast_wasm_call !== "function"
+        typeof ex.sshcast_wasm_alloc !== "function" ||
+        typeof ex.sshcast_wasm_call !== "function"
       ) {
         return null;
       }
       const encoder = new TextEncoder();
       const decoder = new TextDecoder();
       return {
-        type: "rust-wasm (sockcast_proto.wasm)",
+        type: "rust-wasm (sshcast_proto.wasm)",
         call(reqObj) {
           const reqBytes = encoder.encode(JSON.stringify(reqObj));
-          const ptr = ex.sockcast_wasm_alloc(reqBytes.length);
+          const ptr = ex.sshcast_wasm_alloc(reqBytes.length);
           new Uint8Array(ex.memory.buffer, ptr, reqBytes.length).set(reqBytes);
-          const resLen = ex.sockcast_wasm_call(ptr, reqBytes.length);
-          ex.sockcast_wasm_free(ptr, reqBytes.length);
-          const resPtr = ex.sockcast_wasm_result_ptr();
+          const resLen = ex.sshcast_wasm_call(ptr, reqBytes.length);
+          ex.sshcast_wasm_free(ptr, reqBytes.length);
+          const resPtr = ex.sshcast_wasm_result_ptr();
           const resBytes = new Uint8Array(ex.memory.buffer, resPtr, resLen);
           return JSON.parse(decoder.decode(resBytes));
         },
@@ -107,16 +107,16 @@
       throw new Error("wasm_exec.js is not loaded");
     }
     const go = new Go();
-    const resp = await fetch("./sockcast_wasm.wasm");
+    const resp = await fetch("./sshcast_wasm.wasm");
     if (!resp.ok) {
-      throw new Error(`Failed to fetch sockcast_wasm.wasm: HTTP ${resp.status}`);
+      throw new Error(`Failed to fetch sshcast_wasm.wasm: HTTP ${resp.status}`);
     }
     let result;
     if (WebAssembly.instantiateStreaming) {
       try {
         result = await WebAssembly.instantiateStreaming(resp, go.importObject);
       } catch (_) {
-        const fallbackResp = await fetch("./sockcast_wasm.wasm");
+        const fallbackResp = await fetch("./sshcast_wasm.wasm");
         const buf = await fallbackResp.arrayBuffer();
         result = await WebAssembly.instantiate(buf, go.importObject);
       }
@@ -126,16 +126,16 @@
     }
     go.run(result.instance);
     for (let i = 0; i < 50; i++) {
-      if (globalThis.__sockcastGoWasm) break;
+      if (globalThis.__sshcastGoWasm) break;
       await new Promise((r) => setTimeout(r, 20));
     }
-    if (!globalThis.__sockcastGoWasm) {
-      throw new Error("WASM module did not register __sockcastGoWasm");
+    if (!globalThis.__sshcastGoWasm) {
+      throw new Error("WASM module did not register __sshcastGoWasm");
     }
     return {
-      type: "wasm (sockcast_wasm.wasm)",
+      type: "wasm (sshcast_wasm.wasm)",
       call(reqObj) {
-        const raw = globalThis.__sockcastGoWasm.callJSON(JSON.stringify(reqObj));
+        const raw = globalThis.__sshcastGoWasm.callJSON(JSON.stringify(reqObj));
         return JSON.parse(raw);
       },
     };

@@ -3,9 +3,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use sockcast_proto::bundle::EnrollmentBundle;
-use sockcast_proto::crypto::{derive_user_id, sign_node_grant, verify_node_grant};
-use sockcast_proto::v1::{NodeGrant, NodeRole};
+use sshcast_proto::bundle::EnrollmentBundle;
+use sshcast_proto::crypto::{derive_user_id, sign_node_grant, verify_node_grant};
+use sshcast_proto::v1::{NodeGrant, NodeRole};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -146,7 +146,7 @@ pub fn load_user_signing_key(key_path: Option<&Path>) -> Result<SigningKey> {
     };
     let raw = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "failed to read user root key at {} (run `sockcast-client keygen` first)",
+            "failed to read user root key at {} (run `sshcast-client keygen` first)",
             path.display()
         )
     })?;

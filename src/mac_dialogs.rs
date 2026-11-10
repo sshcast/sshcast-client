@@ -14,7 +14,7 @@ use objc2_foundation::{
     NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
 };
 
-use sockcast_proto::v1::NodeRole;
+use sshcast_proto::v1::NodeRole;
 
 use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
 use crate::enroll::{
@@ -98,7 +98,7 @@ fn default_servers_csv(ctx: Option<&TraySharedContext>) -> String {
             }
         }
     }
-    "https://sockcast.stingr.net".to_string()
+    "https://sshcast.stingr.net".to_string()
 }
 
 fn add_window_chrome(
@@ -110,7 +110,7 @@ fn add_window_chrome(
     divider_ys: &[CGFloat],
 ) {
     let sym = NSString::from_str("lock.shield");
-    let desc = NSString::from_str("Sockcast");
+    let desc = NSString::from_str("Sshcast");
     if let Some(img) = NSImage::imageWithSystemSymbolName_accessibilityDescription(&sym, Some(&desc))
     {
         let iv = NSImageView::imageViewWithImage(&img, mtm);
@@ -352,7 +352,7 @@ struct EmptyIvars {}
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "SockcastEnrollWindowHandler"]
+    #[name = "SshcastEnrollWindowHandler"]
     #[ivars = EmptyIvars]
     struct EnrollWindowHandler;
 
@@ -439,7 +439,7 @@ define_class!(
                 show_tray_error_dialog(
                     "Validation Error",
                     "At least one Coordinator Server URL is required",
-                    "Please enter your coordinator URL (e.g. 'https://sockcast.stingr.net').",
+                    "Please enter your coordinator URL (e.g. 'https://sshcast.stingr.net').",
                 );
                 return;
             }
@@ -700,7 +700,7 @@ pub fn show_enroll_window() {
         let win_h: CGFloat = 540.0;
         let window = create_centered_window(
             mtm,
-            "Sockcast — Initialize / Enroll Workstation",
+            "Sshcast — Initialize / Enroll Workstation",
             win_w,
             win_h,
         );
@@ -731,7 +731,7 @@ pub fn show_enroll_window() {
             mtm,
             &content_view,
             win_h,
-            "User Root Key (for /etc/sockcast/server.toml):",
+            "User Root Key (for /etc/sshcast/server.toml):",
             24.0,
             94.0,
             400.0,
@@ -823,7 +823,7 @@ pub fn show_enroll_window() {
             &content_view,
             win_h,
             &servers_default,
-            "https://sockcast.example.com",
+            "https://sshcast.example.com",
             false,
             true,
             228.0,
@@ -837,7 +837,7 @@ pub fn show_enroll_window() {
             &content_view,
             win_h,
             "Enroll This Workstation",
-            "Mint a signed client grant using your local root key and save ~/.config/sockcast/client.toml",
+            "Mint a signed client grant using your local root key and save ~/.config/sshcast/client.toml",
             &handler,
             sel!(onEnrollPrimary:),
             true,
@@ -899,7 +899,7 @@ pub fn show_enroll_window() {
             &content_view,
             win_h,
             "Initialize Workstation from Bundle",
-            "Verify the pasted sc1_ token, write ~/.config/sockcast/client.toml, and connect immediately",
+            "Verify the pasted sc1_ token, write ~/.config/sshcast/client.toml, and connect immediately",
             &handler,
             sel!(onInitBundle:),
             false,
@@ -971,7 +971,7 @@ struct BundleWindowWidgets {
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "SockcastBundleWindowHandler"]
+    #[name = "SshcastBundleWindowHandler"]
     #[ivars = EmptyIvars]
     struct BundleWindowHandler;
 
@@ -1110,7 +1110,7 @@ define_class!(
                 show_tray_error_dialog(
                     "Validation Error",
                     "At least one Coordinator URL is required",
-                    "Enter at least one coordinator URL (e.g. 'https://sockcast.stingr.net').",
+                    "Enter at least one coordinator URL (e.g. 'https://sshcast.stingr.net').",
                 );
                 return;
             }
@@ -1157,9 +1157,9 @@ define_class!(
             match res {
                 Ok(token) => {
                     let cli_cmd = if is_relay {
-                        format!("sockcast-relay init --bundle {token}")
+                        format!("sshcast-relay init --bundle {token}")
                     } else {
-                        format!("sockcast-client init --bundle {token}")
+                        format!("sshcast-client init --bundle {token}")
                     };
                     let _ = copy_to_clipboard(&cli_cmd);
                     let status = format!(
@@ -1269,7 +1269,7 @@ pub fn show_bundle_generator_window() {
         let win_h: CGFloat = 560.0;
         let window = create_centered_window(
             mtm,
-            "Sockcast — Generate Enrollment Bundle",
+            "Sshcast — Generate Enrollment Bundle",
             win_w,
             win_h,
         );
@@ -1290,7 +1290,7 @@ pub fn show_bundle_generator_window() {
             mtm,
             &content_view,
             win_h,
-            "User Root Key (for /etc/sockcast/server.toml):",
+            "User Root Key (for /etc/sshcast/server.toml):",
             24.0,
             68.0,
             464.0,
@@ -1358,7 +1358,7 @@ pub fn show_bundle_generator_window() {
 
         let radio_relay = unsafe {
             NSButton::radioButtonWithTitle_target_action(
-                &NSString::from_str("Remote Linux Server Relay (sockcast-relay)"),
+                &NSString::from_str("Remote Linux Server Relay (sshcast-relay)"),
                 Some(&handler),
                 Some(sel!(onSelectRelay:)),
                 mtm,
@@ -1370,7 +1370,7 @@ pub fn show_bundle_generator_window() {
 
         let radio_client = unsafe {
             NSButton::radioButtonWithTitle_target_action(
-                &NSString::from_str("Secondary Workstation (sockcast-client)"),
+                &NSString::from_str("Secondary Workstation (sshcast-client)"),
                 Some(&handler),
                 Some(sel!(onSelectClient:)),
                 mtm,
@@ -1430,7 +1430,7 @@ pub fn show_bundle_generator_window() {
             &content_view,
             win_h,
             &servers_default,
-            "https://sockcast.example.com",
+            "https://sshcast.example.com",
             false,
             true,
             226.0,
@@ -1624,7 +1624,7 @@ impl BackendsWindowWidgets {
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "SockcastBackendsWindowHandler"]
+    #[name = "SshcastBackendsWindowHandler"]
     #[ivars = EmptyIvars]
     struct BackendsWindowHandler;
 
@@ -1643,7 +1643,7 @@ define_class!(
                         show_tray_error_dialog(
                             "Invalid Server URL",
                             "Coordinator URL must start with http:// or https://",
-                            "Example: https://sockcast.stingr.net",
+                            "Example: https://sshcast.stingr.net",
                         );
                         return;
                     }
@@ -1792,7 +1792,7 @@ pub fn show_backends_window() {
         let win_h: CGFloat = 420.0;
         let window = create_centered_window(
             mtm,
-            "Sockcast — Manage Coordinator Backends",
+            "Sshcast — Manage Coordinator Backends",
             win_w,
             win_h,
         );
@@ -1869,7 +1869,7 @@ pub fn show_backends_window() {
             &content_view,
             win_h,
             "https://",
-            "https://sockcast.example.com",
+            "https://sshcast.example.com",
             false,
             true,
             24.0,
@@ -2009,7 +2009,7 @@ impl SshKeysWindowWidgets {
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "SockcastSshKeysWindowHandler"]
+    #[name = "SshcastSshKeysWindowHandler"]
     #[ivars = EmptyIvars]
     struct SshKeysWindowHandler;
 
@@ -2256,7 +2256,7 @@ pub fn show_ssh_keys_window() {
 
         let win_w: CGFloat = 620.0;
         let win_h: CGFloat = 490.0;
-        let window = create_centered_window(mtm, "Sockcast — Manage SSH Keys", win_w, win_h);
+        let window = create_centered_window(mtm, "Sshcast — Manage SSH Keys", win_w, win_h);
         let content_view = window.contentView().expect("window has contentView");
         let handler = SshKeysWindowHandler::new(mtm);
 
