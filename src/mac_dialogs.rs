@@ -14,14 +14,15 @@ use objc2_foundation::{
     NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
 };
 
+use sshcast_proto::bundle::USER_CERT_PREFIX;
 use sshcast_proto::v1::NodeRole;
 
 use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
 use crate::enroll::{
     decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
-    import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
-    write_client_config_and_optional_root_key, write_client_config_from_bundle,
-    USER_KEY_TOKEN_PREFIX,
+    import_user_cert, import_user_root_key, load_user_cert, load_user_signing_key,
+    mint_enrollment_bundle, run_keygen, write_client_config_and_optional_root_key,
+    write_client_config_from_bundle, USER_KEY_TOKEN_PREFIX,
 };
 use crate::mac_native::{
     confirm_overwrite_dialog, get_tray_context, reload_tray_configuration, run_on_main_async,
@@ -60,13 +61,25 @@ fn parse_servers_input(raw: &str) -> Vec<String> {
 
 fn format_root_key_allowlist() -> Option<String> {
     if let Ok((_, uk)) = UserKeyFile::load(None) {
-        Some(format!(
-            "allowed_user_pubkeys = [\"{}\"]",
-            uk.user_pubkey_token
-        ))
+        Some(uk.user_pubkey_token)
     } else {
         None
     }
+}
+
+fn format_user_cert_status(cfg_path: Option<&std::path::Path>) -> Option<String> {
+    let cert = load_user_cert(None, cfg_path)?;
+    let op_hex = hex::encode(&cert.operator_pubkey);
+    let short_op = &op_hex[..12.min(op_hex.len())];
+    Some(format!(
+        "Certified by sc_op_pub_{short_op}... (User: {})",
+        cert.user_id
+    ))
+}
+
+fn is_valid_coordinator_entry(trimmed: &str) -> bool {
+    ((trimmed.starts_with("http://") || trimmed.starts_with("https://")) && trimmed.len() > 8)
+        || sshcast_proto::dns::is_dns_discovery_entry(trimmed).is_some()
 }
 
 fn default_workstation_node_name(ctx: Option<&TraySharedContext>) -> String {
@@ -326,12 +339,13 @@ fn create_centered_window(
 }
 
 // ============================================================================
-// 1. INITIALIZE / ENROLL WORKSTATION WINDOW (640 x 540)
+// 1. INITIALIZE / ENROLL WORKSTATION WINDOW (640 x 600)
 // ============================================================================
 
 struct EnrollWindowWidgets {
     window: Retained<NSWindow>,
     root_key_edit: Retained<NSTextField>,
+    cert_edit: Retained<NSTextField>,
     node_edit: Retained<NSTextField>,
     servers_edit: Retained<NSTextField>,
     bundle_edit: Retained<NSTextField>,
@@ -366,21 +380,19 @@ define_class!(
                 && !confirm_overwrite_dialog(
                     "Overwrite User Root Key?",
                     "A user root key (user_key.toml) already exists.",
-                    "Generating a new user root key will invalidate previous allowlist entries unless you update server.toml. Overwrite user_key.toml?",
+                    "Generating a new user root key will invalidate previous certificates and allowlist entries. Overwrite user_key.toml?",
                 )
             {
                 return;
             }
             match run_keygen(None, true) {
                 Ok(out) => {
-                    let allow = format!(
-                        "allowed_user_pubkeys = [\"{}\"]",
-                        out.user_pubkey_token
-                    );
                     let status = format!("Generated root key (User ID: {}).", out.user_id);
                     ENROLL_WINDOW.with(|cell| {
                         if let Some(ref w) = *cell.borrow() {
-                            w.root_key_edit.setStringValue(&NSString::from_str(&allow));
+                            w.root_key_edit
+                                .setStringValue(&NSString::from_str(&out.user_pubkey_token));
+                            w.cert_edit.setStringValue(&NSString::from_str(""));
                             w.footer_status.setStringValue(&NSString::from_str(&status));
                         }
                     });
@@ -397,9 +409,9 @@ define_class!(
 
         #[unsafe(method(onCopyPubkey:))]
         fn on_copy_pubkey(&self, _sender: Option<&AnyObject>) {
-            let msg = if let Some(allow) = format_root_key_allowlist() {
-                if copy_to_clipboard(&allow) {
-                    "Copied allowed_user_pubkeys line to clipboard!"
+            let msg = if let Some(pubkey) = format_root_key_allowlist() {
+                if copy_to_clipboard(&pubkey) {
+                    "Copied sc_pub_... public key to clipboard!"
                 } else {
                     "Failed to copy to clipboard."
                 }
@@ -413,16 +425,94 @@ define_class!(
             });
         }
 
+        #[unsafe(method(onPasteCert:))]
+        fn on_paste_cert(&self, _sender: Option<&AnyObject>) {
+            if let Some(clip) = paste_from_clipboard() {
+                let token = clip
+                    .split_whitespace()
+                    .find(|w| w.starts_with(USER_CERT_PREFIX))
+                    .unwrap_or(clip.trim());
+                ENROLL_WINDOW.with(|cell| {
+                    if let Some(ref w) = *cell.borrow() {
+                        w.cert_edit.setStringValue(&NSString::from_str(token));
+                        w.footer_status.setStringValue(&NSString::from_str(
+                            "Pasted certificate token from clipboard. Click 'Import Cert' to apply.",
+                        ));
+                    }
+                });
+            }
+        }
+
+        #[unsafe(method(onImportCert:))]
+        fn on_import_cert(&self, _sender: Option<&AnyObject>) {
+            let raw_edit = ENROLL_WINDOW.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .map(|w| w.cert_edit.stringValue().to_string())
+                    .unwrap_or_default()
+            });
+            let mut token = raw_edit
+                .split_whitespace()
+                .find(|w| w.starts_with(USER_CERT_PREFIX))
+                .unwrap_or("")
+                .to_string();
+            if token.is_empty() {
+                if let Some(clip) = paste_from_clipboard() {
+                    if let Some(found) =
+                        clip.split_whitespace().find(|w| w.starts_with(USER_CERT_PREFIX))
+                    {
+                        token = found.to_string();
+                    }
+                }
+            }
+            if token.is_empty() {
+                show_tray_error_dialog(
+                    "No Certificate Token Found",
+                    "Please paste an sc_cert_<base64> token first",
+                    "Sign your sc_pub_... key in the Operator Console, copy the sc_cert_... token, and click 'Paste Cert' or 'Import Cert'.",
+                );
+                return;
+            }
+            let cfg_path = get_tray_context()
+                .and_then(|c| c.config_path.clone())
+                .or_else(|| default_client_config_path().ok());
+            match import_user_cert(&token, None, cfg_path.as_deref()) {
+                Ok((_, updated_cfg, cert)) => {
+                    if updated_cfg.is_some() {
+                        reload_tray_configuration();
+                    }
+                    let status = format_user_cert_status(cfg_path.as_deref());
+                    let msg = format!("Imported operator certificate for {}!", cert.user_id);
+                    ENROLL_WINDOW.with(|cell| {
+                        if let Some(ref w) = *cell.borrow() {
+                            if let Some(ref s) = status {
+                                w.cert_edit.setStringValue(&NSString::from_str(s));
+                            }
+                            w.footer_status.setStringValue(&NSString::from_str(&msg));
+                        }
+                    });
+                }
+                Err(e) => {
+                    show_tray_error_dialog(
+                        "Certificate Import Failed",
+                        "Failed to import sc_cert_ operator certificate",
+                        &format!("{e:#}"),
+                    );
+                }
+            }
+        }
+
         #[unsafe(method(onEnrollPrimary:))]
         fn on_enroll_primary(&self, _sender: Option<&AnyObject>) {
-            let (node_name, servers_raw) = ENROLL_WINDOW.with(|cell| {
+            let (node_name, servers_raw, raw_cert_edit) = ENROLL_WINDOW.with(|cell| {
                 if let Some(ref w) = *cell.borrow() {
                     (
                         w.node_edit.stringValue().to_string(),
                         w.servers_edit.stringValue().to_string(),
+                        w.cert_edit.stringValue().to_string(),
                     )
                 } else {
-                    (String::new(), String::new())
+                    (String::new(), String::new(), String::new())
                 }
             });
 
@@ -438,8 +528,8 @@ define_class!(
             if servers.is_empty() {
                 show_tray_error_dialog(
                     "Validation Error",
-                    "At least one Coordinator Server URL is required",
-                    "Please enter your coordinator URL (e.g. 'https://sshcast.stingr.net').",
+                    "At least one Coordinator Domain or URL is required",
+                    "Please enter your coordinator domain (e.g. 'sshcast.net') or URL (e.g. 'https://sshcast.stingr.net').",
                 );
                 return;
             }
@@ -453,10 +543,10 @@ define_class!(
                     );
                     return;
                 }
-                if let Some(allow) = format_root_key_allowlist() {
+                if let Some(pubkey) = format_root_key_allowlist() {
                     ENROLL_WINDOW.with(|cell| {
                         if let Some(ref w) = *cell.borrow() {
-                            w.root_key_edit.setStringValue(&NSString::from_str(&allow));
+                            w.root_key_edit.setStringValue(&NSString::from_str(&pubkey));
                         }
                     });
                 }
@@ -465,6 +555,27 @@ define_class!(
             let cfg_path = get_tray_context()
                 .and_then(|c| c.config_path.clone())
                 .or_else(|| default_client_config_path().ok());
+
+            if let Some(cert_tok) = raw_cert_edit
+                .split_whitespace()
+                .find(|w| w.starts_with(USER_CERT_PREFIX))
+            {
+                if let Err(e) = import_user_cert(cert_tok, None, cfg_path.as_deref()) {
+                    show_tray_error_dialog(
+                        "Certificate Import Failed",
+                        "Failed to import pasted sc_cert_ operator certificate",
+                        &format!("{e:#}"),
+                    );
+                    return;
+                }
+                if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                    ENROLL_WINDOW.with(|cell| {
+                        if let Some(ref w) = *cell.borrow() {
+                            w.cert_edit.setStringValue(&NSString::from_str(&status));
+                        }
+                    });
+                }
+            }
 
             if let Some(ref p) = cfg_path {
                 if p.exists()
@@ -522,7 +633,11 @@ define_class!(
             if let Some(clip) = paste_from_clipboard() {
                 let token = clip
                     .split_whitespace()
-                    .find(|w| w.starts_with("sc1_") || w.starts_with(USER_KEY_TOKEN_PREFIX))
+                    .find(|w| {
+                        w.starts_with("sc1_")
+                            || w.starts_with(USER_KEY_TOKEN_PREFIX)
+                            || w.starts_with(USER_CERT_PREFIX)
+                    })
                     .unwrap_or(clip.trim());
                 ENROLL_WINDOW.with(|cell| {
                     if let Some(ref w) = *cell.borrow() {
@@ -545,13 +660,17 @@ define_class!(
             });
             let token = raw_input
                 .split_whitespace()
-                .find(|w| w.starts_with("sc1_") || w.starts_with(USER_KEY_TOKEN_PREFIX))
+                .find(|w| {
+                    w.starts_with("sc1_")
+                        || w.starts_with(USER_KEY_TOKEN_PREFIX)
+                        || w.starts_with(USER_CERT_PREFIX)
+                })
                 .unwrap_or(raw_input.trim());
             if token.is_empty() {
                 show_tray_error_dialog(
                     "Validation Error",
                     "Enrollment Bundle is empty",
-                    "Please paste an sc1_<base64> client enrollment bundle (or scu1_<base64> user root key) first.",
+                    "Please paste an sc1_<base64> client enrollment bundle (or scu1_ root key / sc_cert_ certificate) first.",
                 );
                 return;
             }
@@ -560,20 +679,49 @@ define_class!(
                 .and_then(|c| c.config_path.clone())
                 .or_else(|| default_client_config_path().ok());
 
+            if token.starts_with(USER_CERT_PREFIX) {
+                match import_user_cert(token, None, cfg_path.as_deref()) {
+                    Ok((_, updated_cfg, cert)) => {
+                        if updated_cfg.is_some() {
+                            reload_tray_configuration();
+                        }
+                        let status = format_user_cert_status(cfg_path.as_deref());
+                        let msg = format!("Imported operator certificate for {}!", cert.user_id);
+                        ENROLL_WINDOW.with(|cell| {
+                            if let Some(ref w) = *cell.borrow() {
+                                if let Some(ref s) = status {
+                                    w.cert_edit.setStringValue(&NSString::from_str(s));
+                                }
+                                w.footer_status.setStringValue(&NSString::from_str(&msg));
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        show_tray_error_dialog(
+                            "Certificate Import Failed",
+                            "Failed to import sc_cert_ operator certificate",
+                            &format!("{e:#}"),
+                        );
+                    }
+                }
+                return;
+            }
+
             if token.starts_with(USER_KEY_TOKEN_PREFIX) {
                 match import_user_root_key(token, None, cfg_path.as_deref(), true) {
                     Ok(out) => {
-                        let allow = format!(
-                            "allowed_user_pubkeys = [\"{}\"]",
-                            out.user_pubkey_token
-                        );
+                        let status = format_user_cert_status(cfg_path.as_deref());
                         let msg = format!(
                             "Imported user root key (User ID: {})!",
                             out.user_id
                         );
                         ENROLL_WINDOW.with(|cell| {
                             if let Some(ref w) = *cell.borrow() {
-                                w.root_key_edit.setStringValue(&NSString::from_str(&allow));
+                                w.root_key_edit
+                                    .setStringValue(&NSString::from_str(&out.user_pubkey_token));
+                                if let Some(ref s) = status {
+                                    w.cert_edit.setStringValue(&NSString::from_str(s));
+                                }
                                 w.footer_status.setStringValue(&NSString::from_str(&msg));
                             }
                         });
@@ -637,11 +785,15 @@ define_class!(
                             decoded.grant.node_id
                         )
                     };
-                    let allow = format_root_key_allowlist();
+                    let pubkey = format_root_key_allowlist();
+                    let status = format_user_cert_status(cfg_path.as_deref());
                     ENROLL_WINDOW.with(|cell| {
                         if let Some(ref w) = *cell.borrow() {
-                            if let Some(ref a) = allow {
-                                w.root_key_edit.setStringValue(&NSString::from_str(a));
+                            if let Some(ref pk) = pubkey {
+                                w.root_key_edit.setStringValue(&NSString::from_str(pk));
+                            }
+                            if let Some(ref s) = status {
+                                w.cert_edit.setStringValue(&NSString::from_str(s));
                             }
                             w.footer_status.setStringValue(&NSString::from_str(&msg));
                         }
@@ -681,10 +833,19 @@ pub fn show_enroll_window() {
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
 
+        let maybe_ctx = get_tray_context();
+        let cfg_path = maybe_ctx
+            .as_ref()
+            .and_then(|c| c.config_path.clone())
+            .or_else(|| default_client_config_path().ok());
+
         let already_created = ENROLL_WINDOW.with(|cell| {
             if let Some(ref w) = *cell.borrow() {
-                if let Some(allow) = format_root_key_allowlist() {
-                    w.root_key_edit.setStringValue(&NSString::from_str(&allow));
+                if let Some(pubkey) = format_root_key_allowlist() {
+                    w.root_key_edit.setStringValue(&NSString::from_str(&pubkey));
+                }
+                if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                    w.cert_edit.setStringValue(&NSString::from_str(&status));
                 }
                 w.window.makeKeyAndOrderFront(None);
                 true
@@ -697,7 +858,7 @@ pub fn show_enroll_window() {
         }
 
         let win_w: CGFloat = 640.0;
-        let win_h: CGFloat = 540.0;
+        let win_h: CGFloat = 600.0;
         let window = create_centered_window(
             mtm,
             "Sshcast — Initialize / Enroll Workstation",
@@ -706,7 +867,6 @@ pub fn show_enroll_window() {
         );
         let content_view = window.contentView().expect("window has contentView");
         let handler = EnrollWindowHandler::new(mtm);
-        let maybe_ctx = get_tray_context();
 
         add_window_chrome(
             mtm,
@@ -714,7 +874,7 @@ pub fn show_enroll_window() {
             win_w,
             win_h,
             "Initialize or Enroll This Workstation",
-            &[56.0, 304.0],
+            &[56.0, 360.0],
         );
 
         add_section_header(
@@ -731,7 +891,7 @@ pub fn show_enroll_window() {
             mtm,
             &content_view,
             win_h,
-            "User Root Key (for /etc/sshcast/server.toml):",
+            "User Root Public Key (sc_pub_...):",
             24.0,
             94.0,
             400.0,
@@ -771,7 +931,7 @@ pub fn show_enroll_window() {
             mtm,
             &content_view,
             win_h,
-            "Copy Allowlist",
+            "Copy Public Key",
             &handler,
             sel!(onCopyPubkey:),
             false,
@@ -785,9 +945,61 @@ pub fn show_enroll_window() {
             mtm,
             &content_view,
             win_h,
+            "Operator Signed Certificate (sc_cert_...):",
+            24.0,
+            150.0,
+            400.0,
+            18.0,
+        );
+        let cert_initial =
+            format_user_cert_status(cfg_path.as_deref()).unwrap_or_default();
+        let cert_edit = add_edit_field(
+            mtm,
+            &content_view,
+            win_h,
+            &cert_initial,
+            "Paste sc_cert_... token from Operator Console",
+            false,
+            true,
+            24.0,
+            171.0,
+            376.0,
+            24.0,
+        );
+        add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Paste Cert",
+            &handler,
+            sel!(onPasteCert:),
+            false,
+            408.0,
+            169.0,
+            102.0,
+            28.0,
+        );
+        add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Import Cert",
+            &handler,
+            sel!(onImportCert:),
+            false,
+            514.0,
+            169.0,
+            102.0,
+            28.0,
+        );
+
+        add_label(
+            mtm,
+            &content_view,
+            win_h,
             "Workstation Name:",
             24.0,
-            152.0,
+            208.0,
             190.0,
             18.0,
         );
@@ -795,9 +1007,9 @@ pub fn show_enroll_window() {
             mtm,
             &content_view,
             win_h,
-            "Coordinator Backend URL(s) (comma-separated):",
+            "Coordinator Domain or URL(s) (comma-separated):",
             228.0,
-            152.0,
+            208.0,
             388.0,
             18.0,
         );
@@ -812,7 +1024,7 @@ pub fn show_enroll_window() {
             false,
             false,
             24.0,
-            173.0,
+            229.0,
             192.0,
             24.0,
         );
@@ -823,11 +1035,11 @@ pub fn show_enroll_window() {
             &content_view,
             win_h,
             &servers_default,
-            "https://sshcast.example.com",
+            "sshcast.net or https://sshcast.example.com",
             false,
             true,
             228.0,
-            173.0,
+            229.0,
             388.0,
             24.0,
         );
@@ -842,7 +1054,7 @@ pub fn show_enroll_window() {
             sel!(onEnrollPrimary:),
             true,
             24.0,
-            212.0,
+            268.0,
             592.0,
             58.0,
         );
@@ -853,7 +1065,7 @@ pub fn show_enroll_window() {
             win_h,
             "2. Or Initialize Secondary Workstation from an Enrollment Bundle",
             24.0,
-            316.0,
+            372.0,
             592.0,
             22.0,
         );
@@ -863,7 +1075,7 @@ pub fn show_enroll_window() {
             win_h,
             "Client Enrollment Bundle Token (sc1_<base64>):",
             24.0,
-            342.0,
+            398.0,
             400.0,
             18.0,
         );
@@ -876,7 +1088,7 @@ pub fn show_enroll_window() {
             false,
             true,
             24.0,
-            363.0,
+            419.0,
             460.0,
             24.0,
         );
@@ -889,7 +1101,7 @@ pub fn show_enroll_window() {
             sel!(onPasteBundle:),
             false,
             492.0,
-            361.0,
+            417.0,
             124.0,
             28.0,
         );
@@ -904,7 +1116,7 @@ pub fn show_enroll_window() {
             sel!(onInitBundle:),
             false,
             24.0,
-            402.0,
+            458.0,
             592.0,
             58.0,
         );
@@ -915,7 +1127,7 @@ pub fn show_enroll_window() {
             win_h,
             "Ready.",
             24.0,
-            504.0,
+            564.0,
             470.0,
             20.0,
         );
@@ -928,7 +1140,7 @@ pub fn show_enroll_window() {
             sel!(onClose:),
             false,
             516.0,
-            498.0,
+            558.0,
             100.0,
             28.0,
         );
@@ -939,6 +1151,7 @@ pub fn show_enroll_window() {
             *cell.borrow_mut() = Some(EnrollWindowWidgets {
                 window,
                 root_key_edit,
+                cert_edit,
                 node_edit,
                 servers_edit,
                 bundle_edit,
@@ -1000,9 +1213,9 @@ define_class!(
 
         #[unsafe(method(onCopyPubkey:))]
         fn on_copy_pubkey(&self, _sender: Option<&AnyObject>) {
-            let msg = if let Some(allow) = format_root_key_allowlist() {
-                if copy_to_clipboard(&allow) {
-                    "Copied allowed_user_pubkeys line to clipboard!"
+            let msg = if let Some(pubkey) = format_root_key_allowlist() {
+                if copy_to_clipboard(&pubkey) {
+                    "Copied sc_pub_... public key to clipboard!"
                 } else {
                     "Failed to copy to clipboard."
                 }
@@ -1014,6 +1227,45 @@ define_class!(
                     w.footer_status.setStringValue(&NSString::from_str(msg));
                 }
             });
+        }
+
+        #[unsafe(method(onImportCert:))]
+        fn on_import_cert(&self, _sender: Option<&AnyObject>) {
+            let Some(clip) = paste_from_clipboard() else {
+                show_tray_error_dialog(
+                    "Clipboard Empty",
+                    "No sc_cert_ operator certificate token found on clipboard",
+                    "Sign your sc_pub_... key in the Operator Console, copy the sc_cert_... token to clipboard, and click 'Import Cert'.",
+                );
+                return;
+            };
+            let token = clip
+                .split_whitespace()
+                .find(|w| w.starts_with(USER_CERT_PREFIX))
+                .unwrap_or(clip.trim());
+            let cfg_path = get_tray_context()
+                .and_then(|c| c.config_path.clone())
+                .or_else(|| default_client_config_path().ok());
+            match import_user_cert(token, None, cfg_path.as_deref()) {
+                Ok((_, updated_cfg, cert)) => {
+                    if updated_cfg.is_some() {
+                        reload_tray_configuration();
+                    }
+                    let msg = format!("Imported operator certificate for {}!", cert.user_id);
+                    BUNDLE_WINDOW.with(|cell| {
+                        if let Some(ref w) = *cell.borrow() {
+                            w.footer_status.setStringValue(&NSString::from_str(&msg));
+                        }
+                    });
+                }
+                Err(e) => {
+                    show_tray_error_dialog(
+                        "Certificate Import Failed",
+                        "Failed to import sc_cert_ operator certificate from clipboard",
+                        &format!("{e:#}"),
+                    );
+                }
+            }
         }
 
         #[unsafe(method(onRootKeyAction:))]
@@ -1054,17 +1306,14 @@ define_class!(
                     .or_else(|| default_client_config_path().ok());
                 match import_user_root_key(&clip, None, cfg_path.as_deref(), true) {
                     Ok(out) => {
-                        let allow = format!(
-                            "allowed_user_pubkeys = [\"{}\"]",
-                            out.user_pubkey_token
-                        );
                         let msg = format!(
                             "Imported root key (User ID: {}) and saved user_key.toml!",
                             out.user_id
                         );
                         BUNDLE_WINDOW.with(|cell| {
                             if let Some(ref w) = *cell.borrow() {
-                                w.root_pubkey_edit.setStringValue(&NSString::from_str(&allow));
+                                w.root_pubkey_edit
+                                    .setStringValue(&NSString::from_str(&out.user_pubkey_token));
                                 w.root_key_action_btn
                                     .setTitle(&NSString::from_str("Copy Root Key"));
                                 w.footer_status.setStringValue(&NSString::from_str(&msg));
@@ -1290,7 +1539,7 @@ pub fn show_bundle_generator_window() {
             mtm,
             &content_view,
             win_h,
-            "User Root Key (for /etc/sshcast/server.toml):",
+            "User Root Public Key & Operator Certificate:",
             24.0,
             68.0,
             464.0,
@@ -1310,20 +1559,33 @@ pub fn show_bundle_generator_window() {
             true,
             24.0,
             95.0,
-            376.0,
+            270.0,
             24.0,
         );
         add_push_button(
             mtm,
             &content_view,
             win_h,
-            "Copy Allowlist",
+            "Copy Public Key",
             &handler,
             sel!(onCopyPubkey:),
             false,
+            302.0,
+            93.0,
+            100.0,
+            28.0,
+        );
+        add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Import Cert",
+            &handler,
+            sel!(onImportCert:),
+            false,
             408.0,
             93.0,
-            102.0,
+            100.0,
             28.0,
         );
         let root_action_label = if has_root_key {
@@ -1637,19 +1899,17 @@ define_class!(
                 if let Some(ref mut w) = *cell.borrow_mut() {
                     let raw = w.add_edit.stringValue().to_string();
                     let trimmed = raw.trim();
-                    if (!trimmed.starts_with("http://") && !trimmed.starts_with("https://"))
-                        || trimmed.len() <= 8
-                    {
+                    if !is_valid_coordinator_entry(trimmed) {
                         show_tray_error_dialog(
-                            "Invalid Server URL",
-                            "Coordinator URL must start with http:// or https://",
-                            "Example: https://sshcast.stingr.net",
+                            "Invalid Coordinator Entry",
+                            "Enter a domain name (_sshcast DNS TXT) or an http(s):// URL",
+                            "Example: sshcast.net or https://sshcast.stingr.net",
                         );
                         return;
                     }
                     if w.servers.iter().any(|s| s.eq_ignore_ascii_case(trimmed)) {
                         w.footer_status.setStringValue(&NSString::from_str(
-                            "That coordinator URL is already in the list.",
+                            "That coordinator entry is already in the list.",
                         ));
                         return;
                     }
@@ -1659,7 +1919,7 @@ define_class!(
                     if last_idx >= 0 {
                         w.server_popup.selectItemAtIndex(last_idx);
                     }
-                    w.add_edit.setStringValue(&NSString::from_str("https://"));
+                    w.add_edit.setStringValue(&NSString::from_str(""));
                     w.footer_status.setStringValue(&NSString::from_str(&format!(
                         "Added '{trimmed}'. Click Save Backends to apply."
                     )));
@@ -1858,7 +2118,7 @@ pub fn show_backends_window() {
             mtm,
             &content_view,
             win_h,
-            "Add Coordinator Server URL (http:// or https://):",
+            "Add Coordinator Domain (_sshcast TXT) or Server URL (https://):",
             24.0,
             224.0,
             512.0,
@@ -1868,8 +2128,8 @@ pub fn show_backends_window() {
             mtm,
             &content_view,
             win_h,
-            "https://",
-            "https://sshcast.example.com",
+            "",
+            "sshcast.net or https://sshcast.example.com",
             false,
             true,
             24.0,

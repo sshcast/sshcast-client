@@ -463,6 +463,14 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
         };
 
         unsafe {
+            let cert_str = match &cfg.grant.user_cert {
+                Some(cert) => {
+                    let op_hex = hex::encode(&cert.operator_pubkey);
+                    let short_op = &op_hex[..12.min(op_hex.len())];
+                    format!("Certified (sc_op_pub_{short_op}...)")
+                }
+                None => "None (static public key)".to_string(),
+            };
             let title_w = to_wide("Sshcast Workstation Status");
             let instr_w = to_wide(&format!(
                 "Workstation '{}' ({}/{total} coordinators connected)",
@@ -470,11 +478,13 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
             ));
             let content_w = to_wide(&format!(
                 "User ID:             {}\n\
+                 Operator Cert:       {}\n\
                  Force Active Mode:   {}\n\
                  Config Directory:    {}\n\n\
                  Coordinators:\n  • {}\n\n\
                  Exported Local SSH Keys ({}):\n{}",
                 cfg.grant.user_id,
+                cert_str,
                 if force_active {
                     "Enabled"
                 } else {

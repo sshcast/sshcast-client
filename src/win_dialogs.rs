@@ -3,6 +3,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 
+use sshcast_proto::bundle::USER_CERT_PREFIX;
 use sshcast_proto::v1::NodeRole;
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, S_OK, WPARAM};
@@ -35,9 +36,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
 use crate::enroll::{
     decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
-    import_user_root_key, load_user_signing_key, mint_enrollment_bundle, run_keygen,
-    write_client_config_and_optional_root_key, write_client_config_from_bundle,
-    USER_KEY_TOKEN_PREFIX,
+    import_user_cert, import_user_root_key, load_user_cert, load_user_signing_key,
+    mint_enrollment_bundle, run_keygen, write_client_config_and_optional_root_key,
+    write_client_config_from_bundle, USER_KEY_TOKEN_PREFIX,
 };
 use crate::win_native::{show_tray_error_dialog, TraySharedContext};
 
@@ -96,12 +97,16 @@ const ID_ENROLL_BTN_PASTE_BUNDLE: i32 = 2007;
 const ID_ENROLL_BUNDLE_EDIT: i32 = 2008;
 const ID_ENROLL_BTN_INIT_BUNDLE: i32 = 2009;
 const ID_ENROLL_BTN_CLOSE: i32 = 2011;
+const ID_ENROLL_CERT_EDIT: i32 = 2012;
+const ID_ENROLL_BTN_PASTE_CERT: i32 = 2013;
+const ID_ENROLL_BTN_IMPORT_CERT: i32 = 2014;
 
 // Control IDs for Bundle Generator Window
 const ID_BUNDLE_ROOT_PUBKEY_EDIT: i32 = 1952;
 const ID_BUNDLE_BTN_KEYGEN: i32 = 3002;
 const ID_BUNDLE_BTN_COPY_PUBKEY: i32 = 3003;
 const ID_BUNDLE_BTN_ROOT_KEY_ACTION: i32 = 3016;
+const ID_BUNDLE_BTN_IMPORT_CERT: i32 = 3017;
 const ID_BUNDLE_RADIO_RELAY: i32 = 3004;
 const ID_BUNDLE_RADIO_CLIENT: i32 = 3005;
 const ID_BUNDLE_NODE_EDIT: i32 = 3006;
@@ -804,13 +809,25 @@ fn parse_servers_input(raw: &str) -> Vec<String> {
 
 fn format_root_key_allowlist() -> Option<String> {
     if let Ok((_, uk)) = UserKeyFile::load(None) {
-        Some(format!(
-            "allowed_user_pubkeys = [\"{}\"]",
-            uk.user_pubkey_token
-        ))
+        Some(uk.user_pubkey_token)
     } else {
         None
     }
+}
+
+fn format_user_cert_status(cfg_path: Option<&std::path::Path>) -> Option<String> {
+    let cert = load_user_cert(None, cfg_path)?;
+    let op_hex = hex::encode(&cert.operator_pubkey);
+    let short_op = &op_hex[..12.min(op_hex.len())];
+    Some(format!(
+        "Certified by sc_op_pub_{short_op}... (User: {})",
+        cert.user_id
+    ))
+}
+
+fn is_valid_coordinator_entry(trimmed: &str) -> bool {
+    ((trimmed.starts_with("http://") || trimmed.starts_with("https://")) && trimmed.len() > 8)
+        || sshcast_proto::dns::is_dns_discovery_entry(trimmed).is_some()
 }
 
 fn default_workstation_node_name(ctx: &TraySharedContext) -> String {
@@ -834,7 +851,7 @@ fn default_servers_csv(ctx: &TraySharedContext) -> String {
 }
 
 // ============================================================================
-// 1. INITIALIZE / ENROLL WORKSTATION WINDOW (640 x 540 Client Area)
+// 1. INITIALIZE / ENROLL WORKSTATION WINDOW (640 x 600 Client Area)
 // ============================================================================
 
 unsafe extern "system" fn enroll_wnd_proc(
@@ -846,7 +863,7 @@ unsafe extern "system" fn enroll_wnd_proc(
     match msg {
         WM_ERASEBKGND => 1,
         WM_PAINT => {
-            paint_taskdialog_frame(hwnd, &[56, 304]);
+            paint_taskdialog_frame(hwnd, &[56, 360]);
             0
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => handle_ctlcolor(wparam, lparam),
@@ -854,6 +871,10 @@ unsafe extern "system" fn enroll_wnd_proc(
             let dpi = get_dpi_scale();
             let assets = ensure_theme_assets(dpi);
             let maybe_ctx = crate::win_native::get_tray_context();
+            let cfg_path = maybe_ctx
+                .as_ref()
+                .and_then(|c| c.config_path.clone())
+                .or_else(|| default_client_config_path().ok());
 
             // Main TaskDialog-style Header
             create_label(
@@ -882,7 +903,7 @@ unsafe extern "system" fn enroll_wnd_proc(
             );
             create_label(
                 hwnd,
-                "User Root Key (for /etc/sshcast/server.toml):",
+                "User Root Public Key (sc_pub_...):",
                 24,
                 96,
                 400,
@@ -920,7 +941,7 @@ unsafe extern "system" fn enroll_wnd_proc(
             );
             create_button(
                 hwnd,
-                "Copy Allowlist",
+                "Copy Public Key",
                 518,
                 115,
                 98,
@@ -932,9 +953,58 @@ unsafe extern "system" fn enroll_wnd_proc(
 
             create_label(
                 hwnd,
+                "Operator Signed Certificate (sc_cert_...):",
+                24,
+                152,
+                400,
+                18,
+                0,
+                dpi,
+                assets.font_ui,
+            );
+            let cert_initial =
+                format_user_cert_status(cfg_path.as_deref()).unwrap_or_default();
+            create_edit(
+                hwnd,
+                &cert_initial,
+                "Paste sc_cert_... token from Operator Console",
+                false,
+                24,
+                172,
+                384,
+                26,
+                ID_ENROLL_CERT_EDIT,
+                dpi,
+                assets.font_mono,
+            );
+            create_button(
+                hwnd,
+                "Paste Cert",
+                416,
+                171,
+                96,
+                28,
+                ID_ENROLL_BTN_PASTE_CERT,
+                dpi,
+                assets.font_ui,
+            );
+            create_button(
+                hwnd,
+                "Import Cert",
+                518,
+                171,
+                98,
+                28,
+                ID_ENROLL_BTN_IMPORT_CERT,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_label(
+                hwnd,
                 "Workstation Name:",
                 24,
-                154,
+                210,
                 190,
                 18,
                 0,
@@ -943,9 +1013,9 @@ unsafe extern "system" fn enroll_wnd_proc(
             );
             create_label(
                 hwnd,
-                "Coordinator Backend URL(s) (comma-separated):",
+                "Coordinator Domain or URL(s) (comma-separated):",
                 228,
-                154,
+                210,
                 388,
                 18,
                 0,
@@ -963,7 +1033,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                 "e.g. bandura",
                 false,
                 24,
-                174,
+                230,
                 192,
                 26,
                 ID_ENROLL_NODE_EDIT,
@@ -978,10 +1048,10 @@ unsafe extern "system" fn enroll_wnd_proc(
             create_edit(
                 hwnd,
                 &servers_default,
-                "https://sshcast.example.com",
+                "sshcast.net or https://sshcast.example.com",
                 false,
                 228,
-                174,
+                230,
                 388,
                 26,
                 ID_ENROLL_SERVERS_EDIT,
@@ -995,7 +1065,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                 "Mint a signed client grant using your local root key and save ~/.config/sshcast/client.toml",
                 true,
                 24,
-                214,
+                270,
                 592,
                 58,
                 ID_ENROLL_BTN_ENROLL_PRIMARY,
@@ -1008,7 +1078,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                 hwnd,
                 "2. Or Initialize Secondary Workstation from an Enrollment Bundle",
                 24,
-                318,
+                374,
                 592,
                 22,
                 ID_STYLE_SECTION_HEADER_2,
@@ -1019,7 +1089,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                 hwnd,
                 "Client Enrollment Bundle Token (sc1_<base64>):",
                 24,
-                344,
+                400,
                 400,
                 18,
                 0,
@@ -1032,7 +1102,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                 "Paste sc1_... client bundle token here",
                 false,
                 24,
-                364,
+                420,
                 464,
                 26,
                 ID_ENROLL_BUNDLE_EDIT,
@@ -1043,7 +1113,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                 hwnd,
                 "Paste Clipboard",
                 496,
-                363,
+                419,
                 120,
                 28,
                 ID_ENROLL_BTN_PASTE_BUNDLE,
@@ -1057,7 +1127,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                 "Verify the pasted sc1_ token, write ~/.config/sshcast/client.toml, and connect immediately",
                 false,
                 24,
-                404,
+                460,
                 592,
                 58,
                 ID_ENROLL_BTN_INIT_BUNDLE,
@@ -1065,12 +1135,12 @@ unsafe extern "system" fn enroll_wnd_proc(
                 assets.font_ui,
             );
 
-            // Footer Bar (y = 486 .. 540)
+            // Footer Bar (y = 546 .. 600)
             create_label(
                 hwnd,
                 "Ready.",
                 24,
-                503,
+                563,
                 470,
                 20,
                 ID_STYLE_FOOTER_STATUS,
@@ -1081,7 +1151,7 @@ unsafe extern "system" fn enroll_wnd_proc(
                 hwnd,
                 "Close",
                 516,
-                498,
+                558,
                 100,
                 30,
                 ID_ENROLL_BTN_CLOSE,
@@ -1102,18 +1172,19 @@ unsafe extern "system" fn enroll_wnd_proc(
                                 hwnd,
                                 "Overwrite User Root Key?",
                                 "A user root key (user_key.toml) already exists.",
-                                "Generating a new user root key will invalidate previous allowlist entries unless you update server.toml. Overwrite user_key.toml?",
+                                "Generating a new user root key will invalidate previous certificates and allowlist entries. Overwrite user_key.toml?",
                             )
                         {
                             return 0;
                         }
                         match run_keygen(None, true) {
                             Ok(out) => {
-                                let allow = format!(
-                                    "allowed_user_pubkeys = [\"{}\"]",
-                                    out.user_pubkey_token
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_ENROLL_ROOT_KEY_EDIT,
+                                    &out.user_pubkey_token,
                                 );
-                                set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &allow);
+                                set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, "");
                                 set_dlg_item_string(
                                     hwnd,
                                     ID_STYLE_FOOTER_STATUS,
@@ -1130,12 +1201,12 @@ unsafe extern "system" fn enroll_wnd_proc(
                         }
                     }
                     ID_ENROLL_BTN_COPY_PUBKEY => {
-                        if let Some(allow) = format_root_key_allowlist() {
-                            if copy_to_clipboard(hwnd, &allow) {
+                        if let Some(pubkey) = format_root_key_allowlist() {
+                            if copy_to_clipboard(hwnd, &pubkey) {
                                 set_dlg_item_string(
                                     hwnd,
                                     ID_STYLE_FOOTER_STATUS,
-                                    "Copied allowed_user_pubkeys line to clipboard!",
+                                    "Copied sc_pub_... public key to clipboard!",
                                 );
                             }
                         } else {
@@ -1144,6 +1215,73 @@ unsafe extern "system" fn enroll_wnd_proc(
                                 ID_STYLE_FOOTER_STATUS,
                                 "Generate a root key first before copying.",
                             );
+                        }
+                    }
+                    ID_ENROLL_BTN_PASTE_CERT => {
+                        if let Some(clip) = paste_from_clipboard(hwnd) {
+                            let token = clip
+                                .split_whitespace()
+                                .find(|w| w.starts_with(USER_CERT_PREFIX))
+                                .unwrap_or(clip.trim());
+                            set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, token);
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "Pasted certificate token from clipboard. Click 'Import Cert' to apply.",
+                            );
+                        }
+                    }
+                    ID_ENROLL_BTN_IMPORT_CERT => {
+                        let raw_edit = get_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT);
+                        let mut token = raw_edit
+                            .split_whitespace()
+                            .find(|w| w.starts_with(USER_CERT_PREFIX))
+                            .unwrap_or("")
+                            .to_string();
+                        if token.is_empty() {
+                            if let Some(clip) = paste_from_clipboard(hwnd) {
+                                if let Some(found) =
+                                    clip.split_whitespace().find(|w| w.starts_with(USER_CERT_PREFIX))
+                                {
+                                    token = found.to_string();
+                                }
+                            }
+                        }
+                        if token.is_empty() {
+                            show_tray_error_dialog(
+                                "No Certificate Token Found",
+                                "Please paste an sc_cert_<base64> token first",
+                                "Sign your sc_pub_... key in the Operator Console, copy the sc_cert_... token, and click 'Paste Cert' or 'Import Cert'.",
+                            );
+                            return 0;
+                        }
+                        let cfg_path = crate::win_native::get_tray_context()
+                            .and_then(|c| c.config_path.clone())
+                            .or_else(|| default_client_config_path().ok());
+                        match import_user_cert(&token, None, cfg_path.as_deref()) {
+                            Ok((_, updated_cfg, cert)) => {
+                                if updated_cfg.is_some() {
+                                    crate::win_native::reload_tray_configuration();
+                                }
+                                if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                                    set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, &status);
+                                }
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    &format!(
+                                        "Imported operator certificate for {}!",
+                                        cert.user_id
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                show_tray_error_dialog(
+                                    "Certificate Import Failed",
+                                    "Failed to import sc_cert_ operator certificate",
+                                    &format!("{e:#}"),
+                                );
+                            }
                         }
                     }
                     ID_ENROLL_BTN_ENROLL_PRIMARY => {
@@ -1161,8 +1299,8 @@ unsafe extern "system" fn enroll_wnd_proc(
                         if servers.is_empty() {
                             show_tray_error_dialog(
                                 "Validation Error",
-                                "At least one Coordinator Server URL is required",
-                                "Please enter your coordinator URL (e.g. 'https://sshcast.stingr.net').",
+                                "At least one Coordinator Domain or URL is required",
+                                "Please enter your coordinator domain (e.g. 'sshcast.net') or URL (e.g. 'https://sshcast.stingr.net').",
                             );
                             return 0;
                         }
@@ -1176,14 +1314,33 @@ unsafe extern "system" fn enroll_wnd_proc(
                                 );
                                 return 0;
                             }
-                            if let Some(allow) = format_root_key_allowlist() {
-                                set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &allow);
+                            if let Some(pubkey) = format_root_key_allowlist() {
+                                set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &pubkey);
                             }
                         }
 
                         let cfg_path = crate::win_native::get_tray_context()
                             .and_then(|c| c.config_path.clone())
                             .or_else(|| default_client_config_path().ok());
+
+                        // If the user pasted an sc_cert_ token into the cert box without clicking Import Cert yet, import it now
+                        let raw_cert_edit = get_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT);
+                        if let Some(cert_tok) = raw_cert_edit
+                            .split_whitespace()
+                            .find(|w| w.starts_with(USER_CERT_PREFIX))
+                        {
+                            if let Err(e) = import_user_cert(cert_tok, None, cfg_path.as_deref()) {
+                                show_tray_error_dialog(
+                                    "Certificate Import Failed",
+                                    "Failed to import pasted sc_cert_ operator certificate",
+                                    &format!("{e:#}"),
+                                );
+                                return 0;
+                            }
+                            if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                                set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, &status);
+                            }
+                        }
 
                         if let Some(ref p) = cfg_path {
                             if p.exists()
@@ -1240,7 +1397,9 @@ unsafe extern "system" fn enroll_wnd_proc(
                             let token = clip
                                 .split_whitespace()
                                 .find(|w| {
-                                    w.starts_with("sc1_") || w.starts_with(USER_KEY_TOKEN_PREFIX)
+                                    w.starts_with("sc1_")
+                                        || w.starts_with(USER_KEY_TOKEN_PREFIX)
+                                        || w.starts_with(USER_CERT_PREFIX)
                                 })
                                 .unwrap_or(clip.trim());
                             set_dlg_item_string(hwnd, ID_ENROLL_BUNDLE_EDIT, token);
@@ -1256,14 +1415,16 @@ unsafe extern "system" fn enroll_wnd_proc(
                         let token = raw_input
                             .split_whitespace()
                             .find(|w| {
-                                w.starts_with("sc1_") || w.starts_with(USER_KEY_TOKEN_PREFIX)
+                                w.starts_with("sc1_")
+                                    || w.starts_with(USER_KEY_TOKEN_PREFIX)
+                                    || w.starts_with(USER_CERT_PREFIX)
                             })
                             .unwrap_or(raw_input.trim());
                         if token.is_empty() {
                             show_tray_error_dialog(
                                 "Validation Error",
                                 "Enrollment Bundle is empty",
-                                "Please paste an sc1_<base64> client enrollment bundle (or scu1_<base64> user root key) first.",
+                                "Please paste an sc1_<base64> client enrollment bundle (or scu1_ root key / sc_cert_ certificate) first.",
                             );
                             return 0;
                         }
@@ -1272,14 +1433,46 @@ unsafe extern "system" fn enroll_wnd_proc(
                             .and_then(|c| c.config_path.clone())
                             .or_else(|| default_client_config_path().ok());
 
+                        if token.starts_with(USER_CERT_PREFIX) {
+                            match import_user_cert(token, None, cfg_path.as_deref()) {
+                                Ok((_, updated_cfg, cert)) => {
+                                    if updated_cfg.is_some() {
+                                        crate::win_native::reload_tray_configuration();
+                                    }
+                                    if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                                        set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, &status);
+                                    }
+                                    set_dlg_item_string(
+                                        hwnd,
+                                        ID_STYLE_FOOTER_STATUS,
+                                        &format!(
+                                            "Imported operator certificate for {}!",
+                                            cert.user_id
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    show_tray_error_dialog(
+                                        "Certificate Import Failed",
+                                        "Failed to import sc_cert_ operator certificate",
+                                        &format!("{e:#}"),
+                                    );
+                                }
+                            }
+                            return 0;
+                        }
+
                         if token.starts_with(USER_KEY_TOKEN_PREFIX) {
                             match import_user_root_key(token, None, cfg_path.as_deref(), true) {
                                 Ok(out) => {
-                                    let allow = format!(
-                                        "allowed_user_pubkeys = [\"{}\"]",
-                                        out.user_pubkey_token
+                                    set_dlg_item_string(
+                                        hwnd,
+                                        ID_ENROLL_ROOT_KEY_EDIT,
+                                        &out.user_pubkey_token,
                                     );
-                                    set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &allow);
+                                    if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                                        set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, &status);
+                                    }
                                     set_dlg_item_string(
                                         hwnd,
                                         ID_STYLE_FOOTER_STATUS,
@@ -1337,8 +1530,11 @@ unsafe extern "system" fn enroll_wnd_proc(
                             true,
                         ) {
                             Ok((_cfg_path, maybe_key_path)) => {
-                                if let Some(allow) = format_root_key_allowlist() {
-                                    set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &allow);
+                                if let Some(pubkey) = format_root_key_allowlist() {
+                                    set_dlg_item_string(hwnd, ID_ENROLL_ROOT_KEY_EDIT, &pubkey);
+                                }
+                                if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                                    set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, &status);
                                 }
                                 crate::win_native::reload_tray_configuration();
                                 let msg = if maybe_key_path.is_some() {
@@ -1392,8 +1588,14 @@ pub unsafe fn show_enroll_window() {
         let g = DIALOG_RES.lock().unwrap();
         let existing = g.enroll_hwnd as HWND;
         if !existing.is_null() && IsWindow(existing) != 0 {
-            if let Some(allow) = format_root_key_allowlist() {
-                set_dlg_item_string(existing, ID_ENROLL_ROOT_KEY_EDIT, &allow);
+            if let Some(pubkey) = format_root_key_allowlist() {
+                set_dlg_item_string(existing, ID_ENROLL_ROOT_KEY_EDIT, &pubkey);
+            }
+            let cfg_path = crate::win_native::get_tray_context()
+                .and_then(|c| c.config_path.clone())
+                .or_else(|| default_client_config_path().ok());
+            if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                set_dlg_item_string(existing, ID_ENROLL_CERT_EDIT, &status);
             }
             ShowWindow(existing, SW_RESTORE);
             SetForegroundWindow(existing);
@@ -1421,7 +1623,7 @@ pub unsafe fn show_enroll_window() {
     };
     RegisterClassW(&wc);
 
-    let hwnd = create_centered_dialog_window(&class_name, &title, 640, 540, dpi);
+    let hwnd = create_centered_dialog_window(&class_name, &title, 640, 600, dpi);
     if !hwnd.is_null() {
         DIALOG_RES.lock().unwrap().enroll_hwnd = hwnd as isize;
         ShowWindow(hwnd, SW_SHOW);
@@ -1464,10 +1666,10 @@ unsafe extern "system" fn bundle_wnd_proc(
                 assets.font_title,
             );
 
-            // Section 1: Root Key Allowlist
+            // Section 1: Root Public Key & Certificate
             create_label(
                 hwnd,
-                "User Root Key (for /etc/sshcast/server.toml):",
+                "User Root Public Key & Operator Certificate:",
                 24,
                 70,
                 464,
@@ -1487,7 +1689,7 @@ unsafe extern "system" fn bundle_wnd_proc(
                 true,
                 24,
                 96,
-                384,
+                282,
                 26,
                 ID_BUNDLE_ROOT_PUBKEY_EDIT,
                 dpi,
@@ -1495,12 +1697,23 @@ unsafe extern "system" fn bundle_wnd_proc(
             );
             create_button(
                 hwnd,
-                "Copy Allowlist",
-                416,
+                "Copy Public Key",
+                314,
                 95,
                 96,
                 28,
                 ID_BUNDLE_BTN_COPY_PUBKEY,
+                dpi,
+                assets.font_ui,
+            );
+            create_button(
+                hwnd,
+                "Import Cert",
+                416,
+                95,
+                96,
+                28,
+                ID_BUNDLE_BTN_IMPORT_CERT,
                 dpi,
                 assets.font_ui,
             );
@@ -1765,18 +1978,18 @@ unsafe extern "system" fn bundle_wnd_proc(
                                 hwnd,
                                 "Overwrite User Root Key?",
                                 "A user root key (user_key.toml) already exists.",
-                                "Generating a new user root key will invalidate previous allowlist entries unless you update server.toml. Overwrite user_key.toml?",
+                                "Generating a new user root key will invalidate previous certificates and allowlist entries. Overwrite user_key.toml?",
                             )
                         {
                             return 0;
                         }
                         match run_keygen(None, true) {
                             Ok(out) => {
-                                let allow = format!(
-                                    "allowed_user_pubkeys = [\"{}\"]",
-                                    out.user_pubkey_token
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_BUNDLE_ROOT_PUBKEY_EDIT,
+                                    &out.user_pubkey_token,
                                 );
-                                set_dlg_item_string(hwnd, ID_BUNDLE_ROOT_PUBKEY_EDIT, &allow);
                                 set_dlg_item_string(
                                     hwnd,
                                     ID_STYLE_FOOTER_STATUS,
@@ -1793,12 +2006,12 @@ unsafe extern "system" fn bundle_wnd_proc(
                         }
                     }
                     ID_BUNDLE_BTN_COPY_PUBKEY => {
-                        if let Some(allow) = format_root_key_allowlist() {
-                            if copy_to_clipboard(hwnd, &allow) {
+                        if let Some(pubkey) = format_root_key_allowlist() {
+                            if copy_to_clipboard(hwnd, &pubkey) {
                                 set_dlg_item_string(
                                     hwnd,
                                     ID_STYLE_FOOTER_STATUS,
-                                    "Copied allowed_user_pubkeys line to clipboard!",
+                                    "Copied sc_pub_... public key to clipboard!",
                                 );
                             }
                         } else {
@@ -1807,6 +2020,45 @@ unsafe extern "system" fn bundle_wnd_proc(
                                 ID_STYLE_FOOTER_STATUS,
                                 "Import or generate a root key first before copying.",
                             );
+                        }
+                    }
+                    ID_BUNDLE_BTN_IMPORT_CERT => {
+                        let Some(clip) = paste_from_clipboard(hwnd) else {
+                            show_tray_error_dialog(
+                                "Clipboard Empty",
+                                "No sc_cert_ operator certificate token found on clipboard",
+                                "Sign your sc_pub_... key in the Operator Console, copy the sc_cert_... token to clipboard, and click 'Import Cert'.",
+                            );
+                            return 0;
+                        };
+                        let token = clip
+                            .split_whitespace()
+                            .find(|w| w.starts_with(USER_CERT_PREFIX))
+                            .unwrap_or(clip.trim());
+                        let cfg_path = crate::win_native::get_tray_context()
+                            .and_then(|c| c.config_path.clone())
+                            .or_else(|| default_client_config_path().ok());
+                        match import_user_cert(token, None, cfg_path.as_deref()) {
+                            Ok((_, updated_cfg, cert)) => {
+                                if updated_cfg.is_some() {
+                                    crate::win_native::reload_tray_configuration();
+                                }
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    &format!(
+                                        "Imported operator certificate for {}!",
+                                        cert.user_id
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                show_tray_error_dialog(
+                                    "Certificate Import Failed",
+                                    "Failed to import sc_cert_ operator certificate from clipboard",
+                                    &format!("{e:#}"),
+                                );
+                            }
                         }
                     }
                     ID_BUNDLE_BTN_ROOT_KEY_ACTION => {
@@ -1843,11 +2095,11 @@ unsafe extern "system" fn bundle_wnd_proc(
                                 .or_else(|| default_client_config_path().ok());
                             match import_user_root_key(&clip, None, cfg_path.as_deref(), true) {
                                 Ok(out) => {
-                                    let allow = format!(
-                                        "allowed_user_pubkeys = [\"{}\"]",
-                                        out.user_pubkey_token
+                                    set_dlg_item_string(
+                                        hwnd,
+                                        ID_BUNDLE_ROOT_PUBKEY_EDIT,
+                                        &out.user_pubkey_token,
                                     );
-                                    set_dlg_item_string(hwnd, ID_BUNDLE_ROOT_PUBKEY_EDIT, &allow);
                                     set_dlg_item_string(
                                         hwnd,
                                         ID_BUNDLE_BTN_ROOT_KEY_ACTION,
@@ -2170,7 +2422,7 @@ unsafe extern "system" fn backends_wnd_proc(
 
             create_label(
                 hwnd,
-                "Add Coordinator Server URL (http:// or https://):",
+                "Add Coordinator Domain (_sshcast TXT) or Server URL (https://):",
                 24,
                 226,
                 512,
@@ -2181,8 +2433,8 @@ unsafe extern "system" fn backends_wnd_proc(
             );
             create_edit(
                 hwnd,
-                "https://",
-                "https://sshcast.example.com",
+                "",
+                "sshcast.net or https://sshcast.example.com",
                 false,
                 24,
                 246,
@@ -2252,13 +2504,11 @@ unsafe extern "system" fn backends_wnd_proc(
                     ID_BACKENDS_BTN_ADD => {
                         let raw = get_dlg_item_string(hwnd, ID_BACKENDS_ADD_EDIT);
                         let trimmed = raw.trim();
-                        if !trimmed.starts_with("http://") && !trimmed.starts_with("https://")
-                            || trimmed.len() <= 8
-                        {
+                        if !is_valid_coordinator_entry(trimmed) {
                             show_tray_error_dialog(
-                                "Invalid Server URL",
-                                "Coordinator URL must start with http:// or https://",
-                                "Example: https://sshcast.stingr.net",
+                                "Invalid Coordinator Entry",
+                                "Enter a domain name (_sshcast DNS TXT) or an http(s):// URL",
+                                "Example: sshcast.net or https://sshcast.stingr.net",
                             );
                             return 0;
                         }
@@ -2267,14 +2517,14 @@ unsafe extern "system" fn backends_wnd_proc(
                             set_dlg_item_string(
                                 hwnd,
                                 ID_STYLE_FOOTER_STATUS,
-                                "That coordinator URL is already in the list.",
+                                "That coordinator entry is already in the list.",
                             );
                             return 0;
                         }
                         let w = to_wide(trimmed);
                         let idx = SendMessageW(lb, LB_ADDSTRING, 0, w.as_ptr() as isize);
                         SendMessageW(lb, LB_SETCURSEL, idx as usize, 0);
-                        set_dlg_item_string(hwnd, ID_BACKENDS_ADD_EDIT, "https://");
+                        set_dlg_item_string(hwnd, ID_BACKENDS_ADD_EDIT, "");
                         set_dlg_item_string(
                             hwnd,
                             ID_STYLE_FOOTER_STATUS,
