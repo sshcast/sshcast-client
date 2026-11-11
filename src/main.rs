@@ -490,14 +490,9 @@ async fn main() -> Result<()> {
                     conn
                 }
             };
-            let keys = connector.list_filtered_keys().await?;
+            let keys = connector.list_filtered_keys_with_source_labels().await?;
             println!("Exported local SSH keys ({}):", keys.len());
-            for k in keys {
-                let source = if connector.is_loaded_key(&k.key_blob) {
-                    "built-in"
-                } else {
-                    "os-agent"
-                };
+            for (k, _, source) in keys {
                 println!(
                     "  - [{source}] {} {} ({})",
                     k.key_type, k.fingerprint_sha256, k.comment

@@ -21,5 +21,7 @@ pub mod wasm;
 pub mod win_dialogs;
 #[cfg(target_os = "windows")]
 pub mod win_native;
+#[cfg(target_os = "windows")]
+pub mod win_pageant;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod zellij_proxy;

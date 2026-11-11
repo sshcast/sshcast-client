@@ -21,6 +21,40 @@ struct AgentConnectorOptions {
     socket_override: Option<String>,
     filter: KeyFilterConfig,
     disable_os_agent: bool,
+    #[cfg(all(windows, test))]
+    test_pageant_pipe: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalKeySource {
+    OsAgent,
+    Pageant,
+    OsAgentAndPageant,
+}
+
+impl ExternalKeySource {
+    pub fn ui_badge(self) -> &'static str {
+        match self {
+            Self::OsAgent => "OS Agent",
+            Self::Pageant => "Pageant",
+            Self::OsAgentAndPageant => "OS Agent + Pageant",
+        }
+    }
+
+    pub fn cli_id(self) -> &'static str {
+        match self {
+            Self::OsAgent => "os-agent",
+            Self::Pageant => "pageant",
+            Self::OsAgentAndPageant => "os-agent+pageant",
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowsAgentBackend {
+    NamedPipe(String),
+    Pageant(Option<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -62,9 +96,19 @@ impl LocalAgentConnector {
                 socket_override,
                 filter,
                 disable_os_agent,
+                #[cfg(all(windows, test))]
+                test_pageant_pipe: None,
             })),
             loaded_keys: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    #[cfg(all(windows, test))]
+    fn set_test_pageant_pipe(&self, pipe: Option<String>) {
+        self.options
+            .write()
+            .expect("options lock poisoned")
+            .test_pageant_pipe = pipe;
     }
 
     /// Constructs a `LocalAgentConnector` from `ClientConfig`, loading any configured
@@ -361,7 +405,105 @@ impl LocalAgentConnector {
         }
     }
 
-    /// Queries the built-in key ring and (unless disabled) the local OS SSH agent,
+    #[cfg(windows)]
+    fn resolve_windows_backends(&self) -> Vec<WindowsAgentBackend> {
+        const DEFAULT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+
+        let (socket_override, pageant_pipe_override) = {
+            let opts = self.options.read().expect("options lock poisoned");
+            #[cfg(test)]
+            let pipe_opt = opts.test_pageant_pipe.clone();
+            #[cfg(not(test))]
+            let pipe_opt: Option<String> = None;
+            (opts.socket_override.clone(), pipe_opt)
+        };
+
+        let classify_pipe = |raw_pipe: &str| -> WindowsAgentBackend {
+            let resolved = crate::win_pageant::normalize_pipe_or_openssh_config(raw_pipe);
+            if resolved
+                .to_ascii_lowercase()
+                .starts_with(r"\\.\pipe\pageant.")
+            {
+                WindowsAgentBackend::Pageant(Some(resolved))
+            } else {
+                WindowsAgentBackend::NamedPipe(resolved)
+            }
+        };
+
+        let default_pipe_backend = || -> Option<WindowsAgentBackend> {
+            if let Ok(env_sock) = std::env::var("SSH_AUTH_SOCK") {
+                let trimmed = env_sock.trim();
+                if !trimmed.is_empty() {
+                    if trimmed.eq_ignore_ascii_case("pageant") {
+                        return None;
+                    }
+                    let classified = classify_pipe(trimmed);
+                    if matches!(classified, WindowsAgentBackend::Pageant(_)) {
+                        return Some(classified);
+                    }
+                    return Some(classified);
+                }
+            }
+            Some(WindowsAgentBackend::NamedPipe(DEFAULT_PIPE.to_string()))
+        };
+
+        if let Some(raw) = socket_override {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("auto") {
+                if trimmed.eq_ignore_ascii_case("pageant") {
+                    return vec![WindowsAgentBackend::Pageant(pageant_pipe_override)];
+                }
+                if trimmed.eq_ignore_ascii_case(DEFAULT_PIPE) {
+                    return vec![
+                        WindowsAgentBackend::NamedPipe(DEFAULT_PIPE.to_string()),
+                        WindowsAgentBackend::Pageant(pageant_pipe_override),
+                    ];
+                }
+                if trimmed.contains(';') {
+                    let mut list = Vec::new();
+                    for part in trimmed.split(';') {
+                        let p = part.trim();
+                        if p.is_empty() {
+                            continue;
+                        }
+                        let backend = if p.eq_ignore_ascii_case("pageant") {
+                            WindowsAgentBackend::Pageant(pageant_pipe_override.clone())
+                        } else {
+                            classify_pipe(p)
+                        };
+                        if !list.contains(&backend) {
+                            list.push(backend);
+                        }
+                    }
+                    if !list.is_empty() {
+                        return list;
+                    }
+                }
+                let mut list = vec![classify_pipe(trimmed)];
+                if pageant_pipe_override.is_some()
+                    && !list
+                        .iter()
+                        .any(|b| matches!(b, WindowsAgentBackend::Pageant(_)))
+                {
+                    list.push(WindowsAgentBackend::Pageant(pageant_pipe_override));
+                }
+                return list;
+            }
+        }
+
+        let mut backends = Vec::with_capacity(2);
+        if let Some(pipe) = default_pipe_backend() {
+            let already_pageant = matches!(pipe, WindowsAgentBackend::Pageant(_));
+            backends.push(pipe);
+            if already_pageant {
+                return backends;
+            }
+        }
+        backends.push(WindowsAgentBackend::Pageant(pageant_pipe_override));
+        backends
+    }
+
+    /// Queries the built-in key ring and (unless disabled) external SSH agents,
     /// returning all keys matching the configured `KeyFilterConfig`.
     pub async fn list_filtered_keys(&self) -> Result<Vec<PublicKey>> {
         let all_keys = self.list_all_keys().await?;
@@ -369,30 +511,137 @@ impl LocalAgentConnector {
         Ok(filter_keys(all_keys, &filter))
     }
 
-    /// Queries only the external OS SSH agent (`SSH2_AGENTC_REQUEST_IDENTITIES`).
-    pub async fn list_os_agent_keys(&self) -> Result<Vec<PublicKey>> {
+    /// Queries all filtered keys along with `(ui_badge, cli_id)` source labels
+    /// (`"Built-in"` / `"OS Agent"` / `"Pageant"` / `"OS Agent + Pageant"`).
+    pub async fn list_filtered_keys_with_source_labels(
+        &self,
+    ) -> Result<Vec<(PublicKey, &'static str, &'static str)>> {
+        let filter = self.filter_config();
+        let mut out: Vec<(PublicKey, &'static str, &'static str)> = self
+            .list_loaded_keys()
+            .into_iter()
+            .map(|pk| (pk, "Built-in", "built-in"))
+            .collect();
+
+        if !self.is_os_agent_disabled() {
+            match self.list_os_agent_keys_with_sources().await {
+                Ok(ext_keys) => {
+                    for (pk, src) in ext_keys {
+                        if !out.iter().any(|(existing, _, _)| existing.key_blob == pk.key_blob) {
+                            out.push((pk, src.ui_badge(), src.cli_id()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if out.is_empty() {
+                        return Err(e);
+                    }
+                    tracing::debug!(
+                        "External SSH agent unavailable ({:#}); using {} built-in SSH key(s)",
+                        e,
+                        out.len()
+                    );
+                }
+            }
+        }
+
+        out.retain(|(pk, _, _)| key_matches_filter(pk, &filter));
+        Ok(out)
+    }
+
+    /// Queries external OS SSH agent(s) (`SSH2_AGENTC_REQUEST_IDENTITIES`) and tags each key's origin.
+    /// On Windows, queries both the OpenSSH named pipe (e.g. 1Password / Windows OpenSSH) and
+    /// PuTTY Pageant when running, deduplicating shared keys by `key_blob`.
+    pub async fn list_os_agent_keys_with_sources(
+        &self,
+    ) -> Result<Vec<(PublicKey, ExternalKeySource)>> {
         #[cfg(unix)]
         {
             let path = self.resolve_endpoint()?;
             let mut stream = tokio::net::UnixStream::connect(&path)
                 .await
                 .with_context(|| format!("failed to connect to local SSH agent at {path}"))?;
-            request_identities_over_stream(&mut stream).await
+            let keys = request_identities_over_stream(&mut stream).await?;
+            Ok(keys
+                .into_iter()
+                .map(|k| (k, ExternalKeySource::OsAgent))
+                .collect())
         }
         #[cfg(windows)]
         {
-            let pipe_name = self.resolve_endpoint()?;
-            let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(&pipe_name)
-                .with_context(|| {
-                    format!("failed to connect to Windows OpenSSH agent pipe {pipe_name}")
-                })?;
-            request_identities_over_stream(&mut client).await
+            let backends = self.resolve_windows_backends();
+            let mut merged: Vec<(PublicKey, ExternalKeySource)> = Vec::new();
+            let mut any_reachable = false;
+            let mut errors: Vec<String> = Vec::new();
+
+            for backend in &backends {
+                match backend {
+                    WindowsAgentBackend::NamedPipe(pipe_name) => {
+                        match open_windows_named_pipe_identities(pipe_name).await {
+                            Ok(pipe_keys) => {
+                                any_reachable = true;
+                                for pk in pipe_keys {
+                                    merge_external_key(
+                                        &mut merged,
+                                        pk,
+                                        ExternalKeySource::OsAgent,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                errors.push(format!("{e:#}"));
+                            }
+                        }
+                    }
+                    WindowsAgentBackend::Pageant(pipe_override) => {
+                        match crate::win_pageant::request_identities_with_pipe(
+                            pipe_override.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(pageant_keys) => {
+                                any_reachable = true;
+                                for pk in pageant_keys {
+                                    merge_external_key(
+                                        &mut merged,
+                                        pk,
+                                        ExternalKeySource::Pageant,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let msg = format!("{e:#}");
+                                if backends.len() == 1
+                                    || msg != "PuTTY Pageant named pipe is not running"
+                                {
+                                    errors.push(msg);
+                                } else {
+                                    tracing::debug!("Pageant named pipe not available: {msg}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if any_reachable {
+                Ok(merged)
+            } else if errors.is_empty() {
+                anyhow::bail!("no external Windows SSH agent (OpenSSH named pipe or PuTTY Pageant) is running")
+            } else {
+                anyhow::bail!("{}", errors.join("; "))
+            }
         }
     }
 
+    /// Queries only the external OS SSH agent(s) (`SSH2_AGENTC_REQUEST_IDENTITIES`).
+    pub async fn list_os_agent_keys(&self) -> Result<Vec<PublicKey>> {
+        let entries = self.list_os_agent_keys_with_sources().await?;
+        Ok(entries.into_iter().map(|(pk, _)| pk).collect())
+    }
+
     /// Returns all available SSH public keys, merging built-in in-memory keys with keys from
-    /// the local OS SSH agent (when enabled and reachable).
+    /// the local OS SSH agent / PuTTY Pageant (when enabled and reachable).
     pub async fn list_all_keys(&self) -> Result<Vec<PublicKey>> {
         let mut keys = self.list_loaded_keys();
         if self.is_os_agent_disabled() {
@@ -425,7 +674,8 @@ impl LocalAgentConnector {
 
     /// Signs `data` with `key_blob`, first checking `KeyFilterConfig`.
     /// If `key_blob` is loaded in the built-in in-memory key ring, signs directly in-process;
-    /// otherwise delegates to the local OS SSH agent (`SSH2_AGENTC_SIGN_REQUEST`).
+    /// otherwise delegates to the running external SSH agent holding `key_blob` (routing across
+    /// Windows OpenSSH named pipe and PuTTY Pageant with automatic fallback).
     pub async fn sign(&self, key_blob: &[u8], data: &[u8], flags: u32) -> Result<Vec<u8>> {
         let filter = self.filter_config();
 
@@ -455,7 +705,7 @@ impl LocalAgentConnector {
             );
         }
 
-        // 2. Fall back to local OS SSH agent
+        // 2. Fall back to external SSH agent(s)
         if is_filter_active(&filter) {
             let allowed = self.list_filtered_keys().await?;
             if !allowed.iter().any(|k| k.key_blob == key_blob) {
@@ -473,22 +723,114 @@ impl LocalAgentConnector {
         }
         #[cfg(windows)]
         {
-            let pipe_name = self.resolve_endpoint()?;
-            let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(&pipe_name)
-                .with_context(|| {
-                    format!("failed to connect to Windows OpenSSH agent pipe {pipe_name}")
-                })?;
-            sign_over_stream(&mut client, key_blob, data, flags).await
+            self.sign_with_windows_backends(key_blob, data, flags).await
         }
+    }
+
+    #[cfg(windows)]
+    async fn sign_with_windows_backends(
+        &self,
+        key_blob: &[u8],
+        data: &[u8],
+        flags: u32,
+    ) -> Result<Vec<u8>> {
+        let configured = self.resolve_windows_backends();
+        if configured.is_empty() {
+            anyhow::bail!("no Windows SSH agent backend configured");
+        }
+
+        // Fast path when only a single backend is configured (e.g. explicit single pipe):
+        // skip the extra REQUEST_IDENTITIES probe and sign directly.
+        if configured.len() == 1 {
+            return match &configured[0] {
+                WindowsAgentBackend::NamedPipe(pipe_name) => {
+                    sign_over_windows_named_pipe(pipe_name, key_blob, data, flags).await
+                }
+                WindowsAgentBackend::Pageant(pipe_override) => {
+                    crate::win_pageant::sign_with_pipe(
+                        pipe_override.as_deref(),
+                        key_blob,
+                        data,
+                        flags,
+                    )
+                    .await
+                }
+            };
+        }
+
+        // Multi-agent routing (e.g. 1Password/OpenSSH pipe + PuTTY Pageant named pipe):
+        // check which running agent(s) hold `key_blob` so a Pageant-only key routes straight to
+        // Pageant's named pipe without prompting or erroring on 1Password, while a shared key
+        // tries OpenSSH pipe first and falls back to Pageant on failure.
+        let mut matching: Vec<WindowsAgentBackend> = Vec::new();
+        let mut fallback_candidates: Vec<WindowsAgentBackend> = Vec::new();
+
+        for backend in &configured {
+            let identities_res = match backend {
+                WindowsAgentBackend::NamedPipe(pipe_name) => {
+                    open_windows_named_pipe_identities(pipe_name).await
+                }
+                WindowsAgentBackend::Pageant(pipe_override) => {
+                    crate::win_pageant::request_identities_with_pipe(pipe_override.as_deref())
+                        .await
+                }
+            };
+            match identities_res {
+                Ok(keys) => {
+                    if keys.iter().any(|k| k.key_blob == key_blob) {
+                        matching.push(backend.clone());
+                    } else {
+                        fallback_candidates.push(backend.clone());
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Skipping unreachable Windows SSH agent backend during key routing: {e:#}");
+                }
+            }
+        }
+
+        let route_targets = if !matching.is_empty() {
+            matching
+        } else if !fallback_candidates.is_empty() {
+            fallback_candidates
+        } else {
+            configured
+        };
+
+        let mut sign_errors: Vec<String> = Vec::new();
+        for target in &route_targets {
+            let res = match target {
+                WindowsAgentBackend::NamedPipe(pipe_name) => {
+                    sign_over_windows_named_pipe(pipe_name, key_blob, data, flags).await
+                }
+                WindowsAgentBackend::Pageant(pipe_override) => {
+                    crate::win_pageant::sign_with_pipe(
+                        pipe_override.as_deref(),
+                        key_blob,
+                        data,
+                        flags,
+                    )
+                    .await
+                }
+            };
+            match res {
+                Ok(sig) => return Ok(sig),
+                Err(e) => {
+                    tracing::debug!("Windows SSH agent backend failed to sign, trying next if available: {e:#}");
+                    sign_errors.push(format!("{e:#}"));
+                }
+            }
+        }
+
+        anyhow::bail!("{}", sign_errors.join("; "))
     }
 
     // ========================================================================
     // UI Helpers for System Tray / Menu Bar SSH Key Management Dialogs
     // ========================================================================
 
-    /// Returns a snapshot of all held SSH keys (`[Built-in]` and `[OS Agent]`) formatted for
-    /// display in the System Tray / Menu Bar SSH Keys management window.
+    /// Returns a snapshot of all held SSH keys (`[Built-in]`, `[OS Agent]`, `[Pageant]`) formatted
+    /// for display in the System Tray / Menu Bar SSH Keys management window.
     pub fn query_held_keys_for_ui(&self) -> Vec<HeldKeyDisplayItem> {
         let builtin_entries = self.list_loaded_key_entries();
         let mut items = Vec::new();
@@ -525,8 +867,8 @@ impl LocalAgentConnector {
                     .ok()?;
                 rt.block_on(async move {
                     tokio::time::timeout(
-                        Duration::from_millis(1200),
-                        clone_self.list_os_agent_keys(),
+                        Duration::from_millis(2500),
+                        clone_self.list_os_agent_keys_with_sources(),
                     )
                     .await
                     .ok()?
@@ -538,17 +880,19 @@ impl LocalAgentConnector {
             .flatten()
             .unwrap_or_default();
 
-            for pk in os_keys {
+            for (pk, ext_src) in os_keys {
                 if seen_blobs.iter().any(|b| b == &pk.key_blob) {
                     continue;
                 }
+                seen_blobs.push(pk.key_blob.clone());
                 let comment_part = if pk.comment.is_empty() {
                     "no comment".to_string()
                 } else {
                     pk.comment.clone()
                 };
+                let badge = ext_src.ui_badge();
                 let display_line = format!(
-                    "[OS Agent] {} {} ({})",
+                    "[{badge}] {} {} ({})",
                     pk.key_type, pk.fingerprint_sha256, comment_part
                 );
                 items.push(HeldKeyDisplayItem {
@@ -556,7 +900,7 @@ impl LocalAgentConnector {
                     key_type: pk.key_type,
                     fingerprint_sha256: pk.fingerprint_sha256,
                     comment: pk.comment,
-                    source: "os-agent".to_string(),
+                    source: ext_src.cli_id().to_string(),
                     display_line,
                 });
             }
@@ -665,7 +1009,8 @@ impl LocalAgentConnector {
     ) -> Result<bool> {
         if !item.is_builtin {
             anyhow::bail!(
-                "Selected key belongs to the external OS ssh-agent. Use `ssh-add -d` or check 'Use Built-in Keys Only'."
+                "Selected key belongs to an external SSH agent ({}). Remove it in that agent or check 'Use Built-in Keys Only'.",
+                item.source
             );
         }
         let removed = self.remove_loaded_key(&item.fingerprint_sha256);
@@ -752,12 +1097,72 @@ pub fn key_matches_filter(key: &PublicKey, filter: &KeyFilterConfig) -> bool {
     fp_match || comment_match
 }
 
-pub async fn request_identities_over_stream<S>(stream: &mut S) -> Result<Vec<PublicKey>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    write_frame(stream, &[SSH2_AGENTC_REQUEST_IDENTITIES]).await?;
-    let resp = read_frame(stream).await?;
+#[cfg(any(windows, test))]
+fn merge_external_key(
+    merged: &mut Vec<(PublicKey, ExternalKeySource)>,
+    pk: PublicKey,
+    source: ExternalKeySource,
+) {
+    if let Some((existing_pk, existing_src)) = merged
+        .iter_mut()
+        .find(|(existing, _)| existing.key_blob == pk.key_blob)
+    {
+        if existing_pk.comment.is_empty() && !pk.comment.is_empty() {
+            existing_pk.comment = pk.comment;
+        }
+        if *existing_src != source {
+            *existing_src = ExternalKeySource::OsAgentAndPageant;
+        }
+    } else {
+        merged.push((pk, source));
+    }
+}
+
+#[cfg(windows)]
+async fn open_windows_named_pipe(
+    pipe_name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    const ERROR_PIPE_BUSY_CODE: i32 = 231;
+    const SECURITY_IDENTIFICATION_QOS: u32 = 0x0001_0000;
+    let resolved = crate::win_pageant::normalize_pipe_or_openssh_config(pipe_name);
+    let mut attempts = 0usize;
+    loop {
+        match tokio::net::windows::named_pipe::ClientOptions::new()
+            .security_qos_flags(SECURITY_IDENTIFICATION_QOS)
+            .open(&resolved)
+        {
+            Ok(client) => return Ok(client),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY_CODE) && attempts < 5 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to connect to Windows OpenSSH agent pipe {resolved}")
+                });
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn open_windows_named_pipe_identities(pipe_name: &str) -> Result<Vec<PublicKey>> {
+    let mut client = open_windows_named_pipe(pipe_name).await?;
+    request_identities_over_stream(&mut client).await
+}
+
+#[cfg(windows)]
+async fn sign_over_windows_named_pipe(
+    pipe_name: &str,
+    key_blob: &[u8],
+    data: &[u8],
+    flags: u32,
+) -> Result<Vec<u8>> {
+    let mut client = open_windows_named_pipe(pipe_name).await?;
+    sign_over_stream(&mut client, key_blob, data, flags).await
+}
+
+pub fn parse_identities_answer(resp: &[u8]) -> Result<Vec<PublicKey>> {
     let Some((&msg_type, mut cursor)) = resp.split_first() else {
         anyhow::bail!("empty response from local SSH agent");
     };
@@ -777,23 +1182,16 @@ where
     Ok(keys)
 }
 
-pub async fn sign_over_stream<S>(
-    stream: &mut S,
-    key_blob: &[u8],
-    data: &[u8],
-    flags: u32,
-) -> Result<Vec<u8>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+pub fn build_sign_request_payload(key_blob: &[u8], data: &[u8], flags: u32) -> Vec<u8> {
     let mut req = Vec::with_capacity(13 + key_blob.len() + data.len());
     req.push(SSH2_AGENTC_SIGN_REQUEST);
     write_ssh_bytes(&mut req, key_blob);
     write_ssh_bytes(&mut req, data);
     req.extend_from_slice(&flags.to_be_bytes());
+    req
+}
 
-    write_frame(stream, &req).await?;
-    let resp = read_frame(stream).await?;
+pub fn parse_sign_response(resp: &[u8]) -> Result<Vec<u8>> {
     let Some((&msg_type, mut cursor)) = resp.split_first() else {
         anyhow::bail!("empty sign response from local SSH agent");
     };
@@ -807,6 +1205,30 @@ where
         .context("truncated signature blob from local SSH agent")?
         .to_vec();
     Ok(sig_blob)
+}
+
+pub async fn request_identities_over_stream<S>(stream: &mut S) -> Result<Vec<PublicKey>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame(stream, &[SSH2_AGENTC_REQUEST_IDENTITIES]).await?;
+    let resp = read_frame(stream).await?;
+    parse_identities_answer(&resp)
+}
+
+pub async fn sign_over_stream<S>(
+    stream: &mut S,
+    key_blob: &[u8],
+    data: &[u8],
+    flags: u32,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let req = build_sign_request_payload(key_blob, data, flags);
+    write_frame(stream, &req).await?;
+    let resp = read_frame(stream).await?;
+    parse_sign_response(&resp)
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, payload: &[u8]) -> Result<()> {
@@ -851,4 +1273,247 @@ fn read_ssh_bytes<'a>(cursor: &mut &'a [u8]) -> Option<&'a [u8]> {
     let slice = &cursor[..len];
     *cursor = &cursor[len..];
     Some(slice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_external_key_deduplicates_and_tracks_combined_sources() {
+        let k1 = LoadedSshKey::generate_ed25519("key1@1password").public_key_proto();
+        let mut k1_pageant = k1.clone();
+        k1_pageant.comment = "key1@pageant".to_string();
+        let k2 = LoadedSshKey::generate_ed25519("key2@pageant").public_key_proto();
+
+        let mut merged = Vec::new();
+        merge_external_key(&mut merged, k1.clone(), ExternalKeySource::OsAgent);
+        merge_external_key(&mut merged, k1_pageant, ExternalKeySource::Pageant);
+        merge_external_key(&mut merged, k2.clone(), ExternalKeySource::Pageant);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].0.key_blob, k1.key_blob);
+        assert_eq!(merged[0].0.comment, "key1@1password");
+        assert_eq!(merged[0].1, ExternalKeySource::OsAgentAndPageant);
+        assert_eq!(merged[1].0.key_blob, k2.key_blob);
+        assert_eq!(merged[1].1, ExternalKeySource::Pageant);
+    }
+
+    #[cfg(windows)]
+    mod win_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct MockAgentState {
+            keys: Vec<LoadedSshKey>,
+            sign_calls: AtomicUsize,
+            fail_sign: AtomicBool,
+        }
+
+        impl MockAgentState {
+            fn handle_request(&self, req: &[u8]) -> Vec<u8> {
+                let Some((&msg_type, mut cursor)) = req.split_first() else {
+                    return vec![SSH_AGENT_FAILURE];
+                };
+                if msg_type == SSH2_AGENTC_REQUEST_IDENTITIES {
+                    let mut reply = Vec::new();
+                    reply.push(SSH2_AGENT_IDENTITIES_ANSWER);
+                    reply.extend_from_slice(&(self.keys.len() as u32).to_be_bytes());
+                    for k in &self.keys {
+                        write_ssh_bytes(&mut reply, k.key_blob());
+                        write_ssh_bytes(&mut reply, k.comment().as_bytes());
+                    }
+                    reply
+                } else if msg_type == SSH2_AGENTC_SIGN_REQUEST {
+                    self.sign_calls.fetch_add(1, Ordering::SeqCst);
+                    if self.fail_sign.load(Ordering::SeqCst) {
+                        return vec![SSH_AGENT_FAILURE];
+                    }
+                    let Some(key_blob) = read_ssh_bytes(&mut cursor) else {
+                        return vec![SSH_AGENT_FAILURE];
+                    };
+                    let Some(data) = read_ssh_bytes(&mut cursor) else {
+                        return vec![SSH_AGENT_FAILURE];
+                    };
+                    let flags = read_u32(&mut cursor).unwrap_or(0);
+                    let Some(key) = self.keys.iter().find(|k| k.key_blob() == key_blob) else {
+                        return vec![SSH_AGENT_FAILURE];
+                    };
+                    match key.sign_ssh_data(data, flags) {
+                        Ok(sig_blob) => {
+                            let mut reply = Vec::new();
+                            reply.push(SSH2_AGENT_SIGN_RESPONSE);
+                            write_ssh_bytes(&mut reply, &sig_blob);
+                            reply
+                        }
+                        Err(_) => vec![SSH_AGENT_FAILURE],
+                    }
+                } else {
+                    vec![SSH_AGENT_FAILURE]
+                }
+            }
+        }
+
+        async fn spawn_mock_pipe_agent(pipe_name: String, state: Arc<MockAgentState>) {
+            use tokio::net::windows::named_pipe::ServerOptions;
+            let mut server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)
+                .unwrap();
+            tokio::spawn(async move {
+                while server.connect().await.is_ok() {
+                    let mut conn = server;
+                    server = match ServerOptions::new().create(&pipe_name) {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    };
+                    let st = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        while let Ok(req) = read_frame(&mut conn).await {
+                            let reply = st.handle_request(&req);
+                            if write_frame(&mut conn, &reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        #[test]
+        fn test_pageant_capi_obfuscate_and_openssh_config_parsing() {
+            let s1 = crate::win_pageant::capi_obfuscate_string("Pageant")
+                .expect("CryptProtectMemory failed");
+            let s2 = crate::win_pageant::capi_obfuscate_string("Pageant")
+                .expect("CryptProtectMemory failed");
+            assert_eq!(s1, s2);
+            assert_eq!(s1.len(), 64);
+            assert!(s1.chars().all(|c| c.is_ascii_hexdigit()));
+
+            let (suffix, usernames, paths) = crate::win_pageant::deterministic_pageant_pipe_paths();
+            assert_eq!(suffix.as_deref(), Some(s1.as_str()));
+            assert!(!usernames.is_empty());
+            assert!(!paths.is_empty());
+            assert!(paths[0].starts_with(r"\\.\pipe\pageant."));
+            assert!(paths[0].ends_with(&format!(".{s1}")));
+
+            let conf_quoted =
+                "IdentityAgent \"\\\\\\\\.\\\\pipe\\\\pageant.alice.0123456789abcdef\"\n";
+            assert_eq!(
+                crate::win_pageant::parse_identity_agent_from_openssh_config(conf_quoted)
+                    .as_deref(),
+                Some(r"\\.\pipe\pageant.alice.0123456789abcdef")
+            );
+
+            let conf_slashes = "# Generated by Pageant\nIdentityAgent //./pipe/pageant.bob.fedcba98\n";
+            assert_eq!(
+                crate::win_pageant::parse_identity_agent_from_openssh_config(conf_slashes)
+                    .as_deref(),
+                Some(r"\\.\pipe\pageant.bob.fedcba98")
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_windows_dual_agents_1password_and_pageant_named_pipes_dedup_and_routing() {
+            let key1 = LoadedSshKey::generate_ed25519("key1@shared");
+            let key2 = LoadedSshKey::generate_ed25519("key2@pageant-only");
+
+            // Agent 1 (1Password on Windows OpenSSH Named Pipe): holds Key 1 only
+            let pipe_state = Arc::new(MockAgentState {
+                keys: vec![key1.clone()],
+                sign_calls: AtomicUsize::new(0),
+                fail_sign: AtomicBool::new(false),
+            });
+            let pipe_name = format!(r"\\.\pipe\sshcast-1password-test-{}", std::process::id());
+            spawn_mock_pipe_agent(pipe_name.clone(), Arc::clone(&pipe_state)).await;
+
+            // Agent 2 (Modern PuTTY Pageant 0.75+ Named Pipe): holds Key 1 AND Key 2
+            let pageant_state = Arc::new(MockAgentState {
+                keys: vec![key1.clone(), key2.clone()],
+                sign_calls: AtomicUsize::new(0),
+                fail_sign: AtomicBool::new(false),
+            });
+            let pageant_pipe_name = format!(
+                r"\\.\pipe\pageant.sshcasttest.{:016x}",
+                std::process::id()
+            );
+            spawn_mock_pipe_agent(pageant_pipe_name.clone(), Arc::clone(&pageant_state)).await;
+
+            let connector = LocalAgentConnector::new(Some(pipe_name), KeyFilterConfig::default());
+            connector.set_test_pageant_pipe(Some(pageant_pipe_name.clone()));
+
+            // 1. Advertises Key 1 and Key 2 once each (deduplicating Key 1 across both agents)
+            let keys_with_labels = connector
+                .list_filtered_keys_with_source_labels()
+                .await
+                .unwrap();
+            assert_eq!(keys_with_labels.len(), 2);
+            assert_eq!(keys_with_labels[0].0.key_blob, key1.key_blob());
+            assert_eq!(keys_with_labels[0].1, "OS Agent + Pageant");
+            assert_eq!(keys_with_labels[0].2, "os-agent+pageant");
+            assert_eq!(keys_with_labels[1].0.key_blob, key2.key_blob());
+            assert_eq!(keys_with_labels[1].1, "Pageant");
+            assert_eq!(keys_with_labels[1].2, "pageant");
+
+            // Tray UI snapshot also deduplicates and displays accurate badges
+            let ui_items = connector.query_held_keys_for_ui();
+            assert_eq!(ui_items.len(), 2);
+            assert!(ui_items[0].display_line.starts_with("[OS Agent + Pageant]"));
+            assert!(ui_items[1].display_line.starts_with("[Pageant]"));
+
+            // 2. Signing Key 1 routes to Agent 1 (1Password pipe) first without touching Pageant
+            let challenge1 = b"ssh-auth-challenge-for-key1";
+            let sig1 = connector.sign(key1.key_blob(), challenge1, 0).await.unwrap();
+            key1.verify_ssh_signature_blob(challenge1, &sig1).unwrap();
+            assert_eq!(pipe_state.sign_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(pageant_state.sign_calls.load(Ordering::SeqCst), 0);
+
+            // 3. Signing Key 2 routes directly to Pageant's named pipe WITHOUT sending a sign request to Agent 1!
+            let challenge2 = b"ssh-auth-challenge-for-key2";
+            let sig2 = connector.sign(key2.key_blob(), challenge2, 0).await.unwrap();
+            key2.verify_ssh_signature_blob(challenge2, &sig2).unwrap();
+            assert_eq!(pipe_state.sign_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(pageant_state.sign_calls.load(Ordering::SeqCst), 1);
+
+            // 4. If Agent 1 (1Password) fails/is locked for Key 1, automatically falls back to Pageant's pipe!
+            pipe_state.fail_sign.store(true, Ordering::SeqCst);
+            let challenge3 = b"ssh-auth-challenge-fallback-key1";
+            let sig3 = connector.sign(key1.key_blob(), challenge3, 0).await.unwrap();
+            key1.verify_ssh_signature_blob(challenge3, &sig3).unwrap();
+            assert_eq!(pipe_state.sign_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(pageant_state.sign_calls.load(Ordering::SeqCst), 2);
+
+            // 5. Works when ONLY Pageant is running and OpenSSH named pipe does not exist!
+            let pageant_only_conn = LocalAgentConnector::new(
+                Some(r"\\.\pipe\sshcast-nonexistent-pipe-999999".to_string()),
+                KeyFilterConfig::default(),
+            );
+            pageant_only_conn.set_test_pageant_pipe(Some(pageant_pipe_name.clone()));
+            let pageant_only_keys = pageant_only_conn.list_filtered_keys().await.unwrap();
+            assert_eq!(pageant_only_keys.len(), 2);
+            let sig4 = pageant_only_conn
+                .sign(key2.key_blob(), b"pageant-standalone-challenge", 0)
+                .await
+                .unwrap();
+            key2.verify_ssh_signature_blob(b"pageant-standalone-challenge", &sig4)
+                .unwrap();
+
+            // 6. Also works when pointing at a `pageant.exe --openssh-config` file!
+            let tmp = tempfile::TempDir::new().unwrap();
+            let conf_path = tmp.path().join("pageant.conf");
+            let escaped = pageant_pipe_name.replace('\\', "\\\\");
+            std::fs::write(&conf_path, format!("IdentityAgent \"{escaped}\"\n")).unwrap();
+
+            let conf_conn = LocalAgentConnector::new(
+                Some(conf_path.to_string_lossy().into_owned()),
+                KeyFilterConfig::default(),
+            );
+            let conf_keys = conf_conn
+                .list_filtered_keys_with_source_labels()
+                .await
+                .unwrap();
+            assert_eq!(conf_keys.len(), 2);
+            assert_eq!(conf_keys[0].1, "Pageant");
+        }
+    }
 }

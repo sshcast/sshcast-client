@@ -2728,7 +2728,7 @@ unsafe extern "system" fn ssh_keys_wnd_proc(
 
             create_label(
                 hwnd,
-                "Manage SSH Agent Keys (Built-in & OS Agent)",
+                "Manage SSH Agent Keys (Built-in, OS Agent & Pageant)",
                 62,
                 18,
                 534,
@@ -2740,7 +2740,7 @@ unsafe extern "system" fn ssh_keys_wnd_proc(
 
             create_label(
                 hwnd,
-                "Held SSH Keys ([Built-in] in-memory keys & [OS Agent] keys):",
+                "Held SSH Keys ([Built-in], [OS Agent] & [Pageant]):",
                 24,
                 68,
                 572,
@@ -2792,7 +2792,7 @@ unsafe extern "system" fn ssh_keys_wnd_proc(
                 hwnd,
                 0,
                 "BUTTON",
-                "Use Built-in Keys Only (Disable external OS ssh-agent)",
+                "Use Built-in Keys Only (Disable external OS ssh-agent & Pageant)",
                 BS_AUTOCHECKBOX | WS_TABSTOP,
                 24,
                 228,

@@ -456,7 +456,7 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
             .build();
         let keys = match rt {
             Ok(rt) => rt
-                .block_on(local_agent.list_filtered_keys())
+                .block_on(local_agent.list_filtered_keys_with_source_labels())
                 .unwrap_or_default(),
             Err(_) => Vec::new(),
         };
@@ -470,12 +470,7 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
             "  (No local SSH keys currently loaded or matching filter)".to_string()
         } else {
             keys.iter()
-                .map(|k| {
-                    let src = if local_agent.is_loaded_key(&k.key_blob) {
-                        "Built-in"
-                    } else {
-                        "OS Agent"
-                    };
+                .map(|(k, src, _)| {
                     if k.comment.is_empty() {
                         format!("  • [{src}] {} ({})", k.fingerprint_sha256, k.key_type)
                     } else {
