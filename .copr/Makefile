@@ -5,6 +5,9 @@ outdir ?= .
 
 srpm:
 	@set -eu; \
+	if ! command -v cargo >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v rpmbuild >/dev/null 2>&1; then \
+		dnf -y install cargo git-core rpm-build; \
+	fi; \
 	if [ ! -f sshcast-proto/Cargo.toml ]; then \
 		git submodule update --init --recursive; \
 	fi; \
