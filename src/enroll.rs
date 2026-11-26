@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{
-    default_client_config_path, default_user_key_path, ClientConfig, ClientConfigFile, UserKeyFile,
+    atomic_write_private_file, default_client_config_path, default_user_key_path, ClientConfig,
+    ClientConfigFile, UserKeyFile,
 };
 
 pub const USER_KEY_TOKEN_PREFIX: &str = "scu1_";
@@ -78,15 +79,7 @@ pub fn save_user_signing_key(
     };
 
     let toml_str = toml::to_string_pretty(&file).context("failed to serialize user_key.toml")?;
-    std::fs::write(&path, &toml_str)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set 0600 permissions on {}", path.display()))?;
-    }
+    atomic_write_private_file(&path, &toml_str)?;
 
     Ok(KeygenOutcome {
         key_path: path,
@@ -227,8 +220,7 @@ pub fn import_user_cert(
         key_file.user_cert_token = Some(canonical_token);
         let toml_str =
             toml::to_string_pretty(&key_file).context("failed to serialize user_key.toml")?;
-        std::fs::write(&kp, &toml_str)
-            .with_context(|| format!("failed to write {}", kp.display()))?;
+        atomic_write_private_file(&kp, &toml_str)?;
         updated_key_path = Some(kp);
     }
 
@@ -263,6 +255,17 @@ pub fn import_user_cert(
     }
 
     Ok((updated_key_path, updated_cfg_path, cert))
+}
+
+/// Atomically persists a verified `UserCert` to `user_key.toml` and `client.toml` if present.
+pub fn persist_user_cert(
+    cert: &UserCert,
+    key_path: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let token = encode_user_cert_token(cert);
+    let (kp, cp, _) = import_user_cert(&token, key_path, config_path)?;
+    Ok((kp, cp))
 }
 
 /// Mints a signed `NodeGrant` and returns an `EnrollmentBundle` (`sc1_<base64>`) for a target relay or workstation.
@@ -360,27 +363,9 @@ pub fn write_client_config_from_bundle(
         );
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-
     let cfg_file = ClientConfigFile::from_bundle(bundle);
     let toml_str = toml::to_string_pretty(&cfg_file).context("failed to serialize client.toml")?;
-    std::fs::write(&path, &toml_str)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set 0600 permissions on {}", path.display()))?;
-    }
+    atomic_write_private_file(&path, &toml_str)?;
 
     Ok(path)
 }

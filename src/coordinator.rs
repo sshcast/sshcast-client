@@ -4,18 +4,19 @@ use sshcast_proto::v1::client_stream_message::Payload as ClientPayload;
 use sshcast_proto::v1::server_stream_message::Payload as ServerPayload;
 use sshcast_proto::v1::sshcast_service_client::SshcastServiceClient;
 use sshcast_proto::v1::{
-    ClientStreamMessage, SignAck, SignRequest, SignResponse, WorkstationStatus,
+    ClientStreamMessage, NodeGrant, SignAck, SignRequest, SignResponse, WorkstationStatus,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
 use crate::config::ClientConfig;
 use crate::local_agent::LocalAgentConnector;
+use crate::operator::{cert_needs_renewal, renew_user_cert_http, resolve_operator_url};
 use crate::policy::{ApprovalDecision, PolicyEngine};
 use crate::presence::{current_os_name, now_unix_ms, query_last_input_epoch_ms};
 use crate::prompt::{ApprovalPrompter, PromptDetails};
@@ -169,6 +170,9 @@ impl ActiveSignRequests {
 
 pub struct WorkstationManager {
     cfg: ClientConfig,
+    grant: Arc<RwLock<NodeGrant>>,
+    renew_lock: Arc<Mutex<()>>,
+    resolved_operator_url: Arc<RwLock<Option<String>>>,
     local_agent: Arc<LocalAgentConnector>,
     policy: Arc<PolicyEngine>,
     prompter: Arc<dyn ApprovalPrompter>,
@@ -207,8 +211,13 @@ impl WorkstationManager {
     ) -> Self {
         connected_count.store(0, Ordering::Relaxed);
         let zellij_hub = Arc::new(ZellijProxyHub::new(cfg.clone()));
+        let grant = Arc::new(RwLock::new(cfg.grant.clone()));
+        let resolved_operator_url = Arc::new(RwLock::new(cfg.operator_url.clone()));
         Self {
             cfg,
+            grant,
+            renew_lock: Arc::new(Mutex::new(())),
+            resolved_operator_url,
             local_agent,
             policy,
             prompter,
@@ -261,12 +270,33 @@ impl WorkstationManager {
             .iter()
             .any(|s| sshcast_proto::dns::is_dns_discovery_entry(s).is_some());
 
-        let initial_urls = tokio::task::spawn_blocking({
+        let discovery = tokio::task::spawn_blocking({
             let entries = configured_entries.clone();
-            move || sshcast_proto::dns::resolve_coordinator_servers(&entries)
+            move || sshcast_proto::dns::resolve_swarm_discovery(&entries)
         })
         .await
-        .unwrap_or_else(|_| configured_entries.clone());
+        .unwrap_or_default();
+
+        if self.cfg.operator_url.is_none() {
+            if let Some(op_url) = discovery.operator_url {
+                *self.resolved_operator_url.write().await = Some(op_url);
+            }
+        }
+
+        let initial_urls = if discovery.servers.is_empty() {
+            configured_entries.clone()
+        } else {
+            discovery.servers
+        };
+
+        let _ = sync_cert_if_needed(
+            &self.cfg,
+            &self.grant,
+            &self.renew_lock,
+            &self.resolved_operator_url,
+            false,
+        )
+        .await;
 
         let mut active_streams: HashMap<String, (watch::Sender<bool>, tokio::task::JoinHandle<()>)> =
             HashMap::new();
@@ -275,6 +305,10 @@ impl WorkstationManager {
             let (stop_tx, handle) = self.spawn_coordinator_worker(server_url.clone(), shutdown_rx.clone());
             active_streams.insert(server_url, (stop_tx, handle));
         }
+
+        let mut renew_ticker = tokio::time::interval(Duration::from_secs(1800));
+        renew_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        renew_ticker.tick().await;
 
         if has_dns_entries {
             let mut dns_ticker = tokio::time::interval(Duration::from_secs(60));
@@ -288,11 +322,26 @@ impl WorkstationManager {
                             break;
                         }
                     }
+                    _ = renew_ticker.tick() => {
+                        let _ = sync_cert_if_needed(
+                            &self.cfg,
+                            &self.grant,
+                            &self.renew_lock,
+                            &self.resolved_operator_url,
+                            false,
+                        ).await;
+                    }
                     _ = dns_ticker.tick() => {
                         let entries = configured_entries.clone();
-                        if let Ok(resolved) = tokio::task::spawn_blocking(move || {
-                            sshcast_proto::dns::resolve_coordinator_servers(&entries)
+                        if let Ok(disc) = tokio::task::spawn_blocking(move || {
+                            sshcast_proto::dns::resolve_swarm_discovery(&entries)
                         }).await {
+                            if self.cfg.operator_url.is_none() {
+                                if let Some(op_url) = disc.operator_url {
+                                    *self.resolved_operator_url.write().await = Some(op_url);
+                                }
+                            }
+                            let resolved = disc.servers;
                             if !resolved.is_empty() {
                                 for url in &resolved {
                                     if !active_streams.contains_key(url) {
@@ -327,9 +376,25 @@ impl WorkstationManager {
                 }
             }
         } else {
-            while !*shutdown_rx.borrow() {
-                if shutdown_rx.changed().await.is_err() {
+            loop {
+                if *shutdown_rx.borrow() {
                     break;
+                }
+                tokio::select! {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = renew_ticker.tick() => {
+                        let _ = sync_cert_if_needed(
+                            &self.cfg,
+                            &self.grant,
+                            &self.renew_lock,
+                            &self.resolved_operator_url,
+                            false,
+                        ).await;
+                    }
                 }
             }
         }
@@ -351,6 +416,9 @@ impl WorkstationManager {
     ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let cfg = self.cfg.clone();
+        let grant_lock = Arc::clone(&self.grant);
+        let renew_lock = Arc::clone(&self.renew_lock);
+        let resolved_operator_url = Arc::clone(&self.resolved_operator_url);
         let local_agent = Arc::clone(&self.local_agent);
         let policy = Arc::clone(&self.policy);
         let prompter = Arc::clone(&self.prompter);
@@ -398,6 +466,7 @@ impl WorkstationManager {
                 let conn_res = run_single_coordinator_stream(
                     &url,
                     &cfg,
+                    &grant_lock,
                     &local_agent,
                     &policy,
                     &prompter,
@@ -413,18 +482,44 @@ impl WorkstationManager {
                     break;
                 }
 
+                let mut renewed_after_auth_err = false;
                 match conn_res {
                     Ok(()) => {
                         backoff = Duration::from_millis(500);
                     }
                     Err(e) => {
+                        let is_auth_err = e.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<tonic::Status>()
+                                .map(|st| {
+                                    matches!(
+                                        st.code(),
+                                        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                                    )
+                                })
+                                .unwrap_or(false)
+                        });
                         tracing::warn!(
                             "Coordinator stream {} disconnected ({:#}); reconnecting in {:?}",
                             url,
                             e,
                             backoff
                         );
+                        if is_auth_err {
+                            renewed_after_auth_err = sync_cert_if_needed(
+                                &cfg,
+                                &grant_lock,
+                                &renew_lock,
+                                &resolved_operator_url,
+                                true,
+                            )
+                            .await;
+                        }
                     }
+                }
+
+                if renewed_after_auth_err {
+                    backoff = Duration::from_millis(500);
                 }
 
                 tokio::select! {
@@ -448,6 +543,84 @@ impl WorkstationManager {
     }
 }
 
+async fn sync_cert_if_needed(
+    cfg: &ClientConfig,
+    grant_lock: &Arc<RwLock<NodeGrant>>,
+    renew_lock: &Arc<Mutex<()>>,
+    resolved_operator_url: &Arc<RwLock<Option<String>>>,
+    force: bool,
+) -> bool {
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    {
+        let grant_guard = grant_lock.read().await;
+        if !force && !cert_needs_renewal(grant_guard.user_cert.as_ref(), now_sec) {
+            return false;
+        }
+    }
+
+    let _guard = renew_lock.lock().await;
+    let current_grant = {
+        let grant_guard = grant_lock.read().await;
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if !force && !cert_needs_renewal(grant_guard.user_cert.as_ref(), now_sec) {
+            return false;
+        }
+        grant_guard.clone()
+    };
+
+    let mut op_url = resolved_operator_url.read().await.clone();
+    if op_url.is_none() {
+        let explicit = cfg.operator_url.clone();
+        let servers = cfg.servers.clone();
+        op_url = tokio::task::spawn_blocking(move || {
+            resolve_operator_url(explicit.as_deref(), &servers)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(ref discovered) = op_url {
+            *resolved_operator_url.write().await = Some(discovered.clone());
+        }
+    }
+    let Some(op_url) = op_url else {
+        return false;
+    };
+
+    if current_grant.user_cert.is_none() && !force {
+        return false;
+    }
+
+    match renew_user_cert_http(&op_url, &current_grant, &cfg.node_signing_key).await {
+        Ok(new_cert) => {
+            tracing::info!(
+                "Renewed operator UserCert from {} (expires_at={})",
+                op_url,
+                new_cert.expires_at_unix_sec
+            );
+            grant_lock.write().await.user_cert = Some(new_cert.clone());
+            if let Some(ref cfg_path) = cfg.config_path {
+                let cp = cfg_path.clone();
+                let cert_clone = new_cert;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = crate::enroll::persist_user_cert(&cert_clone, None, Some(&cp));
+                })
+                .await;
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Failed to renew UserCert from {}: {:#}", op_url, e);
+            false
+        }
+    }
+}
+
 struct ConnectedGuard<'a>(&'a AtomicUsize);
 
 impl<'a> ConnectedGuard<'a> {
@@ -467,6 +640,7 @@ impl Drop for ConnectedGuard<'_> {
 async fn run_single_coordinator_stream(
     server_url: &str,
     cfg: &ClientConfig,
+    grant_lock: &Arc<RwLock<NodeGrant>>,
     local_agent: &Arc<LocalAgentConnector>,
     policy: &Arc<PolicyEngine>,
     prompter: &Arc<dyn ApprovalPrompter>,
@@ -519,7 +693,8 @@ async fn run_single_coordinator_stream(
     };
 
     // 1. First message on ConnectWorkstation stream MUST be AuthHandshake
-    let handshake = create_node_auth(cfg.grant.clone(), &cfg.node_signing_key, now_unix_ms())?;
+    let current_grant = grant_lock.read().await.clone();
+    let handshake = create_node_auth(current_grant.clone(), &cfg.node_signing_key, now_unix_ms())?;
     tx.send(ClientStreamMessage {
         payload: Some(ClientPayload::AuthHandshake(handshake)),
     })
@@ -543,7 +718,7 @@ async fn run_single_coordinator_stream(
 
     tracing::info!(
         "Connected workstation '{}' to coordinator {}",
-        cfg.grant.node_id,
+        current_grant.node_id,
         server_url
     );
 

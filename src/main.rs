@@ -10,6 +10,7 @@ use sshcast_client::enroll::{
 };
 use sshcast_client::gui::run_egui_modal_process;
 use sshcast_client::local_agent::LocalAgentConnector;
+use sshcast_client::operator::login_and_enroll;
 use sshcast_client::policy::{ApprovalDecision, PolicyEngine};
 use sshcast_client::prompt::{ApprovalPrompter, InteractivePrompter, PromptDetails, StaticPrompter};
 use sshcast_proto::v1::NodeRole;
@@ -31,6 +32,32 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Sign in with GitHub via an Sshcast Operator to obtain an auto-renewing UserCert and enroll this workstation
+    Login {
+        /// Swarm domain for `_sshcast.<domain>` DNS TXT discovery (default: `sshcast.net`)
+        #[arg(long, default_value = "sshcast.net")]
+        domain: String,
+
+        /// Explicit Operator URL override (e.g. `https://op.sshcast.net`)
+        #[arg(long)]
+        operator: Option<String>,
+
+        /// Optional workstation identifier (defaults to hostname; enrolls client.toml if missing or specified)
+        #[arg(long)]
+        node: Option<String>,
+
+        /// Optional path to `user_key.toml`
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+
+        /// Optional path to `client.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Do not open a browser automatically; print the sign-in URL instead
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+    },
     /// Generate a new User Root Ed25519 keypair (`user_key.toml`)
     Keygen {
         /// Optional path for `user_key.toml` (defaults to `~/.config/sshcast/user_key.toml`)
@@ -261,6 +288,49 @@ async fn main() -> Result<()> {
         auto_approve: false,
         zellij_port: None,
     }) {
+        Commands::Login {
+            domain,
+            operator,
+            node,
+            key_file,
+            config,
+            no_browser,
+        } => {
+            let outcome = login_and_enroll(
+                std::slice::from_ref(&domain),
+                operator.as_deref(),
+                node.as_deref(),
+                key_file.as_deref(),
+                config.as_deref(),
+                !no_browser,
+                |auth_url| {
+                    println!("Opening GitHub sign-in in your browser:");
+                    println!("  {auth_url}");
+                    println!("Waiting for authentication...");
+                },
+            )
+            .await?;
+            println!("Authenticated Sshcast user '{}'!", outcome.user_id);
+            println!("  Operator:          {}", outcome.operator_url);
+            println!("  Root key:          {}", outcome.key_path.display());
+            println!(
+                "  Client config:     {}{}",
+                outcome.config_path.display(),
+                if outcome.enrolled_new_client {
+                    " (newly enrolled)"
+                } else {
+                    ""
+                }
+            );
+            if outcome.cert.expires_at_unix_sec > 0 {
+                println!(
+                    "  Certificate exp:   unix {} (auto-renewed)",
+                    outcome.cert.expires_at_unix_sec
+                );
+            }
+            println!("\nNext: start the workstation client (`sshcast-client run`) or tray app!");
+            Ok(())
+        }
         Commands::Keygen { key_file, force } => {
             let out = run_keygen(key_file.as_deref(), force)?;
             println!("Generated User Root Ed25519 keypair!");

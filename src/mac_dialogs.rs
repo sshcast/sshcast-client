@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
@@ -353,6 +354,8 @@ struct EnrollWindowWidgets {
     _handler: Retained<EnrollWindowHandler>,
 }
 
+static GITHUB_LOGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 thread_local! {
     static ENROLL_WINDOW: RefCell<Option<EnrollWindowWidgets>> = const { RefCell::new(None) };
     static BUNDLE_WINDOW: RefCell<Option<BundleWindowWidgets>> = const { RefCell::new(None) };
@@ -500,6 +503,104 @@ define_class!(
                     );
                 }
             }
+        }
+
+        #[unsafe(method(onGithubLogin:))]
+        fn on_github_login(&self, _sender: Option<&AnyObject>) {
+            if GITHUB_LOGIN_IN_FLIGHT
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                ENROLL_WINDOW.with(|cell| {
+                    if let Some(ref w) = *cell.borrow() {
+                        w.footer_status.setStringValue(&NSString::from_str(
+                            "GitHub sign-in is already in progress in your browser...",
+                        ));
+                    }
+                });
+                return;
+            }
+
+            let (node_name, servers_raw) = ENROLL_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    (
+                        w.node_edit.stringValue().to_string(),
+                        w.servers_edit.stringValue().to_string(),
+                    )
+                } else {
+                    (String::new(), String::new())
+                }
+            });
+            let servers = parse_servers_input(&servers_raw);
+            let cfg_path = get_tray_context()
+                .and_then(|c| c.config_path.clone())
+                .or_else(|| default_client_config_path().ok());
+            let explicit_op = get_tray_context()
+                .and_then(|c| c.current_config())
+                .and_then(|c| c.operator_url);
+
+            ENROLL_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    w.footer_status.setStringValue(&NSString::from_str(
+                        "Opening browser for GitHub sign-in... Complete login in browser.",
+                    ));
+                }
+            });
+
+            std::thread::spawn(move || {
+                let res = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt
+                        .block_on(crate::operator::login_and_enroll(
+                            &servers,
+                            explicit_op.as_deref(),
+                            Some(node_name.trim()).filter(|s| !s.is_empty()),
+                            None,
+                            cfg_path.as_deref(),
+                            true,
+                            |_| {},
+                        ))
+                        .map_err(|e| format!("{e:#}")),
+                    Err(e) => Err(format!("failed to start async runtime: {e}")),
+                };
+                GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+                crate::mac_native::run_on_main_async(move |_mtm| match res {
+                    Ok(outcome) => {
+                        let status = format_user_cert_status(cfg_path.as_deref());
+                        reload_tray_configuration();
+                        let msg = format!(
+                            "Signed in via GitHub as '{}' — connecting!",
+                            outcome.user_id
+                        );
+                        ENROLL_WINDOW.with(|cell| {
+                            if let Some(ref w) = *cell.borrow() {
+                                w.root_key_edit.setStringValue(&NSString::from_str(
+                                    &outcome.user_pubkey_token,
+                                ));
+                                if let Some(ref s) = status {
+                                    w.cert_edit.setStringValue(&NSString::from_str(s));
+                                }
+                                w.footer_status.setStringValue(&NSString::from_str(&msg));
+                            }
+                        });
+                    }
+                    Err(err_msg) => {
+                        ENROLL_WINDOW.with(|cell| {
+                            if let Some(ref w) = *cell.borrow() {
+                                w.footer_status
+                                    .setStringValue(&NSString::from_str("GitHub sign-in failed."));
+                            }
+                        });
+                        show_tray_error_dialog(
+                            "GitHub Sign-In Failed",
+                            "Could not complete GitHub OAuth enrollment",
+                            &err_msg,
+                        );
+                    }
+                });
+            });
         }
 
         #[unsafe(method(onEnrollPrimary:))]
@@ -1048,14 +1149,28 @@ pub fn show_enroll_window() {
             mtm,
             &content_view,
             win_h,
-            "Enroll This Workstation",
-            "Mint a signed client grant using your local root key and save ~/.config/sshcast/client.toml",
+            "Sign in with GitHub",
+            "Open browser OAuth to get an auto-renewing cert & enroll",
             &handler,
-            sel!(onEnrollPrimary:),
+            sel!(onGithubLogin:),
             true,
             24.0,
             268.0,
-            592.0,
+            288.0,
+            58.0,
+        );
+        add_action_card_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Enroll This Workstation",
+            "Mint grant with local root key & save client.toml",
+            &handler,
+            sel!(onEnrollPrimary:),
+            false,
+            328.0,
+            268.0,
+            288.0,
             58.0,
         );
 

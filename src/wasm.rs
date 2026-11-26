@@ -5,9 +5,10 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sshcast_proto::bundle::EnrollmentBundle;
+use sshcast_proto::bundle::{decode_user_cert_token, EnrollmentBundle};
 use sshcast_proto::crypto::{
-    create_node_auth_with_nonce, verify_node_grant, verify_sign_request,
+    create_node_auth_with_nonce, verify_node_grant, verify_sign_request, verify_user_cert,
+    CryptoError,
 };
 use sshcast_proto::ssh::{parse_public_key_blob, parse_ssh_auth_context, LoadedSshKey};
 use sshcast_proto::v1::{
@@ -127,11 +128,24 @@ impl WasmWorkstationEngine {
                         })
                     }
                 };
+                let mut user_cert_expired = false;
                 if let Err(e) = verify_node_grant(&bundle.grant, now_unix_sec) {
-                    return json!({
-                        "ok": false,
-                        "error": format!("Node grant verification failed: {e}")
-                    });
+                    if e == CryptoError::UserCertExpired {
+                        let mut grant_no_cert = bundle.grant.clone();
+                        grant_no_cert.user_cert = None;
+                        if let Err(e2) = verify_node_grant(&grant_no_cert, now_unix_sec) {
+                            return json!({
+                                "ok": false,
+                                "error": format!("Node grant verification failed: {e2}")
+                            });
+                        }
+                        user_cert_expired = true;
+                    } else {
+                        return json!({
+                            "ok": false,
+                            "error": format!("Node grant verification failed: {e}")
+                        });
+                    }
                 }
                 if bundle.grant.role != NodeRole::Client as i32 {
                     return json!({
@@ -147,6 +161,18 @@ impl WasmWorkstationEngine {
                     .filter_map(|s| sshcast_proto::dns::is_dns_discovery_entry(s))
                     .collect();
                 let has_user_cert = bundle.grant.user_cert.is_some();
+                let cert_issued_at_unix_sec = bundle
+                    .grant
+                    .user_cert
+                    .as_ref()
+                    .map(|c| c.issued_at_unix_sec)
+                    .unwrap_or(0);
+                let cert_expires_at_unix_sec = bundle
+                    .grant
+                    .user_cert
+                    .as_ref()
+                    .map(|c| c.expires_at_unix_sec)
+                    .unwrap_or(0);
                 let resp = json!({
                     "ok": true,
                     "coordinator_url": coordinator_url,
@@ -154,6 +180,9 @@ impl WasmWorkstationEngine {
                     "servers": bundle.servers,
                     "dns_domains": dns_domains,
                     "has_user_cert": has_user_cert,
+                    "user_cert_expired": user_cert_expired,
+                    "cert_issued_at_unix_sec": cert_issued_at_unix_sec,
+                    "cert_expires_at_unix_sec": cert_expires_at_unix_sec,
                     "user_id": bundle.grant.user_id,
                     "node_id": bundle.grant.node_id,
                     "role": "CLIENT",
@@ -164,6 +193,85 @@ impl WasmWorkstationEngine {
                     self.bundle = Some(bundle);
                 }
                 resp
+            }
+            "build_renew_node_auth" => {
+                let Some(bundle) = &self.bundle else {
+                    return json!({
+                        "ok": false,
+                        "error": "No enrollment bundle configured in WASM engine"
+                    });
+                };
+                let now_unix_ms = req
+                    .get("now_unix_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                self.nonce_counter = self.nonce_counter.wrapping_add(1);
+                let mut h = Sha256::new();
+                h.update(b"sshcast-wasm-renew-nonce-v1");
+                h.update(now_unix_ms.to_be_bytes());
+                h.update(self.nonce_counter.to_be_bytes());
+                h.update(&bundle.grant.node_pubkey);
+                let nonce = h.finalize()[..16].to_vec();
+
+                let mut grant_no_cert = bundle.grant.clone();
+                grant_no_cert.user_cert = None;
+                let auth = match create_node_auth_with_nonce(
+                    grant_no_cert,
+                    &bundle.node_signing_key,
+                    now_unix_ms,
+                    nonce,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => return json!({ "ok": false, "error": e.to_string() }),
+                };
+                json!({
+                    "ok": true,
+                    "node_auth_proto_b64": STANDARD.encode(auth.encode_to_vec()),
+                })
+            }
+            "update_user_cert" => {
+                let Some(bundle) = &mut self.bundle else {
+                    return json!({
+                        "ok": false,
+                        "error": "No enrollment bundle configured in WASM engine"
+                    });
+                };
+                let cert_token = req
+                    .get("cert_token")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let now_unix_sec = req
+                    .get("now_unix_sec")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cert = match decode_user_cert_token(cert_token) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return json!({
+                            "ok": false,
+                            "error": format!("Invalid user certificate token: {e}")
+                        })
+                    }
+                };
+                if let Err(e) = verify_user_cert(&cert, &bundle.grant.user_pubkey, now_unix_sec) {
+                    return json!({
+                        "ok": false,
+                        "error": format!("User certificate verification failed: {e}")
+                    });
+                }
+                let cert_issued_at_unix_sec = cert.issued_at_unix_sec;
+                let cert_expires_at_unix_sec = cert.expires_at_unix_sec;
+                bundle.grant.user_cert = Some(cert);
+                let updated_bundle_str = bundle.encode().unwrap_or_default();
+                json!({
+                    "ok": true,
+                    "has_user_cert": true,
+                    "user_cert_expired": false,
+                    "cert_issued_at_unix_sec": cert_issued_at_unix_sec,
+                    "cert_expires_at_unix_sec": cert_expires_at_unix_sec,
+                    "updated_bundle_str": updated_bundle_str,
+                })
             }
             "parse_txt_records" => {
                 let raw_records: Vec<String> = req
@@ -870,5 +978,103 @@ mod tests {
         ssh_key
             .verify_ssh_signature_blob(challenge, &sr.signature_blob)
             .unwrap();
+    }
+
+    #[test]
+    fn test_wasm_expired_user_cert_renewal_roundtrip() {
+        use sshcast_proto::bundle::encode_user_cert_token;
+        use sshcast_proto::crypto::{derive_user_id, sign_user_cert, verify_node_auth};
+        use sshcast_proto::v1::{NodeGrant, UserCert};
+
+        let op_sk = SigningKey::from_bytes(&[0x71; 32]);
+        let user_sk = SigningKey::from_bytes(&[0x72; 32]);
+        let client_sk = SigningKey::from_bytes(&[0x73; 32]);
+        let user_pk = user_sk.verifying_key().to_bytes().to_vec();
+
+        let mut expired_cert = UserCert {
+            user_id: derive_user_id(&user_pk),
+            user_pubkey: user_pk.clone(),
+            operator_pubkey: Vec::new(),
+            issued_at_unix_sec: 1_700_000_000,
+            expires_at_unix_sec: 1_700_604_800,
+            operator_signature: Vec::new(),
+        };
+        sign_user_cert(&mut expired_cert, &op_sk);
+
+        let mut grant = NodeGrant {
+            user_id: derive_user_id(&user_pk),
+            user_pubkey: user_pk.clone(),
+            node_id: "browser-laptop".to_string(),
+            role: NodeRole::Client as i32,
+            node_pubkey: client_sk.verifying_key().to_bytes().to_vec(),
+            issued_at_unix_sec: 1_700_000_000,
+            expires_at_unix_sec: 0,
+            user_signature: Vec::new(),
+            user_cert: Some(expired_cert),
+        };
+        sign_node_grant(&mut grant, &user_sk);
+
+        let bundle = EnrollmentBundle::new(vec!["sshcast.net".to_string()], client_sk, grant);
+        let bundle_str = bundle.encode().unwrap();
+
+        let mut engine = WasmWorkstationEngine::new();
+        let now_sec = 1_701_000_000u64; // past expired_cert.expires_at_unix_sec
+        let res = engine.call_value(json!({
+            "op": "set_bundle",
+            "bundle_str": bundle_str,
+            "now_unix_sec": now_sec,
+        }));
+        assert_eq!(res["ok"], Value::Bool(true));
+        assert_eq!(res["has_user_cert"], Value::Bool(true));
+        assert_eq!(res["user_cert_expired"], Value::Bool(true));
+
+        let renew_auth = engine.call_value(json!({
+            "op": "build_renew_node_auth",
+            "now_unix_ms": now_sec * 1000,
+        }));
+        assert_eq!(renew_auth["ok"], Value::Bool(true));
+        let auth_bytes = STANDARD
+            .decode(renew_auth["node_auth_proto_b64"].as_str().unwrap())
+            .unwrap();
+        let auth_msg = sshcast_proto::v1::NodeAuth::decode(auth_bytes.as_slice()).unwrap();
+        assert!(auth_msg.grant.as_ref().unwrap().user_cert.is_none());
+        verify_node_auth(
+            &auth_msg,
+            Some(NodeRole::Client),
+            now_sec * 1000,
+            DEFAULT_MAX_CLOCK_SKEW_MS,
+        )
+        .unwrap();
+
+        let mut fresh_cert = UserCert {
+            user_id: derive_user_id(&user_pk),
+            user_pubkey: user_pk,
+            operator_pubkey: Vec::new(),
+            issued_at_unix_sec: now_sec,
+            expires_at_unix_sec: now_sec + 7 * 86_400,
+            operator_signature: Vec::new(),
+        };
+        sign_user_cert(&mut fresh_cert, &op_sk);
+        let fresh_tok = encode_user_cert_token(&fresh_cert);
+
+        let updated = engine.call_value(json!({
+            "op": "update_user_cert",
+            "cert_token": fresh_tok,
+            "now_unix_sec": now_sec,
+        }));
+        assert_eq!(updated["ok"], Value::Bool(true));
+        assert_eq!(updated["user_cert_expired"], Value::Bool(false));
+        assert_eq!(
+            updated["cert_expires_at_unix_sec"],
+            Value::from(now_sec + 7 * 86_400)
+        );
+        let updated_bundle_str = updated["updated_bundle_str"].as_str().unwrap();
+        let rechecked = engine.call_value(json!({
+            "op": "set_bundle",
+            "bundle_str": updated_bundle_str,
+            "now_unix_sec": now_sec + 10,
+        }));
+        assert_eq!(rechecked["ok"], Value::Bool(true));
+        assert_eq!(rechecked["user_cert_expired"], Value::Bool(false));
     }
 }

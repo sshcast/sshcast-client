@@ -530,6 +530,8 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         ssh_key_files: Vec::new(),
         ssh_keys_inline: Vec::new(),
         disable_os_agent: false,
+        operator_url: None,
+        config_path: None,
     };
 
     let (_c_tx, c_rx) = watch::channel(None);
@@ -585,6 +587,8 @@ async fn test_workstation_stream_end_to_end_verification_sign_ack_and_local_agen
         ssh_key_files: Vec::new(),
         ssh_keys_inline: Vec::new(),
         disable_os_agent: false,
+        operator_url: None,
+        config_path: None,
     };
 
     let counting_prompter = Arc::new(CountingPrompter {
@@ -677,6 +681,8 @@ async fn test_zellij_local_proxy_dashboard_redirect_and_tunnel() {
         ssh_key_files: Vec::new(),
         ssh_keys_inline: Vec::new(),
         disable_os_agent: false,
+        operator_url: None,
+        config_path: None,
     };
 
     let hub = Arc::new(ZellijProxyHub::new(cfg));
@@ -930,6 +936,8 @@ async fn test_builtin_ssh_agent_keys_without_os_agent() {
         ssh_key_files: vec![key_file_path.to_string_lossy().to_string()],
         ssh_keys_inline: Vec::new(),
         disable_os_agent: true,
+        operator_url: None,
+        config_path: None,
     };
 
     let connector = Arc::new(LocalAgentConnector::from_client_config(&cfg, &[], false).unwrap());
@@ -1042,4 +1050,215 @@ async fn test_builtin_ssh_agent_keys_without_os_agent() {
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), manager_handle).await;
+}
+
+#[tokio::test]
+async fn test_operator_renewal_and_github_login_roundtrip() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use prost::Message;
+    use sshcast_client::config::ClientConfigFile;
+    use sshcast_client::operator::{cert_needs_renewal, login_and_enroll, renew_user_cert_http};
+    use sshcast_proto::bundle::encode_user_cert_token;
+    use sshcast_proto::crypto::{derive_user_id, sign_user_cert};
+    use sshcast_proto::v1::{NodeAuth, UserCert};
+
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // 1. Unit assertions for cert_needs_renewal
+    assert!(!cert_needs_renewal(None, now_sec));
+    let infinite = UserCert {
+        expires_at_unix_sec: 0,
+        ..Default::default()
+    };
+    assert!(!cert_needs_renewal(Some(&infinite), now_sec));
+    let fresh = UserCert {
+        issued_at_unix_sec: now_sec - 100,
+        expires_at_unix_sec: now_sec + 7 * 86_400 - 100,
+        ..Default::default()
+    };
+    assert!(!cert_needs_renewal(Some(&fresh), now_sec));
+    let expiring = UserCert {
+        issued_at_unix_sec: now_sec - 4 * 86_400,
+        expires_at_unix_sec: now_sec + 3 * 86_400,
+        ..Default::default()
+    };
+    assert!(cert_needs_renewal(Some(&expiring), now_sec));
+    let expired = UserCert {
+        issued_at_unix_sec: now_sec - 10_000,
+        expires_at_unix_sec: now_sec - 10,
+        ..Default::default()
+    };
+    assert!(cert_needs_renewal(Some(&expired), now_sec));
+
+    // 2. Mock Operator HTTP server handling /api/v1/enroll/start, /api/v1/enroll/poll, and /api/v1/renew
+    let op_sk = SigningKey::from_bytes(&[0x91; 32]);
+    let op_sk_srv = op_sk.clone();
+    let seen_stripped_cert = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen_stripped_srv = Arc::clone(&seen_stripped_cert);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let base_url_srv = base_url.clone();
+
+    let srv_handle = tokio::spawn(async move {
+        let mut issued_cert_token = String::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = vec![0u8; 16384];
+            let mut total = 0usize;
+            loop {
+                let n = stream.read(&mut buf[total..]).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                let text = String::from_utf8_lossy(&buf[..total]);
+                if let Some(hdr_end) = text.find("\r\n\r\n") {
+                    let hdrs = &text[..hdr_end];
+                    let content_len: usize = hdrs
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if total >= hdr_end + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            let req_text = String::from_utf8_lossy(&buf[..total]);
+            let first_line = req_text.lines().next().unwrap_or("");
+            let path = first_line.split_whitespace().nth(1).unwrap_or("");
+            let body = req_text
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b)
+                .unwrap_or("");
+
+            let resp_body = if path == "/api/v1/enroll/start" {
+                let val: serde_json::Value = serde_json::from_str(body).unwrap();
+                let pub_hex = val["user_pubkey"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("sc_pub_")
+                    .unwrap();
+                let user_pk = hex::decode(pub_hex).unwrap();
+                let mut cert = UserCert {
+                    user_id: derive_user_id(&user_pk),
+                    user_pubkey: user_pk,
+                    operator_pubkey: Vec::new(),
+                    issued_at_unix_sec: now_sec,
+                    expires_at_unix_sec: now_sec + 7 * 86_400,
+                    operator_signature: Vec::new(),
+                };
+                sign_user_cert(&mut cert, &op_sk_srv);
+                issued_cert_token = encode_user_cert_token(&cert);
+                serde_json::json!({
+                    "ok": true,
+                    "state": "state123",
+                    "poll_token": "poll123",
+                    "auth_url": format!("{base_url_srv}/auth/github/start?state=state123")
+                })
+                .to_string()
+            } else if path.starts_with("/api/v1/enroll/poll") {
+                serde_json::json!({
+                    "ok": true,
+                    "status": "approved",
+                    "cert_token": issued_cert_token
+                })
+                .to_string()
+            } else if path == "/api/v1/renew" {
+                let val: serde_json::Value = serde_json::from_str(body).unwrap();
+                let auth_b64 = val["node_auth_proto_b64"].as_str().unwrap();
+                let auth_raw = STANDARD.decode(auth_b64).unwrap();
+                let node_auth = NodeAuth::decode(auth_raw.as_slice()).unwrap();
+                let grant = node_auth.grant.as_ref().unwrap();
+                if grant.user_cert.is_none() {
+                    seen_stripped_srv.store(true, Ordering::SeqCst);
+                }
+                verify_node_auth(
+                    &node_auth,
+                    Some(NodeRole::Client),
+                    now_sec * 1000,
+                    DEFAULT_MAX_CLOCK_SKEW_MS,
+                )
+                .unwrap();
+
+                let mut fresh_cert = UserCert {
+                    user_id: derive_user_id(&grant.user_pubkey),
+                    user_pubkey: grant.user_pubkey.clone(),
+                    operator_pubkey: Vec::new(),
+                    issued_at_unix_sec: now_sec + 10,
+                    expires_at_unix_sec: now_sec + 14 * 86_400,
+                    operator_signature: Vec::new(),
+                };
+                sign_user_cert(&mut fresh_cert, &op_sk_srv);
+                let renewed_tok = encode_user_cert_token(&fresh_cert);
+                serde_json::json!({
+                    "ok": true,
+                    "cert_token": renewed_tok
+                })
+                .to_string()
+            } else {
+                serde_json::json!({ "ok": false, "error": "not found" }).to_string()
+            };
+
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(http_resp.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let tmp = TempDir::new().unwrap();
+    let key_path = tmp.path().join("user_key.toml");
+    let cfg_path = tmp.path().join("client.toml");
+
+    let mut seen_url = String::new();
+    let outcome = login_and_enroll(
+        &[base_url.clone()],
+        Some(&base_url),
+        Some("laptop-login"),
+        Some(&key_path),
+        Some(&cfg_path),
+        false,
+        |url| seen_url = url.to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(seen_url.contains("state123"));
+    assert!(outcome.enrolled_new_client);
+
+    let (_, loaded_file) = ClientConfigFile::load(Some(&cfg_path)).unwrap();
+    assert_eq!(loaded_file.operator_url.as_deref(), Some(base_url.as_str()));
+    let loaded_cfg = ClientConfig::load(Some(&cfg_path)).unwrap();
+    assert_eq!(loaded_cfg.grant.node_id, "laptop-login");
+    assert!(loaded_cfg.grant.user_cert.is_some());
+
+    // Now simulate an expired cert on that client grant and test renewal!
+    let mut expired_grant = loaded_cfg.grant.clone();
+    if let Some(ref mut c) = expired_grant.user_cert {
+        c.expires_at_unix_sec = now_sec - 100;
+    }
+    let renewed = renew_user_cert_http(&base_url, &expired_grant, &loaded_cfg.node_signing_key)
+        .await
+        .unwrap();
+    assert!(seen_stripped_cert.load(Ordering::SeqCst));
+    assert_eq!(renewed.expires_at_unix_sec, now_sec + 14 * 86_400);
+
+    srv_handle.abort();
 }

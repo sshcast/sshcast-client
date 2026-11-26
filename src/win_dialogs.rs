@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use sshcast_proto::bundle::USER_CERT_PREFIX;
@@ -26,11 +27,12 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DrawIconEx, GetClientRect,
     GetDlgCtrlID, GetDlgItem, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW,
-    IsDialogMessageW, IsWindow, LoadCursorW, LoadIconW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowTextW, ShowWindow, DI_NORMAL, IDC_ARROW, IDI_SHIELD, IDYES, MSG,
-    SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_ERASEBKGND, WM_PAINT, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    IsDialogMessageW, IsWindow, LoadCursorW, LoadIconW, PostMessageW, RegisterClassW,
+    SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, DI_NORMAL, IDC_ARROW,
+    IDI_SHIELD, IDYES, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOW, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_SETFONT, WNDCLASSW,
+    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
@@ -100,6 +102,12 @@ const ID_ENROLL_BTN_CLOSE: i32 = 2011;
 const ID_ENROLL_CERT_EDIT: i32 = 2012;
 const ID_ENROLL_BTN_PASTE_CERT: i32 = 2013;
 const ID_ENROLL_BTN_IMPORT_CERT: i32 = 2014;
+const ID_ENROLL_BTN_GITHUB_LOGIN: i32 = 2015;
+const WM_ENROLL_GITHUB_DONE: u32 = WM_APP + 20;
+
+static GITHUB_LOGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static GITHUB_LOGIN_RESULT: Mutex<Option<Result<crate::operator::LoginOutcome, String>>> =
+    Mutex::new(None);
 
 // Control IDs for Bundle Generator Window
 const ID_BUNDLE_ROOT_PUBKEY_EDIT: i32 = 1952;
@@ -1061,12 +1069,25 @@ unsafe extern "system" fn enroll_wnd_proc(
 
             create_command_link(
                 hwnd,
-                "Enroll This Workstation",
-                "Mint a signed client grant using your local root key and save ~/.config/sshcast/client.toml",
+                "Sign in with GitHub",
+                "Open browser OAuth to get an auto-renewing cert & enroll",
                 true,
                 24,
                 270,
-                592,
+                288,
+                58,
+                ID_ENROLL_BTN_GITHUB_LOGIN,
+                dpi,
+                assets.font_ui,
+            );
+            create_command_link(
+                hwnd,
+                "Enroll This Workstation",
+                "Mint grant with local root key & save client.toml",
+                false,
+                328,
+                270,
+                288,
                 58,
                 ID_ENROLL_BTN_ENROLL_PRIMARY,
                 dpi,
@@ -1283,6 +1304,57 @@ unsafe extern "system" fn enroll_wnd_proc(
                                 );
                             }
                         }
+                    }
+                    ID_ENROLL_BTN_GITHUB_LOGIN => {
+                        if GITHUB_LOGIN_IN_FLIGHT
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "GitHub sign-in is already in progress in your browser...",
+                            );
+                            return 0;
+                        }
+                        let node_name = get_dlg_item_string(hwnd, ID_ENROLL_NODE_EDIT);
+                        let servers_raw = get_dlg_item_string(hwnd, ID_ENROLL_SERVERS_EDIT);
+                        let servers = parse_servers_input(&servers_raw);
+                        let cfg_path = crate::win_native::get_tray_context()
+                            .and_then(|c| c.config_path.clone())
+                            .or_else(|| default_client_config_path().ok());
+                        let explicit_op = crate::win_native::get_tray_context()
+                            .and_then(|c| c.current_config())
+                            .and_then(|c| c.operator_url);
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_STYLE_FOOTER_STATUS,
+                            "Opening browser for GitHub sign-in... Complete login in browser.",
+                        );
+                        let hwnd_raw = hwnd as isize;
+                        std::thread::spawn(move || {
+                            let res = match tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                            {
+                                Ok(rt) => rt.block_on(crate::operator::login_and_enroll(
+                                    &servers,
+                                    explicit_op.as_deref(),
+                                    Some(node_name.trim()).filter(|s| !s.is_empty()),
+                                    None,
+                                    cfg_path.as_deref(),
+                                    true,
+                                    |_| {},
+                                ))
+                                .map_err(|e| format!("{e:#}")),
+                                Err(e) => Err(format!("failed to start async runtime: {e}")),
+                            };
+                            if let Ok(mut guard) = GITHUB_LOGIN_RESULT.lock() {
+                                *guard = Some(res);
+                            }
+                            GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+                            PostMessageW(hwnd_raw as HWND, WM_ENROLL_GITHUB_DONE, 0, 0);
+                        });
                     }
                     ID_ENROLL_BTN_ENROLL_PRIMARY => {
                         let node_name = get_dlg_item_string(hwnd, ID_ENROLL_NODE_EDIT);
@@ -1563,6 +1635,41 @@ unsafe extern "system" fn enroll_wnd_proc(
                         DestroyWindow(hwnd);
                     }
                     _ => {}
+                }
+            }
+            0
+        }
+        WM_ENROLL_GITHUB_DONE => {
+            let outcome_opt = GITHUB_LOGIN_RESULT.lock().ok().and_then(|mut g| g.take());
+            if let Some(outcome_res) = outcome_opt {
+                match outcome_res {
+                    Ok(outcome) => {
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_ENROLL_ROOT_KEY_EDIT,
+                            &outcome.user_pubkey_token,
+                        );
+                        let cfg_path = crate::win_native::get_tray_context()
+                            .and_then(|c| c.config_path.clone())
+                            .or_else(|| default_client_config_path().ok());
+                        if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
+                            set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, &status);
+                        }
+                        crate::win_native::reload_tray_configuration();
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_STYLE_FOOTER_STATUS,
+                            &format!("Signed in via GitHub as '{}' — connecting!", outcome.user_id),
+                        );
+                    }
+                    Err(err_msg) => {
+                        set_dlg_item_string(hwnd, ID_STYLE_FOOTER_STATUS, "GitHub sign-in failed.");
+                        show_tray_error_dialog(
+                            "GitHub Sign-In Failed",
+                            "Could not complete GitHub OAuth enrollment",
+                            &err_msg,
+                        );
+                    }
                 }
             }
             0

@@ -8,6 +8,8 @@ pub mod enroll;
 pub mod gui;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod local_agent;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod operator;
 #[cfg(target_os = "macos")]
 pub mod mac_dialogs;
 #[cfg(target_os = "macos")]

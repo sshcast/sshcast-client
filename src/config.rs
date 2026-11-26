@@ -97,6 +97,9 @@ pub struct ClientConfigFile {
     /// Disable querying the external OS SSH agent (`$SSH_AUTH_SOCK` / Windows `openssh-ssh-agent`) and use only built-in keys
     #[serde(default)]
     pub disable_os_agent: bool,
+    /// Optional explicit Operator URL (e.g. `https://op.sshcast.net`) overriding DNS discovery for UserCert renewal
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +116,42 @@ pub struct ClientConfig {
     pub ssh_key_files: Vec<String>,
     pub ssh_keys_inline: Vec<String>,
     pub disable_os_agent: bool,
+    pub operator_url: Option<String>,
+    pub config_path: Option<PathBuf>,
+}
+
+/// Atomically writes `content` to `path` with `0600` permissions on Unix via a sibling temp file.
+pub fn atomic_write_private_file(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sshcast");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let tmp_name = format!(".{file_name}.tmp.{}.{nanos}", std::process::id());
+    let tmp_path = path.with_file_name(tmp_name);
+    std::fs::write(&tmp_path, content)
+        .with_context(|| format!("failed to write temp file {}", tmp_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set 0600 permissions on {}", tmp_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("failed to rename {} to {}", tmp_path.display(), path.display()))?;
+    Ok(())
 }
 
 impl ClientConfigFile {
@@ -135,6 +174,7 @@ impl ClientConfigFile {
             ssh_key_files: Vec::new(),
             ssh_keys_inline: Vec::new(),
             disable_os_agent: false,
+            operator_url: None,
         }
     }
 
@@ -157,13 +197,8 @@ impl ClientConfigFile {
             Some(p) => p.to_path_buf(),
             None => default_client_config_path()?,
         };
-        if let Some(parent) = cfg_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        }
         let toml_str = toml::to_string_pretty(self).context("failed to serialize client.toml")?;
-        std::fs::write(&cfg_path, &toml_str)
-            .with_context(|| format!("failed to write {}", cfg_path.display()))?;
+        atomic_write_private_file(&cfg_path, &toml_str)?;
         Ok(cfg_path)
     }
 }
@@ -176,7 +211,9 @@ impl ClientConfig {
         };
         let raw = std::fs::read_to_string(&cfg_path)
             .with_context(|| format!("failed to read client config {}", cfg_path.display()))?;
-        Self::from_toml_str(&raw)
+        let mut cfg = Self::from_toml_str(&raw)?;
+        cfg.config_path = Some(cfg_path);
+        Ok(cfg)
     }
 
     pub fn from_toml_str(raw: &str) -> Result<Self> {
@@ -220,6 +257,8 @@ impl ClientConfig {
             ssh_key_files: file.ssh_key_files,
             ssh_keys_inline: file.ssh_keys_inline,
             disable_os_agent: file.disable_os_agent,
+            operator_url: file.operator_url,
+            config_path: None,
         })
     }
 }
