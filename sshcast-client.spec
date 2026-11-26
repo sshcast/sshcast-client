@@ -6,7 +6,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Workstation GUI and Enrollment CLI for Sshcast Roaming SSH Agent
 License:        MIT OR Apache-2.0
-URL:            https://github.com/theraphim/sshcast-client
+URL:            https://github.com/sshcast/sshcast-client
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
@@ -43,6 +43,7 @@ install -D -m 0644 systemd/sshcast-client.service %{buildroot}%{_userunitdir}/ss
 %systemd_user_preun sshcast-client.service
 
 %files
+%license LICENSE-MIT LICENSE-APACHE
 %doc README.md
 %{_bindir}/sshcast-client
 %{_userunitdir}/sshcast-client.service

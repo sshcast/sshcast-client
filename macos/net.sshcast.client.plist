@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.sshcast.client</string>
+    <string>net.sshcast.client</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/sshcast-tray</string>

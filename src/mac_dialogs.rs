@@ -111,7 +111,7 @@ fn default_servers_csv(ctx: Option<&TraySharedContext>) -> String {
             }
         }
     }
-    "https://sshcast.stingr.net".to_string()
+    "sshcast.net".to_string()
 }
 
 fn add_window_chrome(
@@ -529,7 +529,7 @@ define_class!(
                 show_tray_error_dialog(
                     "Validation Error",
                     "At least one Coordinator Domain or URL is required",
-                    "Please enter your coordinator domain (e.g. 'sshcast.net') or URL (e.g. 'https://sshcast.stingr.net').",
+                    "Please enter your coordinator domain (e.g. 'sshcast.net') or URL (e.g. 'https://c1.sshcast.net').",
                 );
                 return;
             }
@@ -1359,7 +1359,7 @@ define_class!(
                 show_tray_error_dialog(
                     "Validation Error",
                     "At least one Coordinator URL is required",
-                    "Enter at least one coordinator URL (e.g. 'https://sshcast.stingr.net').",
+                    "Enter at least one coordinator domain or URL (e.g. 'sshcast.net' or 'https://c1.sshcast.net').",
                 );
                 return;
             }
@@ -1903,7 +1903,7 @@ define_class!(
                         show_tray_error_dialog(
                             "Invalid Coordinator Entry",
                             "Enter a domain name (_sshcast DNS TXT) or an http(s):// URL",
-                            "Example: sshcast.net or https://sshcast.stingr.net",
+                            "Example: sshcast.net or https://c1.sshcast.net",
                         );
                         return;
                     }

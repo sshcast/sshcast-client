@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, S_OK, WPARAM};
+use windows_sys::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, S_OK, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Controls::{
     TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
     TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS, TDCBF_CANCEL_BUTTON, TDCBF_OK_BUTTON,
@@ -402,7 +403,11 @@ pub fn reload_tray_configuration() {
     }
 }
 
-unsafe fn load_tray_icon() -> HICON {
+unsafe fn load_tray_icon(hinstance: HINSTANCE) -> HICON {
+    let custom = LoadIconW(hinstance, 1usize as *const u16);
+    if !custom.is_null() {
+        return custom;
+    }
     let shield = LoadIconW(null_mut(), IDI_SHIELD);
     if !shield.is_null() {
         return shield;
@@ -789,12 +794,15 @@ pub fn run_windows_tray_loop(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     unsafe {
+        let mutex_name = to_wide("Local\\net.sshcast.client.tray");
+        let _tray_mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
+
         let hinstance = GetModuleHandleW(null());
         let class_name = to_wide("SshcastTrayHiddenWindowClass");
         let window_name = to_wide("Sshcast System Tray");
         let taskbar_created_name = to_wide("TaskbarCreated");
         let taskbar_created_msg = RegisterWindowMessageW(taskbar_created_name.as_ptr());
-        let hicon = load_tray_icon();
+        let hicon = load_tray_icon(hinstance);
 
         let wc = WNDCLASSW {
             style: 0,
