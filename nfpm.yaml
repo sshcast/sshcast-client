@@ -1,0 +1,30 @@
+name: sshcast-client
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${NFPM_VERSION}
+maintainer: Paul Komkoff <i@stingr.net>
+description: Workstation GUI and Enrollment CLI for Sshcast Roaming SSH Agent
+homepage: https://sshcast.net
+license: MIT OR Apache-2.0
+
+contents:
+  - src: ${BIN_DIR}/sshcast-client
+    dst: /usr/bin/sshcast-client
+    file_info:
+      mode: 0755
+  - src: systemd/sshcast-client.service
+    dst: /usr/lib/systemd/user/sshcast-client.service
+    file_info:
+      mode: 0644
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/sshcast-client/LICENSE-MIT
+    file_info:
+      mode: 0644
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/sshcast-client/LICENSE-APACHE
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/sshcast-client/README.md
+    file_info:
+      mode: 0644

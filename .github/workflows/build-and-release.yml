@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -23,6 +23,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive_name: sshcast-client-linux-x86_64.tar.gz
             bin_name: sshcast-client
+            nfpm_arch: amd64
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_name: sshcast-client-linux-arm64.tar.gz
+            bin_name: sshcast-client
+            nfpm_arch: arm64
+            deb_arch: arm64
+            rpm_arch: aarch64
           - os: macos-latest
             target: aarch64-apple-darwin
             archive_name: sshcast-client-macos-arm64.tar.gz
@@ -54,40 +64,237 @@ jobs:
         if: matrix.target != 'x86_64-apple-darwin'
         run: cargo test --release --locked --target ${{ matrix.target }}
 
-      - name: Package Unix archive
+      - name: Set up Go for nfpm
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install nfpm
+        if: runner.os == 'Linux'
+        shell: bash
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
+
+      - name: Package Unix archive and Linux packages
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p dist
+          set -euo pipefail
+          mkdir -p dist artifacts
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" dist/
-          cp README.md dist/
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/
           if [ "${{ runner.os }}" = "macOS" ]; then
             cp "target/${{ matrix.target }}/release/sshcast-tray" dist/
             cp -r macos dist/
+            codesign --force --sign - dist/sshcast-client dist/sshcast-tray
           else
             cp -r systemd dist/
           fi
-          tar -C dist -czf "${{ matrix.archive_name }}" .
+          tar -C dist -czf "artifacts/${{ matrix.archive_name }}" .
 
-      - name: Package Windows archive
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            case "${{ github.ref }}" in
+              refs/tags/v*)
+                VERSION="${GITHUB_REF_NAME#v}"
+                ;;
+              refs/tags/sshcast-client-*)
+                VERSION="${GITHUB_REF_NAME#sshcast-client-}"
+                ;;
+              *)
+                VERSION=$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)
+                ;;
+            esac
+            export BIN_DIR=dist
+            export NFPM_ARCH="${{ matrix.nfpm_arch }}"
+            export NFPM_VERSION="${VERSION}"
+            nfpm pkg --config nfpm.yaml --packager deb --target "artifacts/sshcast-client_${VERSION}_${{ matrix.deb_arch }}.deb"
+            nfpm pkg --config nfpm.yaml --packager rpm --target "artifacts/sshcast-client-${VERSION}-1.${{ matrix.rpm_arch }}.rpm"
+          fi
+
+      - name: Package Windows archive and Inno Setup installer
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist, artifacts | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/sshcast-client.exe" -Destination dist/
           Copy-Item "target/${{ matrix.target }}/release/sshcast-tray.exe" -Destination dist/
-          Copy-Item README.md -Destination dist/
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE -Destination dist/
           Copy-Item -Recurse windows -Destination dist/
-          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive_name }}" -Force
+          Compress-Archive -Path dist/* -DestinationPath "artifacts/${{ matrix.archive_name }}" -Force
+
+          $ref = "${{ github.ref }}"
+          if ($ref.StartsWith("refs/tags/v")) {
+            $ver = $ref.Substring("refs/tags/v".Length)
+          } elseif ($ref.StartsWith("refs/tags/sshcast-client-")) {
+            $ver = $ref.Substring("refs/tags/sshcast-client-".Length)
+          } else {
+            $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          }
+
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (-not $iscc) {
+            $fallback = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+            if (Test-Path $fallback) {
+              $iscc = $fallback
+            } else {
+              throw "Inno Setup compiler (ISCC.exe) not found."
+            }
+          }
+
+          & $iscc "/DAppVersion=$ver" "/DDistDir=dist" "/DOutDir=." "windows\sshcast-client.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC.exe failed with exit code $LASTEXITCODE"
+          }
+          Move-Item -Force "sshcast-client-setup-windows-x86_64.exe" -Destination "artifacts/"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.archive_name }}
-          path: ${{ matrix.archive_name }}
+          name: dist-${{ matrix.target }}
+          path: artifacts/*
 
-      - name: Attach to GitHub Release (on tag)
-        if: startsWith(github.ref, 'refs/tags/')
+  release:
+    name: Release & Provenance
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: dist-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum * > ../SHA256SUMS.txt)
+          mv SHA256SUMS.txt release-assets/SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'release-assets/*'
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.archive_name }}
+          files: release-assets/*
+          generate_release_notes: true
+
+  update-homebrew-tap:
+    name: Update Homebrew Tap
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Download macOS release archives
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/download-artifact@v6
+        with:
+          pattern: dist-*-apple-darwin
+          path: release-assets
+          merge-multiple: true
+
+      - name: Checkout sshcast/homebrew-tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        uses: actions/checkout@v6
+        with:
+          repository: sshcast/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Formula/sshcast-client.rb and push
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          ARM_SHA=$(sha256sum release-assets/sshcast-client-macos-arm64.tar.gz | awk '{print $1}')
+          X64_SHA=$(sha256sum release-assets/sshcast-client-macos-x86_64.tar.gz | awk '{print $1}')
+
+          python3 - "$VER" "$ARM_SHA" "$X64_SHA" "homebrew-tap/Formula/sshcast-client.rb" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          ver, arm_sha, x64_sha, formula_path = sys.argv[1:5]
+          p = pathlib.Path(formula_path)
+          text = p.read_text()
+
+          text, n_ver = re.subn(
+              r'^(\s*version\s+)"[^"]+"',
+              rf'\g<1>"{ver}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if n_ver != 1:
+              raise SystemExit(f"Expected 1 version line in {formula_path}, matched {n_ver}")
+
+          text = re.sub(r'/download/v[0-9][^/"#]*/', f'/download/v{ver}/', text)
+
+          lines = text.splitlines(keepends=True)
+          current_arch = None
+          replaced = {"arm64": 0, "x86_64": 0}
+          out = []
+          for line in lines:
+              if "macos-arm64" in line or "Hardware::CPU.arm?" in line or "on_arm" in line:
+                  current_arch = "arm64"
+              elif (
+                  "macos-x86_64" in line
+                  or "Hardware::CPU.intel?" in line
+                  or "on_intel" in line
+                  or (current_arch == "arm64" and re.match(r"^\s*else\s*$", line))
+              ):
+                  current_arch = "x86_64"
+
+              if current_arch and re.match(r'^\s*sha256\s+"[0-9a-fA-F]{64}"', line):
+                  sha = arm_sha if current_arch == "arm64" else x64_sha
+                  line = re.sub(r'"[0-9a-fA-F]{64}"', f'"{sha}"', line, count=1)
+                  replaced[current_arch] += 1
+                  current_arch = None
+              out.append(line)
+
+          if replaced["arm64"] != 1 or replaced["x86_64"] != 1:
+              raise SystemExit(f"Failed to update both sha256 entries: {replaced}")
+
+          p.write_text("".join(out))
+          PY
+
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet Formula/sshcast-client.rb; then
+            echo "Formula already up to date"
+            exit 0
+          fi
+          git add Formula/sshcast-client.rb
+          git commit -m "sshcast-client ${VER}"
+          git push
+
+  submit-winget:
+    name: Submit Winget Manifest
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - name: Submit to winget-pkgs
+        if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: Sshcast.Client
+          installers-regex: 'sshcast-client-setup-windows-x86_64\.exe$'
+          token: ${{ secrets.WINGET_TOKEN }}
