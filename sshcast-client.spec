@@ -2,7 +2,7 @@
 %global rustflags_codegen_units 16
 
 Name:           sshcast-client
-Version:        0.1.1
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        Workstation GUI and Enrollment CLI for Sshcast Roaming SSH Agent
 License:        MIT OR Apache-2.0
@@ -58,6 +58,9 @@ install -D -m 0644 systemd/sshcast-client.service %{buildroot}%{_userunitdir}/ss
 %{_userunitdir}/sshcast-client.service
 
 %changelog
+* Fri Nov 27 2026 Paul Komkoff <i@stingr.net> - 0.1.3-1
+- Fix Windows unit test manifest embedding and resolve TaskDialogIndirect dynamically
+
 * Fri Nov 27 2026 Paul Komkoff <i@stingr.net> - 0.1.1-1
 - Add zero-trust device pairing, background pairing approval prompts, and recovery passphrase vault support
 
