@@ -1,5 +1,7 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
@@ -14,11 +16,13 @@ use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
 use objc2_foundation::{
     NSObject, NSObjectProtocol, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
 };
+use tokio::sync::mpsc;
+use zeroize::Zeroizing;
 
 use sshcast_proto::bundle::USER_CERT_PREFIX;
 use sshcast_proto::v1::NodeRole;
 
-use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
+use crate::config::{default_client_config_path, ClientConfig, ClientConfigFile, UserKeyFile};
 use crate::enroll::{
     decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
     import_user_cert, import_user_root_key, load_user_cert, load_user_signing_key,
@@ -26,9 +30,17 @@ use crate::enroll::{
     write_client_config_from_bundle, USER_KEY_TOKEN_PREFIX,
 };
 use crate::mac_native::{
-    confirm_overwrite_dialog, get_tray_context, reload_tray_configuration, run_on_main_async,
-    show_tray_error_dialog, TraySharedContext,
+    confirm_action_dialog, confirm_overwrite_dialog, get_tray_context, reload_tray_configuration,
+    resolve_tray_user_key_path, run_on_main_async, show_tray_error_dialog, TraySharedContext,
 };
+use crate::operator::{
+    cancel_enrollment_pairing, complete_paired_enrollment, confirm_replace_lost_root_key,
+    delete_recovery_vault_http, finalize_new_or_same_key_enrollment,
+    get_recovery_vault_status_http, is_terminal_enroll_error, poll_enrollment_once,
+    resolve_operator_url, start_github_enrollment, unlock_with_recovery_passphrase,
+    upload_recovery_vault_http, EnrollPollStep, LoginOutcome, PendingPairingInfo,
+};
+use crate::pairing::{encrypt_recovery_vault, ScryptParams, VaultDecryptError};
 
 const FOOTER_HEIGHT: CGFloat = 52.0;
 
@@ -312,15 +324,18 @@ fn add_action_card_button(
     btn
 }
 
-fn create_centered_window(
+fn create_window_with_style(
     mtm: MainThreadMarker,
     title: &str,
     win_w: CGFloat,
     win_h: CGFloat,
+    closable: bool,
 ) -> Retained<NSWindow> {
-    let style = NSWindowStyleMask::Titled
-        | NSWindowStyleMask::Closable
-        | NSWindowStyleMask::Miniaturizable;
+    let style = if closable {
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable
+    } else {
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Miniaturizable
+    };
     let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(win_w, win_h));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -339,6 +354,24 @@ fn create_centered_window(
     window
 }
 
+fn create_centered_window(
+    mtm: MainThreadMarker,
+    title: &str,
+    win_w: CGFloat,
+    win_h: CGFloat,
+) -> Retained<NSWindow> {
+    create_window_with_style(mtm, title, win_w, win_h, true)
+}
+
+fn create_nonclosable_centered_window(
+    mtm: MainThreadMarker,
+    title: &str,
+    win_w: CGFloat,
+    win_h: CGFloat,
+) -> Retained<NSWindow> {
+    create_window_with_style(mtm, title, win_w, win_h, false)
+}
+
 // ============================================================================
 // 1. INITIALIZE / ENROLL WORKSTATION WINDOW (640 x 600)
 // ============================================================================
@@ -354,10 +387,22 @@ struct EnrollWindowWidgets {
     _handler: Retained<EnrollWindowHandler>,
 }
 
+enum PairingUiAction {
+    Unlock(Zeroizing<String>),
+    Reset,
+    Cancel,
+}
+
 static GITHUB_LOGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static LOGIN_SESSION_GEN: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_PAIRING_TX: Mutex<Option<mpsc::UnboundedSender<PairingUiAction>>> = Mutex::new(None);
+static RECOVERY_OP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static RECOVERY_STATUS_GEN: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static ENROLL_WINDOW: RefCell<Option<EnrollWindowWidgets>> = const { RefCell::new(None) };
+    static PAIRING_WINDOW: RefCell<Option<PairingWaitWindowWidgets>> = const { RefCell::new(None) };
+    static RECOVERY_WINDOW: RefCell<Option<RecoveryWindowWidgets>> = const { RefCell::new(None) };
     static BUNDLE_WINDOW: RefCell<Option<BundleWindowWidgets>> = const { RefCell::new(None) };
     static BACKENDS_WINDOW: RefCell<Option<BackendsWindowWidgets>> = const { RefCell::new(None) };
     static SSH_KEYS_WINDOW: RefCell<Option<SshKeysWindowWidgets>> = const { RefCell::new(None) };
@@ -511,11 +556,26 @@ define_class!(
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
+                let has_active_pairing = ACTIVE_PAIRING_TX
+                    .lock()
+                    .ok()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false);
+                if has_active_pairing {
+                    PAIRING_WINDOW.with(|cell| {
+                        if let Some(ref w) = *cell.borrow() {
+                            w.window.makeKeyAndOrderFront(None);
+                        }
+                    });
+                }
                 ENROLL_WINDOW.with(|cell| {
                     if let Some(ref w) = *cell.borrow() {
-                        w.footer_status.setStringValue(&NSString::from_str(
-                            "GitHub sign-in is already in progress in your browser...",
-                        ));
+                        let msg = if has_active_pairing {
+                            "Device pairing is waiting — complete or cancel in the Approve This Workstation window."
+                        } else {
+                            "GitHub sign-in is already in progress in your browser..."
+                        };
+                        w.footer_status.setStringValue(&NSString::from_str(msg));
                     }
                 });
                 return;
@@ -539,6 +599,8 @@ define_class!(
                 .and_then(|c| c.current_config())
                 .and_then(|c| c.operator_url);
 
+            let session_gen = LOGIN_SESSION_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+
             ENROLL_WINDOW.with(|cell| {
                 if let Some(ref w) = *cell.borrow() {
                     w.footer_status.setStringValue(&NSString::from_str(
@@ -548,56 +610,88 @@ define_class!(
             });
 
             std::thread::spawn(move || {
-                let res = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt
-                        .block_on(crate::operator::login_and_enroll(
-                            &servers,
-                            explicit_op.as_deref(),
-                            Some(node_name.trim()).filter(|s| !s.is_empty()),
-                            None,
-                            cfg_path.as_deref(),
-                            true,
-                            |_| {},
-                        ))
-                        .map_err(|e| format!("{e:#}")),
-                    Err(e) => Err(format!("failed to start async runtime: {e}")),
-                };
-                GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
-                crate::mac_native::run_on_main_async(move |_mtm| match res {
-                    Ok(outcome) => {
-                        let status = format_user_cert_status(cfg_path.as_deref());
-                        reload_tray_configuration();
-                        let msg = format!(
-                            "Signed in via GitHub as '{}' — connecting!",
-                            outcome.user_id
-                        );
-                        ENROLL_WINDOW.with(|cell| {
-                            if let Some(ref w) = *cell.borrow() {
-                                w.root_key_edit.setStringValue(&NSString::from_str(
-                                    &outcome.user_pubkey_token,
-                                ));
-                                if let Some(ref s) = status {
-                                    w.cert_edit.setStringValue(&NSString::from_str(s));
-                                }
-                                w.footer_status.setStringValue(&NSString::from_str(&msg));
-                            }
-                        });
+                let res = {
+                    let _flight_guard = GithubLoginFlightGuard { session_gen };
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt
+                            .block_on(run_github_enrollment_actor(
+                                servers,
+                                explicit_op,
+                                node_name,
+                                cfg_path.clone(),
+                                session_gen,
+                            ))
+                            .map_err(|e| format!("{e:#}")),
+                        Err(e) => Err(format!("failed to start async runtime: {e}")),
                     }
-                    Err(err_msg) => {
-                        ENROLL_WINDOW.with(|cell| {
-                            if let Some(ref w) = *cell.borrow() {
-                                w.footer_status
-                                    .setStringValue(&NSString::from_str("GitHub sign-in failed."));
-                            }
-                        });
-                        show_tray_error_dialog(
-                            "GitHub Sign-In Failed",
-                            "Could not complete GitHub OAuth enrollment",
-                            &err_msg,
-                        );
+                };
+
+                run_on_main_async(move |_mtm| {
+                    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+                        return;
+                    }
+                    match res {
+                        Ok(Some(outcome)) => {
+                            reload_tray_configuration();
+                            apply_login_outcome_to_enroll_window(&outcome, cfg_path.as_deref());
+                            PAIRING_WINDOW.with(|cell| {
+                                if let Some(ref w) = *cell.borrow() {
+                                    if let Some(ref pass_edit) = w.pass_edit {
+                                        pass_edit.setStringValue(&NSString::from_str(""));
+                                    }
+                                    if w.window.isVisible() {
+                                        w.window.close();
+                                    }
+                                }
+                            });
+                        }
+                        Ok(None) => {
+                            PAIRING_WINDOW.with(|cell| {
+                                if let Some(ref w) = *cell.borrow() {
+                                    if let Some(ref pass_edit) = w.pass_edit {
+                                        pass_edit.setStringValue(&NSString::from_str(""));
+                                    }
+                                    if w.window.isVisible() {
+                                        w.window.close();
+                                    }
+                                }
+                            });
+                            ENROLL_WINDOW.with(|cell| {
+                                if let Some(ref w) = *cell.borrow() {
+                                    w.footer_status.setStringValue(&NSString::from_str(
+                                        "GitHub sign-in canceled.",
+                                    ));
+                                }
+                            });
+                        }
+                        Err(err_msg) => {
+                            PAIRING_WINDOW.with(|cell| {
+                                if let Some(ref mut w) = *cell.borrow_mut() {
+                                    w.is_terminal = true;
+                                    w.footer_status.setStringValue(&NSString::from_str(&err_msg));
+                                    if let Some(ref btn) = w.unlock_btn {
+                                        btn.setEnabled(false);
+                                    }
+                                    w.reset_btn.setEnabled(false);
+                                    w.cancel_btn.setTitle(&NSString::from_str("Close"));
+                                }
+                            });
+                            ENROLL_WINDOW.with(|cell| {
+                                if let Some(ref w) = *cell.borrow() {
+                                    w.footer_status.setStringValue(&NSString::from_str(
+                                        "GitHub sign-in failed.",
+                                    ));
+                                }
+                            });
+                            show_tray_error_dialog(
+                                "GitHub Sign-In Failed",
+                                "Could not complete GitHub OAuth enrollment",
+                                &err_msg,
+                            );
+                        }
                     }
                 });
             });
@@ -2858,5 +2952,1303 @@ pub fn show_ssh_keys_window() {
         SSH_KEYS_WINDOW.with(|cell| {
             *cell.borrow_mut() = Some(widgets);
         });
+    });
+}
+
+// ============================================================================
+// 5. DEVICE PAIRING WAIT & RECOVERY UNLOCK WINDOW (580 x 472)
+// ============================================================================
+
+struct GithubLoginFlightGuard {
+    session_gen: u64,
+}
+
+impl Drop for GithubLoginFlightGuard {
+    fn drop(&mut self) {
+        if LOGIN_SESSION_GEN.load(Ordering::SeqCst) == self.session_gen {
+            if let Ok(mut guard) = ACTIVE_PAIRING_TX.lock() {
+                *guard = None;
+            }
+            GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn load_tray_user_key_file(
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<(std::path::PathBuf, UserKeyFile)> {
+    if let Some(sibling) = resolve_tray_user_key_path(config_path) {
+        if let Ok(loaded) = UserKeyFile::load(Some(&sibling)) {
+            return Ok(loaded);
+        }
+    }
+    UserKeyFile::load(None)
+}
+
+fn load_tray_user_signing_key(
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<ed25519_dalek::SigningKey> {
+    if let Some(sibling) = resolve_tray_user_key_path(config_path) {
+        if let Ok(sk) = load_user_signing_key(Some(&sibling)) {
+            return Ok(sk);
+        }
+    }
+    load_user_signing_key(None)
+}
+
+fn is_wrong_passphrase_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<VaultDecryptError>(),
+            Some(VaultDecryptError::WrongPassphrase)
+        )
+    })
+}
+
+fn apply_login_outcome_to_enroll_window(
+    outcome: &LoginOutcome,
+    fallback_cfg_path: Option<&std::path::Path>,
+) {
+    let status = format_user_cert_status(Some(&outcome.config_path))
+        .or_else(|| format_user_cert_status(fallback_cfg_path));
+    let msg = format!(
+        "Signed in via GitHub as '{}' — connecting!",
+        outcome.user_id
+    );
+    ENROLL_WINDOW.with(|cell| {
+        if let Some(ref w) = *cell.borrow() {
+            w.root_key_edit
+                .setStringValue(&NSString::from_str(&outcome.user_pubkey_token));
+            if let Some(ref s) = status {
+                w.cert_edit.setStringValue(&NSString::from_str(s));
+            }
+            w.footer_status.setStringValue(&NSString::from_str(&msg));
+        }
+    });
+}
+
+fn set_pairing_status_text(msg: &str) {
+    PAIRING_WINDOW.with(|cell| {
+        if let Some(ref w) = *cell.borrow() {
+            w.footer_status.setStringValue(&NSString::from_str(msg));
+        }
+    });
+}
+
+async fn run_github_enrollment_actor(
+    servers: Vec<String>,
+    explicit_op: Option<String>,
+    node_name: String,
+    cfg_path: Option<std::path::PathBuf>,
+    session_gen: u64,
+) -> anyhow::Result<Option<LoginOutcome>> {
+    let key_file = resolve_tray_user_key_path(cfg_path.as_deref());
+    let started = start_github_enrollment(
+        &servers,
+        explicit_op.as_deref(),
+        Some(node_name.trim()).filter(|s| !s.is_empty()),
+        key_file.as_deref(),
+        cfg_path.as_deref(),
+        true,
+        |_| {},
+    )
+    .await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let mut logged_awaiting = false;
+
+    let mut pairing_info = loop {
+        if tokio::time::Instant::now() >= deadline {
+            let _ = cancel_enrollment_pairing(&started).await;
+            anyhow::bail!("timed out waiting for GitHub OAuth enrollment completion");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let step = match poll_enrollment_once(&started).await {
+            Ok(s) => s,
+            Err(e) if is_terminal_enroll_error(&e) => return Err(e),
+            Err(e) => {
+                tracing::debug!("Enrollment poll transient error: {e:#}");
+                continue;
+            }
+        };
+
+        match step {
+            EnrollPollStep::Pending => {}
+            EnrollPollStep::AwaitingApproval => {
+                if !logged_awaiting {
+                    logged_awaiting = true;
+                    run_on_main_async(move |_mtm| {
+                        if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+                            return;
+                        }
+                        ENROLL_WINDOW.with(|cell| {
+                            if let Some(ref w) = *cell.borrow() {
+                                w.footer_status.setStringValue(&NSString::from_str(
+                                    "GitHub sign-in completed; waiting for operator approval...",
+                                ));
+                            }
+                        });
+                    });
+                }
+            }
+            EnrollPollStep::Approved { cert_token } => {
+                let outcome = finalize_new_or_same_key_enrollment(&started, &cert_token)?;
+                return Ok(Some(outcome));
+            }
+            EnrollPollStep::Paired {
+                pairing_id,
+                existing_user_pubkey,
+                envelope,
+                ..
+            } => {
+                let outcome = complete_paired_enrollment(
+                    started,
+                    &existing_user_pubkey,
+                    &pairing_id,
+                    &envelope,
+                )
+                .await?;
+                return Ok(Some(outcome));
+            }
+            EnrollPollStep::PairingRequired(info) => break info,
+            EnrollPollStep::Denied(reason) => {
+                anyhow::bail!("enrollment rejected ({reason})");
+            }
+        }
+    };
+
+    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+        let _ = cancel_enrollment_pairing(&started).await;
+        return Ok(None);
+    }
+
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel::<PairingUiAction>();
+    if let Ok(mut guard) = ACTIVE_PAIRING_TX.lock() {
+        *guard = Some(action_tx);
+    }
+    let info_clone = pairing_info.clone();
+    run_on_main_async(move |_mtm| {
+        if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+            return;
+        }
+        show_pairing_wait_window(info_clone);
+    });
+
+    let mut poll_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+    poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline_sleep => {
+                let _ = cancel_enrollment_pairing(&started).await;
+                anyhow::bail!("timed out waiting for device pairing approval");
+            }
+            _ = poll_interval.tick() => {
+                let step = match poll_enrollment_once(&started).await {
+                    Ok(s) => s,
+                    Err(e) if is_terminal_enroll_error(&e) => return Err(e),
+                    Err(e) => {
+                        tracing::debug!("Pairing poll transient error: {e:#}");
+                        continue;
+                    }
+                };
+                match step {
+                    EnrollPollStep::Paired {
+                        pairing_id,
+                        existing_user_pubkey,
+                        envelope,
+                        ..
+                    } => {
+                        let outcome = complete_paired_enrollment(
+                            started,
+                            &existing_user_pubkey,
+                            &pairing_id,
+                            &envelope,
+                        )
+                        .await?;
+                        return Ok(Some(outcome));
+                    }
+                    EnrollPollStep::Approved { cert_token } => {
+                        let outcome = finalize_new_or_same_key_enrollment(&started, &cert_token)?;
+                        return Ok(Some(outcome));
+                    }
+                    EnrollPollStep::PairingRequired(new_info) => {
+                        pairing_info = new_info;
+                    }
+                    EnrollPollStep::Denied(reason) => {
+                        anyhow::bail!("enrollment rejected ({reason})");
+                    }
+                    EnrollPollStep::Pending | EnrollPollStep::AwaitingApproval => {}
+                }
+            }
+            maybe_action = action_rx.recv() => {
+                match maybe_action {
+                    Some(PairingUiAction::Unlock(pass)) => {
+                        match unlock_with_recovery_passphrase(&started, &pairing_info, &pass).await {
+                            Ok(outcome) => return Ok(Some(outcome)),
+                            Err(e) => {
+                                let msg = if is_wrong_passphrase_error(&e) {
+                                    "Incorrect recovery passphrase. Please try again.".to_string()
+                                } else {
+                                    format!("Unlock failed: {e:#}")
+                                };
+                                run_on_main_async(move |_mtm| {
+                                    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+                                        return;
+                                    }
+                                    PAIRING_WINDOW.with(|cell| {
+                                        if let Some(ref w) = *cell.borrow() {
+                                            w.footer_status.setStringValue(&NSString::from_str(&msg));
+                                            if let Some(ref btn) = w.unlock_btn {
+                                                btn.setEnabled(true);
+                                            }
+                                            w.reset_btn.setEnabled(true);
+                                        }
+                                    });
+                                });
+                            }
+                        }
+                    }
+                    Some(PairingUiAction::Reset) => {
+                        match confirm_replace_lost_root_key(&started).await {
+                            Ok(outcome) => return Ok(Some(outcome)),
+                            Err(e) => {
+                                let err_str = format!("{e:#}");
+                                let status_msg = format!("Reset failed: {err_str}");
+                                run_on_main_async(move |_mtm| {
+                                    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+                                        return;
+                                    }
+                                    PAIRING_WINDOW.with(|cell| {
+                                        if let Some(ref w) = *cell.borrow() {
+                                            w.footer_status.setStringValue(&NSString::from_str(&status_msg));
+                                            w.reset_btn.setEnabled(true);
+                                            if let Some(ref btn) = w.unlock_btn {
+                                                btn.setEnabled(true);
+                                            }
+                                        }
+                                    });
+                                    show_tray_error_dialog(
+                                        "Root Key Reset Failed",
+                                        "Could not replace account root key",
+                                        &err_str,
+                                    );
+                                });
+                            }
+                        }
+                    }
+                    Some(PairingUiAction::Cancel) | None => {
+                        let _ = cancel_enrollment_pairing(&started).await;
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct PairingWaitWindowWidgets {
+    window: Retained<NSWindow>,
+    pass_edit: Option<Retained<NSTextField>>,
+    unlock_btn: Option<Retained<NSButton>>,
+    reset_btn: Retained<NSButton>,
+    cancel_btn: Retained<NSButton>,
+    footer_status: Retained<NSTextField>,
+    is_terminal: bool,
+    _handler: Retained<PairingWaitWindowHandler>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SshcastPairingWaitWindowHandler"]
+    #[ivars = EmptyIvars]
+    struct PairingWaitWindowHandler;
+
+    unsafe impl NSObjectProtocol for PairingWaitWindowHandler {}
+
+    impl PairingWaitWindowHandler {
+        #[unsafe(method(onUnlock:))]
+        fn on_unlock(&self, _sender: Option<&AnyObject>) {
+            let pass = PAIRING_WINDOW.with(|cell| {
+                Zeroizing::new(
+                    cell.borrow()
+                        .as_ref()
+                        .and_then(|w| w.pass_edit.as_ref())
+                        .map(|p| p.stringValue().to_string())
+                        .unwrap_or_default(),
+                )
+            });
+            if pass.is_empty() {
+                set_pairing_status_text("Please enter your recovery passphrase.");
+                return;
+            }
+            let maybe_tx = ACTIVE_PAIRING_TX.lock().ok().and_then(|g| g.clone());
+            let Some(tx) = maybe_tx else {
+                set_pairing_status_text("Pairing session has ended. Start GitHub sign-in again.");
+                return;
+            };
+            PAIRING_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    if let Some(ref btn) = w.unlock_btn {
+                        btn.setEnabled(false);
+                    }
+                    w.reset_btn.setEnabled(false);
+                    w.footer_status
+                        .setStringValue(&NSString::from_str("Decrypting recovery vault..."));
+                }
+            });
+            if tx.send(PairingUiAction::Unlock(pass)).is_err() {
+                PAIRING_WINDOW.with(|cell| {
+                    if let Some(ref w) = *cell.borrow() {
+                        if let Some(ref btn) = w.unlock_btn {
+                            btn.setEnabled(true);
+                        }
+                        w.reset_btn.setEnabled(true);
+                        w.footer_status.setStringValue(&NSString::from_str(
+                            "Pairing session has ended. Start GitHub sign-in again.",
+                        ));
+                    }
+                });
+            }
+        }
+
+        #[unsafe(method(onResetAccount:))]
+        fn on_reset_account(&self, _sender: Option<&AnyObject>) {
+            let has_tx = ACTIVE_PAIRING_TX
+                .lock()
+                .ok()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            if !has_tx {
+                set_pairing_status_text("Pairing session has ended. Start GitHub sign-in again.");
+                return;
+            }
+            if !confirm_action_dialog(
+                "Reset Account & Replace Root Key?",
+                "Replace your lost Sshcast root key on the operator?",
+                "Warning: Existing workstations and relays will lose certificate renewal access and will need to be re-enrolled with your new root key.",
+                "Replace Root Key",
+            ) {
+                return;
+            }
+            let maybe_tx = ACTIVE_PAIRING_TX.lock().ok().and_then(|g| g.clone());
+            let Some(tx) = maybe_tx else {
+                set_pairing_status_text("Pairing session has ended. Start GitHub sign-in again.");
+                return;
+            };
+            PAIRING_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    w.reset_btn.setEnabled(false);
+                    if let Some(ref btn) = w.unlock_btn {
+                        btn.setEnabled(false);
+                    }
+                    w.footer_status.setStringValue(&NSString::from_str(
+                        "Replacing account root key on operator...",
+                    ));
+                }
+            });
+            if tx.send(PairingUiAction::Reset).is_err() {
+                PAIRING_WINDOW.with(|cell| {
+                    if let Some(ref w) = *cell.borrow() {
+                        w.reset_btn.setEnabled(true);
+                        if let Some(ref btn) = w.unlock_btn {
+                            btn.setEnabled(true);
+                        }
+                        w.footer_status.setStringValue(&NSString::from_str(
+                            "Pairing session has ended. Start GitHub sign-in again.",
+                        ));
+                    }
+                });
+            }
+        }
+
+        #[unsafe(method(onCancel:))]
+        fn on_cancel(&self, _sender: Option<&AnyObject>) {
+            let is_terminal = PAIRING_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    if let Some(ref pass_edit) = w.pass_edit {
+                        pass_edit.setStringValue(&NSString::from_str(""));
+                    }
+                    w.is_terminal
+                } else {
+                    false
+                }
+            });
+            if is_terminal {
+                PAIRING_WINDOW.with(|cell| {
+                    if let Some(ref w) = *cell.borrow() {
+                        if w.window.isVisible() {
+                            w.window.close();
+                        }
+                    }
+                });
+                return;
+            }
+            LOGIN_SESSION_GEN.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut guard) = ACTIVE_PAIRING_TX.lock() {
+                if let Some(tx) = guard.take() {
+                    let _ = tx.send(PairingUiAction::Cancel);
+                }
+            }
+            GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+            PAIRING_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    if w.window.isVisible() {
+                        w.window.close();
+                    }
+                }
+            });
+            ENROLL_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    w.footer_status
+                        .setStringValue(&NSString::from_str("GitHub sign-in canceled."));
+                }
+            });
+        }
+    }
+);
+
+impl PairingWaitWindowHandler {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = mtm.alloc::<Self>().set_ivars(EmptyIvars::default());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+fn show_pairing_wait_window_on_main(mtm: MainThreadMarker, info: PendingPairingInfo) {
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+
+    let old = PAIRING_WINDOW.with(|cell| cell.borrow_mut().take());
+    if let Some(old) = old {
+        if old.window.isVisible() {
+            old.window.close();
+        }
+    }
+
+    let win_w: CGFloat = 580.0;
+    let win_h: CGFloat = 472.0;
+    let window =
+        create_nonclosable_centered_window(mtm, "Sshcast — Approve This Workstation", win_w, win_h);
+    let content_view = window.contentView().expect("window has contentView");
+    let handler = PairingWaitWindowHandler::new(mtm);
+
+    add_window_chrome(
+        mtm,
+        &content_view,
+        win_w,
+        win_h,
+        "Approve This Workstation",
+        &[56.0, 220.0, 318.0],
+    );
+
+    let account_header = if info.github_login.is_empty() {
+        "Existing Sshcast Account Root Key:".to_string()
+    } else {
+        format!(
+            "Existing GitHub Account (@{}) Root Key:",
+            info.github_login
+        )
+    };
+    add_label(
+        mtm,
+        &content_view,
+        win_h,
+        &account_header,
+        24.0,
+        68.0,
+        532.0,
+        18.0,
+    );
+    add_edit_field(
+        mtm,
+        &content_view,
+        win_h,
+        &info.existing_user_pubkey_token,
+        "",
+        true,
+        true,
+        24.0,
+        90.0,
+        532.0,
+        24.0,
+    );
+
+    add_section_header(
+        mtm,
+        &content_view,
+        win_h,
+        "Verification Code:",
+        24.0,
+        124.0,
+        532.0,
+        20.0,
+    );
+    let sas_field = add_edit_field(
+        mtm,
+        &content_view,
+        win_h,
+        &info.sas_code,
+        "",
+        true,
+        true,
+        24.0,
+        148.0,
+        180.0,
+        34.0,
+    );
+    let sas_font = NSFont::monospacedSystemFontOfSize_weight(20.0, 0.4);
+    let sas_color = NSColor::controlAccentColor();
+    sas_field.setFont(Some(&sas_font));
+    sas_field.setTextColor(Some(&sas_color));
+
+    add_label(
+        mtm,
+        &content_view,
+        win_h,
+        "Confirm this code matches and click Approve on an existing Sshcast workstation.",
+        24.0,
+        188.0,
+        532.0,
+        22.0,
+    );
+
+    let (pass_edit, unlock_btn) = if info.has_recovery_vault {
+        add_section_header(
+            mtm,
+            &content_view,
+            win_h,
+            "Or Unlock Offline with Recovery Passphrase",
+            24.0,
+            230.0,
+            532.0,
+            20.0,
+        );
+        add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "Enter your recovery passphrase to decrypt your root key locally:",
+            24.0,
+            254.0,
+            532.0,
+            18.0,
+        );
+        let pass_edit = add_edit_field(
+            mtm,
+            &content_view,
+            win_h,
+            "",
+            "Recovery passphrase",
+            false,
+            false,
+            24.0,
+            276.0,
+            338.0,
+            24.0,
+        );
+        let unlock_btn = add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Unlock with Passphrase",
+            &handler,
+            sel!(onUnlock:),
+            true,
+            370.0,
+            274.0,
+            186.0,
+            28.0,
+        );
+        (Some(pass_edit), Some(unlock_btn))
+    } else {
+        add_section_header(
+            mtm,
+            &content_view,
+            win_h,
+            "Offline Recovery Passphrase",
+            24.0,
+            230.0,
+            532.0,
+            20.0,
+        );
+        add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "No recovery passphrase set on this account.\nApprove pairing from an existing workstation, or reset your account root key below.",
+            24.0,
+            256.0,
+            532.0,
+            38.0,
+        );
+        (None, None)
+    };
+
+    add_section_header(
+        mtm,
+        &content_view,
+        win_h,
+        "Lost Access to All Old Devices?",
+        24.0,
+        328.0,
+        532.0,
+        20.0,
+    );
+    add_label(
+        mtm,
+        &content_view,
+        win_h,
+        "Replace your lost root key on the operator (old workstations and relays lose renewal access).",
+        24.0,
+        350.0,
+        532.0,
+        18.0,
+    );
+    let reset_btn = add_push_button(
+        mtm,
+        &content_view,
+        win_h,
+        "Lost Old Devices? Reset Account...",
+        &handler,
+        sel!(onResetAccount:),
+        false,
+        24.0,
+        374.0,
+        266.0,
+        28.0,
+    );
+
+    let footer_status = add_label(
+        mtm,
+        &content_view,
+        win_h,
+        "Waiting for pairing approval on an existing workstation...",
+        24.0,
+        436.0,
+        420.0,
+        20.0,
+    );
+    let cancel_btn = add_push_button(
+        mtm,
+        &content_view,
+        win_h,
+        "Cancel",
+        &handler,
+        sel!(onCancel:),
+        false,
+        456.0,
+        430.0,
+        100.0,
+        28.0,
+    );
+
+    window.makeKeyAndOrderFront(None);
+
+    PAIRING_WINDOW.with(|cell| {
+        *cell.borrow_mut() = Some(PairingWaitWindowWidgets {
+            window,
+            pass_edit,
+            unlock_btn,
+            reset_btn,
+            cancel_btn,
+            footer_status,
+            is_terminal: false,
+            _handler: handler,
+        });
+    });
+}
+
+/// Displays the native macOS pairing wait, recovery-passphrase unlock, and root-key reset window.
+pub fn show_pairing_wait_window(info: PendingPairingInfo) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        show_pairing_wait_window_on_main(mtm, info);
+    } else {
+        run_on_main_async(move |mtm| {
+            show_pairing_wait_window_on_main(mtm, info);
+        });
+    }
+}
+
+// ============================================================================
+// 6. RECOVERY PASSPHRASE MANAGEMENT WINDOW (580 x 376)
+// ============================================================================
+
+struct RecoveryOpGuard;
+
+impl Drop for RecoveryOpGuard {
+    fn drop(&mut self) {
+        RECOVERY_OP_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
+struct RecoveryWindowWidgets {
+    window: Retained<NSWindow>,
+    status_label: Retained<NSTextField>,
+    pass_edit: Retained<NSTextField>,
+    confirm_edit: Retained<NSTextField>,
+    save_btn: Retained<NSButton>,
+    remove_btn: Retained<NSButton>,
+    footer_status: Retained<NSTextField>,
+    _handler: Retained<RecoveryWindowHandler>,
+}
+
+async fn resolve_recovery_operator_url(cfg: &ClientConfig) -> anyhow::Result<String> {
+    let explicit = cfg.operator_url.clone();
+    let servers = cfg.servers.clone();
+    tokio::task::spawn_blocking(move || resolve_operator_url(explicit.as_deref(), &servers))
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not discover operator URL via _sshcast DNS TXT for {:?}; configure operator_url in client.toml",
+                cfg.servers
+            )
+        })
+}
+
+fn format_vault_configured_status(updated_at: i64) -> String {
+    if updated_at > 0 {
+        format!("Configured (updated unix {updated_at})")
+    } else {
+        "Configured".to_string()
+    }
+}
+
+fn spawn_recovery_status_refresh() {
+    let gen = RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let cfg_path = get_tray_context().and_then(|c| c.config_path.clone());
+
+    std::thread::spawn(move || {
+        let res = (|| -> anyhow::Result<(bool, i64, String)> {
+            let cfg = ClientConfig::load(cfg_path.as_deref())?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async move {
+                let op_url = resolve_recovery_operator_url(&cfg).await?;
+                let (configured, updated_at) =
+                    get_recovery_vault_status_http(&op_url, &cfg.grant, &cfg.node_signing_key)
+                        .await?;
+                Ok((configured, updated_at, op_url))
+            })
+        })()
+        .map_err(|e| format!("{e:#}"));
+
+        run_on_main_async(move |_mtm| {
+            if RECOVERY_STATUS_GEN.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            RECOVERY_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    match res {
+                        Ok((true, updated_at, op_url)) => {
+                            let status = format_vault_configured_status(updated_at);
+                            w.status_label.setStringValue(&NSString::from_str(&status));
+                            w.footer_status.setStringValue(&NSString::from_str(&format!(
+                                "Operator: {op_url}"
+                            )));
+                        }
+                        Ok((false, _, op_url)) => {
+                            w.status_label
+                                .setStringValue(&NSString::from_str("Not configured"));
+                            w.footer_status.setStringValue(&NSString::from_str(&format!(
+                                "Operator: {op_url} — no recovery passphrase set yet."
+                            )));
+                        }
+                        Err(err_msg) => {
+                            w.status_label
+                                .setStringValue(&NSString::from_str("Status unavailable"));
+                            w.footer_status.setStringValue(&NSString::from_str(&format!(
+                                "Status check failed: {err_msg}"
+                            )));
+                        }
+                    }
+                }
+            });
+        });
+    });
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SshcastRecoveryWindowHandler"]
+    #[ivars = EmptyIvars]
+    struct RecoveryWindowHandler;
+
+    unsafe impl NSObjectProtocol for RecoveryWindowHandler {}
+
+    impl RecoveryWindowHandler {
+        #[unsafe(method(onSaveRecovery:))]
+        fn on_save_recovery(&self, _sender: Option<&AnyObject>) {
+            let (pass1, pass2) = RECOVERY_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    (
+                        Zeroizing::new(w.pass_edit.stringValue().to_string()),
+                        Zeroizing::new(w.confirm_edit.stringValue().to_string()),
+                    )
+                } else {
+                    (Zeroizing::new(String::new()), Zeroizing::new(String::new()))
+                }
+            });
+
+            if pass1.chars().count() < 8 {
+                show_tray_error_dialog(
+                    "Validation Error",
+                    "Recovery passphrase is too short",
+                    "Recovery passphrase must be at least 8 characters long.",
+                );
+                return;
+            }
+            if *pass1 != *pass2 {
+                show_tray_error_dialog(
+                    "Validation Error",
+                    "Passphrases do not match",
+                    "Please make sure both recovery passphrase fields match.",
+                );
+                return;
+            }
+            if RECOVERY_OP_IN_FLIGHT
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                RECOVERY_WINDOW.with(|cell| {
+                    if let Some(ref w) = *cell.borrow() {
+                        w.footer_status.setStringValue(&NSString::from_str(
+                            "A recovery vault operation is already in progress...",
+                        ));
+                    }
+                });
+                return;
+            }
+
+            RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst);
+            RECOVERY_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    w.save_btn.setEnabled(false);
+                    w.remove_btn.setEnabled(false);
+                    w.footer_status.setStringValue(&NSString::from_str(
+                        "Encrypting root key and uploading recovery vault...",
+                    ));
+                }
+            });
+
+            let cfg_path = get_tray_context().and_then(|c| c.config_path.clone());
+            drop(pass2);
+
+            std::thread::spawn(move || {
+                let res = {
+                    let _op_guard = RecoveryOpGuard;
+                    (|| -> anyhow::Result<(i64, String)> {
+                        let cfg = ClientConfig::load(cfg_path.as_deref())?;
+                        let user_sk = load_tray_user_signing_key(cfg_path.as_deref())?;
+                        if user_sk.verifying_key().to_bytes().as_slice()
+                            != cfg.grant.user_pubkey.as_slice()
+                        {
+                            anyhow::bail!(
+                                "local user_key.toml does not match this workstation's enrolled user ({}) in client.toml",
+                                cfg.grant.user_id
+                            );
+                        }
+
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        rt.block_on(async move {
+                            let op_url = resolve_recovery_operator_url(&cfg).await?;
+                            let sk_clone = user_sk.clone();
+                            let vault = tokio::task::spawn_blocking(move || {
+                                encrypt_recovery_vault(&sk_clone, &pass1, ScryptParams::default())
+                            })
+                            .await??;
+                            let updated_at = upload_recovery_vault_http(
+                                &op_url,
+                                &cfg.grant,
+                                &cfg.node_signing_key,
+                                &vault,
+                            )
+                            .await?;
+                            Ok((updated_at, op_url))
+                        })
+                    })()
+                    .map_err(|e| format!("{e:#}"))
+                };
+
+                run_on_main_async(move |_mtm| {
+                    RECOVERY_WINDOW.with(|cell| {
+                        if let Some(ref w) = *cell.borrow() {
+                            w.save_btn.setEnabled(true);
+                            w.remove_btn.setEnabled(true);
+                            match &res {
+                                Ok((updated_at, op_url)) => {
+                                    w.pass_edit.setStringValue(&NSString::from_str(""));
+                                    w.confirm_edit.setStringValue(&NSString::from_str(""));
+                                    let status = format_vault_configured_status(*updated_at);
+                                    w.status_label.setStringValue(&NSString::from_str(&status));
+                                    w.footer_status.setStringValue(&NSString::from_str(&format!(
+                                        "Saved recovery passphrase to {op_url}!"
+                                    )));
+                                }
+                                Err(_) => {
+                                    w.footer_status.setStringValue(&NSString::from_str(
+                                        "Failed to save recovery passphrase.",
+                                    ));
+                                }
+                            }
+                        }
+                    });
+                    if let Err(err_msg) = res {
+                        show_tray_error_dialog(
+                            "Save Failed",
+                            "Could not save recovery passphrase",
+                            &err_msg,
+                        );
+                    }
+                });
+            });
+        }
+
+        #[unsafe(method(onRemoveRecovery:))]
+        fn on_remove_recovery(&self, _sender: Option<&AnyObject>) {
+            if RECOVERY_OP_IN_FLIGHT.load(Ordering::SeqCst) {
+                RECOVERY_WINDOW.with(|cell| {
+                    if let Some(ref w) = *cell.borrow() {
+                        w.footer_status.setStringValue(&NSString::from_str(
+                            "A recovery vault operation is already in progress...",
+                        ));
+                    }
+                });
+                return;
+            }
+            if !confirm_action_dialog(
+                "Remove Recovery Passphrase?",
+                "Remove your encrypted recovery vault from the operator?",
+                "If removed, you will need an existing online workstation to approve pairing for any new device (unless you reset your root key).",
+                "Remove",
+            ) {
+                return;
+            }
+            if RECOVERY_OP_IN_FLIGHT
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return;
+            }
+
+            RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst);
+            RECOVERY_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    w.save_btn.setEnabled(false);
+                    w.remove_btn.setEnabled(false);
+                    w.footer_status.setStringValue(&NSString::from_str(
+                        "Removing recovery vault from operator...",
+                    ));
+                }
+            });
+
+            let cfg_path = get_tray_context().and_then(|c| c.config_path.clone());
+
+            std::thread::spawn(move || {
+                let res = {
+                    let _op_guard = RecoveryOpGuard;
+                    (|| -> anyhow::Result<String> {
+                        let cfg = ClientConfig::load(cfg_path.as_deref())?;
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        rt.block_on(async move {
+                            let op_url = resolve_recovery_operator_url(&cfg).await?;
+                            delete_recovery_vault_http(
+                                &op_url,
+                                &cfg.grant,
+                                &cfg.node_signing_key,
+                            )
+                            .await?;
+                            Ok(op_url)
+                        })
+                    })()
+                    .map_err(|e| format!("{e:#}"))
+                };
+
+                run_on_main_async(move |_mtm| {
+                    RECOVERY_WINDOW.with(|cell| {
+                        if let Some(ref w) = *cell.borrow() {
+                            w.save_btn.setEnabled(true);
+                            w.remove_btn.setEnabled(true);
+                            match &res {
+                                Ok(op_url) => {
+                                    w.pass_edit.setStringValue(&NSString::from_str(""));
+                                    w.confirm_edit.setStringValue(&NSString::from_str(""));
+                                    w.status_label
+                                        .setStringValue(&NSString::from_str("Not configured"));
+                                    w.footer_status.setStringValue(&NSString::from_str(&format!(
+                                        "Removed recovery vault from {op_url}."
+                                    )));
+                                }
+                                Err(_) => {
+                                    w.footer_status.setStringValue(&NSString::from_str(
+                                        "Failed to remove recovery passphrase.",
+                                    ));
+                                }
+                            }
+                        }
+                    });
+                    if let Err(err_msg) = res {
+                        show_tray_error_dialog(
+                            "Removal Failed",
+                            "Could not remove recovery passphrase",
+                            &err_msg,
+                        );
+                    }
+                });
+            });
+        }
+
+        #[unsafe(method(onClose:))]
+        fn on_close(&self, _sender: Option<&AnyObject>) {
+            RECOVERY_WINDOW.with(|cell| {
+                if let Some(ref w) = *cell.borrow() {
+                    w.pass_edit.setStringValue(&NSString::from_str(""));
+                    w.confirm_edit.setStringValue(&NSString::from_str(""));
+                    if w.window.isVisible() {
+                        w.window.close();
+                    }
+                }
+            });
+        }
+    }
+);
+
+impl RecoveryWindowHandler {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = mtm.alloc::<Self>().set_ivars(EmptyIvars::default());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Displays the native macOS Recovery Passphrase management window.
+pub fn show_recovery_window() {
+    let maybe_ctx = get_tray_context();
+    let is_enrolled = maybe_ctx
+        .as_ref()
+        .and_then(|c| c.current_config())
+        .is_some();
+    if !is_enrolled {
+        show_enroll_window();
+        return;
+    }
+
+    let cfg_path = maybe_ctx.as_ref().and_then(|c| c.config_path.clone());
+    if load_tray_user_key_file(cfg_path.as_deref()).is_err() {
+        show_tray_error_dialog(
+            "User Root Key Required",
+            "No user_key.toml found on this workstation",
+            "A local user root key (user_key.toml) is required to configure an encrypted recovery passphrase.",
+        );
+        return;
+    }
+
+    run_on_main_async(|mtm| {
+        let app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+
+        let already_created = RECOVERY_WINDOW.with(|cell| {
+            if let Some(ref w) = *cell.borrow() {
+                if !RECOVERY_OP_IN_FLIGHT.load(Ordering::SeqCst) {
+                    w.pass_edit.setStringValue(&NSString::from_str(""));
+                    w.confirm_edit.setStringValue(&NSString::from_str(""));
+                    w.status_label.setStringValue(&NSString::from_str(
+                        "Checking operator recovery vault status...",
+                    ));
+                    w.footer_status.setStringValue(&NSString::from_str("Ready."));
+                    spawn_recovery_status_refresh();
+                }
+                w.window.makeKeyAndOrderFront(None);
+                true
+            } else {
+                false
+            }
+        });
+        if already_created {
+            return;
+        }
+
+        let win_w: CGFloat = 580.0;
+        let win_h: CGFloat = 376.0;
+        let window = create_centered_window(
+            mtm,
+            "Sshcast — Recovery Passphrase",
+            win_w,
+            win_h,
+        );
+        let content_view = window.contentView().expect("window has contentView");
+        let handler = RecoveryWindowHandler::new(mtm);
+
+        add_window_chrome(
+            mtm,
+            &content_view,
+            win_w,
+            win_h,
+            "Recovery Passphrase (Offline Device Sync)",
+            &[56.0, 154.0],
+        );
+
+        add_section_header(
+            mtm,
+            &content_view,
+            win_h,
+            "Operator Recovery Vault Status:",
+            24.0,
+            68.0,
+            532.0,
+            20.0,
+        );
+        let status_label = NSTextField::labelWithString(
+            &NSString::from_str("Checking operator recovery vault status..."),
+            mtm,
+        );
+        status_label.setFrame(top_cgrect(win_h, 24.0, 92.0, 532.0, 20.0));
+        let status_font = NSFont::monospacedSystemFontOfSize_weight(12.5, 0.2);
+        let status_color = NSColor::labelColor();
+        status_label.setFont(Some(&status_font));
+        status_label.setTextColor(Some(&status_color));
+        status_label.setSelectable(true);
+        content_view.addSubview(&status_label);
+
+        add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "Encrypts your local root key with scrypt before uploading so you can unlock new devices offline.",
+            24.0,
+            116.0,
+            532.0,
+            32.0,
+        );
+
+        add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "New Recovery Passphrase (min 8 chars):",
+            24.0,
+            166.0,
+            532.0,
+            18.0,
+        );
+        let pass_edit = add_edit_field(
+            mtm,
+            &content_view,
+            win_h,
+            "",
+            "Enter recovery passphrase (min 8 chars)",
+            false,
+            false,
+            24.0,
+            187.0,
+            532.0,
+            24.0,
+        );
+
+        add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "Confirm Passphrase:",
+            24.0,
+            220.0,
+            532.0,
+            18.0,
+        );
+        let confirm_edit = add_edit_field(
+            mtm,
+            &content_view,
+            win_h,
+            "",
+            "Re-enter recovery passphrase",
+            false,
+            false,
+            24.0,
+            241.0,
+            532.0,
+            24.0,
+        );
+
+        let save_btn = add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Save Recovery Passphrase",
+            &handler,
+            sel!(onSaveRecovery:),
+            true,
+            24.0,
+            278.0,
+            210.0,
+            28.0,
+        );
+        let remove_btn = add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Remove Recovery Passphrase",
+            &handler,
+            sel!(onRemoveRecovery:),
+            false,
+            244.0,
+            278.0,
+            224.0,
+            28.0,
+        );
+
+        let footer_status = add_label(
+            mtm,
+            &content_view,
+            win_h,
+            "Ready.",
+            24.0,
+            340.0,
+            420.0,
+            20.0,
+        );
+        add_push_button(
+            mtm,
+            &content_view,
+            win_h,
+            "Close",
+            &handler,
+            sel!(onClose:),
+            false,
+            456.0,
+            334.0,
+            100.0,
+            28.0,
+        );
+
+        window.makeKeyAndOrderFront(None);
+
+        RECOVERY_WINDOW.with(|cell| {
+            *cell.borrow_mut() = Some(RecoveryWindowWidgets {
+                window,
+                status_label,
+                pass_edit,
+                confirm_edit,
+                save_btn,
+                remove_btn,
+                footer_status,
+                _handler: handler,
+            });
+        });
+
+        spawn_recovery_status_refresh();
     });
 }

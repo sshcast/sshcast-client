@@ -21,7 +21,8 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSSt
 use crate::config::{default_config_dir, ClientConfig};
 use crate::local_agent::LocalAgentConnector;
 use crate::mac_dialogs::{
-    show_backends_window, show_bundle_generator_window, show_enroll_window, show_ssh_keys_window,
+    show_backends_window, show_bundle_generator_window, show_enroll_window, show_recovery_window,
+    show_ssh_keys_window,
 };
 use crate::policy::ApprovalDecision;
 use crate::prompt::{PairingPromptDetails, PromptDetails};
@@ -103,8 +104,23 @@ struct StatusBarWidgets {
     status_action_item: Retained<NSMenuItem>,
     backends_action_item: Retained<NSMenuItem>,
     bundle_action_item: Retained<NSMenuItem>,
+    recovery_action_item: Retained<NSMenuItem>,
     force_active_item: Retained<NSMenuItem>,
     _menu_target: Retained<SshcastMenuTarget>,
+}
+
+/// Resolves a sibling `user_key.toml` alongside `cfg_path` if present, otherwise returns `None`
+/// so callers fall back to `default_user_key_path()`.
+pub fn resolve_tray_user_key_path(cfg_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    if let Some(p) = cfg_path {
+        if let Some(dir) = p.parent() {
+            let candidate = dir.join("user_key.toml");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn refresh_status_bar_widgets(mtm: MainThreadMarker) {
@@ -116,7 +132,10 @@ fn refresh_status_bar_widgets(mtm: MainThreadMarker) {
     let connected = ctx.connected_count.load(Ordering::Relaxed);
     let force_active = ctx.force_active_flag.load(Ordering::Relaxed);
     let is_enrolled = maybe_cfg.is_some();
-    let has_root_key = crate::config::UserKeyFile::load(None).is_ok();
+    let sibling_key_ok = resolve_tray_user_key_path(ctx.config_path.as_deref())
+        .map(|kp| crate::config::UserKeyFile::load(Some(&kp)).is_ok())
+        .unwrap_or(false);
+    let has_root_key = sibling_key_ok || crate::config::UserKeyFile::load(None).is_ok();
 
     let tip = match &maybe_cfg {
         Some(cfg) => format!("Sshcast — {} ({})", cfg.grant.node_id, cfg.grant.user_id),
@@ -142,6 +161,7 @@ fn refresh_status_bar_widgets(mtm: MainThreadMarker) {
             w.status_action_item.setEnabled(is_enrolled);
             w.backends_action_item.setEnabled(is_enrolled);
             w.bundle_action_item.setEnabled(is_enrolled && has_root_key);
+            w.recovery_action_item.setEnabled(is_enrolled && has_root_key);
             w.force_active_item.setEnabled(is_enrolled);
             w.force_active_item.setState(if force_active {
                 NSControlStateValueOn
@@ -198,11 +218,18 @@ pub fn show_tray_error_dialog(title: &str, instruction: &str, details: &str) {
     });
 }
 
-/// Displays a native macOS warning confirmation dialog and returns `true` if the user clicked Overwrite/Yes.
-pub fn confirm_overwrite_dialog(title: &str, instruction: &str, content: &str) -> bool {
+/// Displays a native macOS warning confirmation dialog and returns `true` if the user clicked
+/// the primary confirmation button (`ok_label`).
+pub fn confirm_action_dialog(
+    title: &str,
+    instruction: &str,
+    content: &str,
+    ok_label: &str,
+) -> bool {
     let title_owned = title.to_string();
     let instr_owned = instruction.to_string();
     let content_owned = content.to_string();
+    let ok_owned = ok_label.to_string();
 
     run_on_main_sync(move |mtm| {
         let app = NSApplication::sharedApplication(mtm);
@@ -212,13 +239,21 @@ pub fn confirm_overwrite_dialog(title: &str, instruction: &str, content: &str) -
         let alert = NSAlert::new(mtm);
         alert.setAlertStyle(NSAlertStyle::Warning);
         alert.setMessageText(&NSString::from_str(&title_owned));
-        alert.setInformativeText(&NSString::from_str(&format!(
-            "{instr_owned}\n\n{content_owned}"
-        )));
-        alert.addButtonWithTitle(&NSString::from_str("Overwrite"));
+        let body = if content_owned.is_empty() {
+            instr_owned
+        } else {
+            format!("{instr_owned}\n\n{content_owned}")
+        };
+        alert.setInformativeText(&NSString::from_str(&body));
+        alert.addButtonWithTitle(&NSString::from_str(&ok_owned));
         alert.addButtonWithTitle(&NSString::from_str("Cancel"));
         alert.runModal() == NSAlertFirstButtonReturn
     })
+}
+
+/// Displays a native macOS warning confirmation dialog and returns `true` if the user clicked Overwrite/Yes.
+pub fn confirm_overwrite_dialog(title: &str, instruction: &str, content: &str) -> bool {
+    confirm_action_dialog(title, instruction, content, "Overwrite")
 }
 
 fn create_shield_icon(description: &str) -> Option<Retained<NSImage>> {
@@ -758,6 +793,11 @@ define_class!(
             show_bundle_generator_window();
         }
 
+        #[unsafe(method(onRecoveryWindow:))]
+        fn on_recovery_window(&self, _sender: Option<&AnyObject>) {
+            show_recovery_window();
+        }
+
         #[unsafe(method(onEnrollWindow:))]
         fn on_enroll_window(&self, _sender: Option<&AnyObject>) {
             show_enroll_window();
@@ -944,6 +984,8 @@ pub fn run_macos_tray_loop(
     );
     let _enroll_action_item =
         make_action_item("Initialize / Enroll Workstation...", sel!(onEnrollWindow:), "");
+    let recovery_action_item =
+        make_action_item("Recovery Passphrase...", sel!(onRecoveryWindow:), "");
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
@@ -966,6 +1008,7 @@ pub fn run_macos_tray_loop(
             status_action_item,
             backends_action_item,
             bundle_action_item,
+            recovery_action_item,
             force_active_item,
             _menu_target: menu_target,
         });
