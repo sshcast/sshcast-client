@@ -24,7 +24,7 @@ use crate::mac_dialogs::{
     show_backends_window, show_bundle_generator_window, show_enroll_window, show_ssh_keys_window,
 };
 use crate::policy::ApprovalDecision;
-use crate::prompt::PromptDetails;
+use crate::prompt::{PairingPromptDetails, PromptDetails};
 
 pub struct TraySharedContext {
     pub config_path: Option<PathBuf>,
@@ -319,6 +319,90 @@ fn build_approval_alert(mtm: MainThreadMarker, details: &PromptDetails) -> Retai
     alert
 }
 
+fn build_pairing_alert(mtm: MainThreadMarker, details: &PairingPromptDetails) -> Retained<NSAlert> {
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Informational);
+    if let Some(icon) = create_shield_icon("Sshcast Device Pairing Request") {
+        unsafe {
+            alert.setIcon(Some(&icon));
+        }
+    }
+    alert.setMessageText(&NSString::from_str(&format!(
+        "Approve new workstation '{}'?",
+        details.node_name
+    )));
+    alert.setInformativeText(&NSString::from_str(
+        "Confirm the 6-digit verification code matches the new device before approving and syncing your Sshcast root key.",
+    ));
+
+    let login_display = if details.github_login.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        format!("@{}", details.github_login)
+    };
+
+    let rows: [(&str, &str, bool); 5] = [
+        ("New Workstation:", &details.node_name, false),
+        ("Operating System:", &details.os_name, false),
+        ("GitHub Account:", &login_display, false),
+        ("Account ID:", &details.existing_user_id, false),
+        ("Verification Code:", &details.sas_code, true),
+    ];
+
+    let view_w: CGFloat = 460.0;
+    let row_h: CGFloat = 24.0;
+    let view_h: CGFloat = (rows.len() as CGFloat) * row_h + 12.0;
+    let accessory = NSView::initWithFrame(
+        mtm.alloc(),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(view_w, view_h)),
+    );
+
+    let key_font = NSFont::systemFontOfSize_weight(12.0, 0.25);
+    let val_font = NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0);
+    let sas_font = NSFont::monospacedSystemFontOfSize_weight(14.0, 0.4);
+    let key_color = NSColor::secondaryLabelColor();
+    let val_color = NSColor::labelColor();
+    let sas_color = NSColor::controlAccentColor();
+
+    for (idx, (k, v, is_sas)) in rows.iter().enumerate() {
+        let y = view_h - ((idx as CGFloat + 1.0) * row_h) - 4.0;
+
+        let k_label = NSTextField::labelWithString(&NSString::from_str(k), mtm);
+        k_label.setFrame(CGRect::new(
+            CGPoint::new(0.0, y),
+            CGSize::new(148.0, row_h - 2.0),
+        ));
+        k_label.setFont(Some(&key_font));
+        k_label.setTextColor(Some(&key_color));
+        accessory.addSubview(&k_label);
+
+        let v_label = NSTextField::labelWithString(&NSString::from_str(v), mtm);
+        v_label.setFrame(CGRect::new(
+            CGPoint::new(154.0, y),
+            CGSize::new(view_w - 154.0, row_h - 2.0),
+        ));
+        if *is_sas {
+            v_label.setFont(Some(&sas_font));
+            v_label.setTextColor(Some(&sas_color));
+        } else {
+            v_label.setFont(Some(&val_font));
+            v_label.setTextColor(Some(&val_color));
+        }
+        v_label.setSelectable(true);
+        accessory.addSubview(&v_label);
+    }
+
+    alert.setAccessoryView(Some(&accessory));
+
+    let btn_approve = alert.addButtonWithTitle(&NSString::from_str("Approve"));
+    btn_approve.setKeyEquivalent(&NSString::from_str("\r"));
+
+    let btn_deny = alert.addButtonWithTitle(&NSString::from_str("Deny"));
+    btn_deny.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+
+    alert
+}
+
 fn map_modal_response(resp: isize) -> ApprovalDecision {
     if resp == NSAlertFirstButtonReturn {
         ApprovalDecision::ApproveOnce
@@ -351,21 +435,37 @@ pub fn run_macos_modal_process(details: PromptDetails) -> ApprovalDecision {
     map_modal_response(resp)
 }
 
+/// Runs the native macOS `NSAlert` device pairing dialog in a standalone helper process
+/// (`sshcast-client internal-gui-pairing-prompt --payload-json <json>`).
+pub fn run_macos_pairing_modal_process(details: PairingPromptDetails) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+
+    let alert = build_pairing_alert(mtm, &details);
+    let alert_window = alert.window();
+    alert_window.center();
+    alert_window.makeKeyAndOrderFront(None);
+
+    alert.runModal() == NSAlertFirstButtonReturn
+}
+
 struct MacModalCancelState {
     app_ptr: Option<usize>,
     canceled: bool,
 }
 
-/// Displays a native macOS `NSAlert` approval modal on the AppKit main thread and automatically
-/// aborts the modal if `cancel_rx` fires (`CancelSignRequest` from coordinator).
-pub async fn prompt_macos_dialog(
-    details: &PromptDetails,
+async fn run_cancellable_macos_alert<F>(
     cancel_rx: &mut watch::Receiver<Option<String>>,
-) -> Option<ApprovalDecision> {
-    if cancel_rx.borrow().is_some() {
-        return Some(ApprovalDecision::Deny);
-    }
-
+    build_alert: F,
+) -> Option<isize>
+where
+    F: FnOnce(MainThreadMarker) -> Retained<NSAlert> + Send + 'static,
+{
     if !is_appkit_loop_running() {
         return None;
     }
@@ -421,7 +521,6 @@ pub async fn prompt_macos_dialog(
         }
     });
 
-    let details_cloned = details.clone();
     let cancel_rx_check = cancel_rx.clone();
     let state_for_main = Arc::clone(&state);
 
@@ -443,7 +542,7 @@ pub async fn prompt_macos_dialog(
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
 
-        let alert = build_approval_alert(mtm, &details_cloned);
+        let alert = build_alert(mtm);
         let resp = alert.runModal();
         if let Ok(mut guard) = state_for_main.lock() {
             guard.app_ptr = None;
@@ -455,11 +554,53 @@ pub async fn prompt_macos_dialog(
     let _ = done_tx.send(());
     cancel_task.abort();
 
+    resp
+}
+
+/// Displays a native macOS `NSAlert` approval modal on the AppKit main thread and automatically
+/// aborts the modal if `cancel_rx` fires (`CancelSignRequest` from coordinator).
+pub async fn prompt_macos_dialog(
+    details: &PromptDetails,
+    cancel_rx: &mut watch::Receiver<Option<String>>,
+) -> Option<ApprovalDecision> {
+    if cancel_rx.borrow().is_some() {
+        return Some(ApprovalDecision::Deny);
+    }
+
+    let details_cloned = details.clone();
+    let resp = run_cancellable_macos_alert(cancel_rx, move |mtm| {
+        build_approval_alert(mtm, &details_cloned)
+    })
+    .await;
+
     if cancel_rx.borrow().is_some() {
         return Some(ApprovalDecision::Deny);
     }
 
     resp.map(map_modal_response)
+}
+
+/// Displays a native macOS `NSAlert` device pairing modal on the AppKit main thread and
+/// automatically aborts the modal if `cancel_rx` fires.
+pub async fn prompt_pairing_macos_dialog(
+    details: &PairingPromptDetails,
+    cancel_rx: &mut watch::Receiver<Option<String>>,
+) -> Option<bool> {
+    if cancel_rx.borrow().is_some() {
+        return Some(false);
+    }
+
+    let details_cloned = details.clone();
+    let resp = run_cancellable_macos_alert(cancel_rx, move |mtm| {
+        build_pairing_alert(mtm, &details_cloned)
+    })
+    .await;
+
+    if cancel_rx.borrow().is_some() {
+        return Some(false);
+    }
+
+    resp.map(|r| r == NSAlertFirstButtonReturn)
 }
 
 pub fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {

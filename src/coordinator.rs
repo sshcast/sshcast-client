@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use sshcast_proto::crypto::{create_node_auth, verify_sign_request};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+use base64::Engine;
+use ed25519_dalek::VerifyingKey;
+use sshcast_proto::crypto::{create_node_auth, derive_user_id, verify_sign_request};
 use sshcast_proto::v1::client_stream_message::Payload as ClientPayload;
 use sshcast_proto::v1::server_stream_message::Payload as ServerPayload;
 use sshcast_proto::v1::sshcast_service_client::SshcastServiceClient;
@@ -7,6 +10,7 @@ use sshcast_proto::v1::{
     ClientStreamMessage, NodeGrant, SignAck, SignRequest, SignResponse, WorkstationStatus,
 };
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,12 +18,19 @@ use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, UserKeyFile};
+use crate::enroll::load_user_signing_key;
 use crate::local_agent::LocalAgentConnector;
-use crate::operator::{cert_needs_renewal, renew_user_cert_http, resolve_operator_url};
+use crate::operator::{
+    cert_needs_renewal, poll_pending_pairing_requests_http, renew_user_cert_http,
+    resolve_operator_url, respond_to_pairing_request_http,
+};
+use crate::pairing::{
+    compute_pairing_sas_code, create_encrypted_pairing_handoff, parse_user_pubkey_token,
+};
 use crate::policy::{ApprovalDecision, PolicyEngine};
 use crate::presence::{current_os_name, now_unix_ms, query_last_input_epoch_ms};
-use crate::prompt::{ApprovalPrompter, PromptDetails};
+use crate::prompt::{ApprovalPrompter, PairingPromptDetails, PromptDetails};
 use crate::zellij_proxy::{serve_zellij_proxy_with_listener, ZellijProxyHub};
 
 const RECENT_CANCEL_TTL: Duration = Duration::from_secs(120);
@@ -298,6 +309,8 @@ impl WorkstationManager {
         )
         .await;
 
+        let pairing_handle = self.spawn_pairing_listener(shutdown_rx.clone());
+
         let mut active_streams: HashMap<String, (watch::Sender<bool>, tokio::task::JoinHandle<()>)> =
             HashMap::new();
 
@@ -403,10 +416,25 @@ impl WorkstationManager {
             let _ = stop_tx.send(true);
             let _ = handle.await;
         }
+        let _ = pairing_handle.await;
         if let Some(zh) = zellij_handle {
             let _ = zh.await;
         }
         Ok(())
+    }
+
+    fn spawn_pairing_listener(
+        &self,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let cfg = self.cfg.clone();
+        let grant_lock = Arc::clone(&self.grant);
+        let resolved_operator_url = Arc::clone(&self.resolved_operator_url);
+        let prompter = Arc::clone(&self.prompter);
+        tokio::spawn(async move {
+            run_pairing_listener(cfg, grant_lock, resolved_operator_url, prompter, shutdown_rx)
+                .await;
+        })
     }
 
     fn spawn_coordinator_worker(
@@ -543,6 +571,381 @@ impl WorkstationManager {
     }
 }
 
+async fn resolve_or_cache_operator_url(
+    cfg: &ClientConfig,
+    resolved_operator_url: &Arc<RwLock<Option<String>>>,
+) -> Option<String> {
+    if let Some(cached) = resolved_operator_url.read().await.clone() {
+        return Some(cached);
+    }
+    let explicit = cfg.operator_url.clone();
+    let servers = cfg.servers.clone();
+    let discovered = tokio::task::spawn_blocking(move || {
+        resolve_operator_url(explicit.as_deref(), &servers)
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(ref op_url) = discovered {
+        *resolved_operator_url.write().await = Some(op_url.clone());
+    }
+    discovered
+}
+
+async fn sleep_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<bool>) -> bool {
+    if *shutdown_rx.borrow() {
+        return true;
+    }
+    tokio::select! {
+        res = shutdown_rx.changed() => res.is_err() || *shutdown_rx.borrow(),
+        _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+fn find_matching_local_user_key(cfg: &ClientConfig) -> Option<(Option<PathBuf>, [u8; 32])> {
+    let candidate_path = cfg
+        .config_path
+        .as_ref()
+        .and_then(|cp| cp.parent())
+        .map(|parent| parent.join("user_key.toml"))
+        .filter(|p| p.exists());
+
+    let (_, key_file) = UserKeyFile::load(candidate_path.as_deref()).ok()?;
+    let user_pk = parse_user_pubkey_token(&key_file.user_pubkey_token).ok()?;
+    if user_pk.as_slice() != cfg.grant.user_pubkey.as_slice() {
+        return None;
+    }
+    Some((candidate_path, user_pk))
+}
+
+fn decode_b64_32(raw: &str, label: &str) -> Result<[u8; 32]> {
+    let trimmed = raw.trim();
+    let bytes = STANDARD
+        .decode(trimmed)
+        .or_else(|_| STANDARD_NO_PAD.decode(trimmed))
+        .or_else(|_| URL_SAFE.decode(trimmed))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(trimmed))
+        .with_context(|| format!("invalid base64 in {label}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{label} must decode to 32 bytes"))
+}
+
+const PAIRING_POLL_TIMEOUT_SECS: u64 = 25;
+const PAIRING_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+const PAIRING_MONITOR_INTERVAL: Duration = Duration::from_secs(3);
+const PAIRING_SEEN_TTL: Duration = Duration::from_secs(600);
+
+async fn run_pairing_listener(
+    cfg: ClientConfig,
+    grant_lock: Arc<RwLock<NodeGrant>>,
+    resolved_operator_url: Arc<RwLock<Option<String>>>,
+    prompter: Arc<dyn ApprovalPrompter>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut backoff = Duration::from_secs(2);
+    let max_backoff = Duration::from_secs(30);
+    let mut recently_handled: HashMap<String, Instant> = HashMap::new();
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let cfg_for_key = cfg.clone();
+        let matching_key =
+            tokio::task::spawn_blocking(move || find_matching_local_user_key(&cfg_for_key))
+                .await
+                .ok()
+                .flatten();
+
+        let Some((local_key_path, user_pk_arr)) = matching_key else {
+            if sleep_or_shutdown(PAIRING_RECHECK_INTERVAL, &mut shutdown_rx).await {
+                break;
+            }
+            continue;
+        };
+
+        let Some(op_url) = resolve_or_cache_operator_url(&cfg, &resolved_operator_url).await else {
+            if sleep_or_shutdown(PAIRING_RECHECK_INTERVAL, &mut shutdown_rx).await {
+                break;
+            }
+            continue;
+        };
+
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let current_grant = grant_lock.read().await.clone();
+        let poll_started = Instant::now();
+        let poll_res = tokio::select! {
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
+            res = poll_pending_pairing_requests_http(
+                &op_url,
+                &current_grant,
+                &cfg.node_signing_key,
+                PAIRING_POLL_TIMEOUT_SECS,
+            ) => res,
+        };
+
+        let requests = match poll_res {
+            Ok(reqs) => {
+                backoff = Duration::from_secs(2);
+                reqs
+            }
+            Err(e) => {
+                tracing::debug!("Pairing poll transient error from {}: {:#}", op_url, e);
+                if sleep_or_shutdown(backoff, &mut shutdown_rx).await {
+                    break;
+                }
+                backoff = (backoff * 2).min(max_backoff);
+                continue;
+            }
+        };
+
+        let now = Instant::now();
+        recently_handled.retain(|_, ts| now.duration_since(*ts) < PAIRING_SEEN_TTL);
+
+        let mut handled_any = false;
+        for req in requests {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            if recently_handled.contains_key(&req.pairing_id) {
+                continue;
+            }
+            recently_handled.insert(req.pairing_id.clone(), Instant::now());
+            handled_any = true;
+
+            let req_node_pk = match decode_b64_32(&req.node_pubkey_b64, "node_pubkey_b64") {
+                Ok(pk) => {
+                    if let Err(e) = VerifyingKey::from_bytes(&pk) {
+                        tracing::warn!(
+                            "Ignoring pairing request {} with invalid Ed25519 node_pubkey_b64: {}",
+                            req.pairing_id,
+                            e
+                        );
+                        continue;
+                    }
+                    pk
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Ignoring pairing request {} with invalid node_pubkey_b64: {:#}",
+                        req.pairing_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let req_eph_pk = match decode_b64_32(&req.eph_x25519_pub_b64, "eph_x25519_pub_b64") {
+                Ok(pk) => pk,
+                Err(e) => {
+                    tracing::warn!(
+                        "Ignoring pairing request {} with invalid eph_x25519_pub_b64: {:#}",
+                        req.pairing_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let sas_code = compute_pairing_sas_code(&user_pk_arr, &req_eph_pk);
+            let existing_user_id = if !current_grant.user_id.is_empty() {
+                current_grant.user_id.clone()
+            } else {
+                derive_user_id(&user_pk_arr)
+            };
+            let details = PairingPromptDetails {
+                pairing_id: req.pairing_id.clone(),
+                node_name: req.node_name.clone(),
+                os_name: req.os_name.clone(),
+                github_login: req.github_login.clone(),
+                sas_code,
+                existing_user_id,
+            };
+
+            let (cancel_tx, cancel_rx) = watch::channel(None);
+            let monitor_handle = tokio::spawn({
+                let monitor_op_url = op_url.clone();
+                let monitor_grant = Arc::clone(&grant_lock);
+                let monitor_node_sk = cfg.node_signing_key.clone();
+                let monitor_pairing_id = req.pairing_id.clone();
+                let monitor_cancel_tx = cancel_tx.clone();
+                let mut monitor_shutdown = shutdown_rx.clone();
+                async move {
+                    if *monitor_shutdown.borrow() {
+                        let _ = monitor_cancel_tx
+                            .send(Some("Workstation manager shutting down".to_string()));
+                        return;
+                    }
+                    let mut ticker = tokio::time::interval(PAIRING_MONITOR_INTERVAL);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    ticker.tick().await;
+                    loop {
+                        tokio::select! {
+                            res = monitor_shutdown.changed() => {
+                                if res.is_err() || *monitor_shutdown.borrow() {
+                                    let _ = monitor_cancel_tx.send(Some(
+                                        "Workstation manager shutting down".to_string(),
+                                    ));
+                                    break;
+                                }
+                            }
+                            _ = ticker.tick() => {
+                                let g = monitor_grant.read().await.clone();
+                                if let Ok(pending) = poll_pending_pairing_requests_http(
+                                    &monitor_op_url,
+                                    &g,
+                                    &monitor_node_sk,
+                                    0,
+                                )
+                                .await
+                                {
+                                    if !pending.iter().any(|p| p.pairing_id == monitor_pairing_id) {
+                                        let _ = monitor_cancel_tx
+                                            .send(Some("Handled or canceled".to_string()));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            let approved = prompter.prompt_pairing(details, cancel_rx.clone()).await;
+            monitor_handle.abort();
+
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            if cancel_rx.borrow().is_some() {
+                tracing::info!(
+                    "Pairing prompt for {} ({}) dismissed before response",
+                    req.node_name,
+                    req.pairing_id
+                );
+                continue;
+            }
+
+            if approved {
+                let kp_for_load = local_key_path.clone();
+                let user_sk = match tokio::task::spawn_blocking(move || {
+                    load_user_signing_key(kp_for_load.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(sk)) => sk,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Failed to load user root key while approving pairing {}: {:#}",
+                            req.pairing_id,
+                            e
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "User key load task panicked while approving pairing {}: {}",
+                            req.pairing_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                if user_sk.verifying_key().to_bytes() != user_pk_arr {
+                    tracing::warn!(
+                        "Refusing pairing approval for {}: local user_key.toml changed and no longer matches workstation user_pubkey",
+                        req.pairing_id
+                    );
+                    continue;
+                }
+
+                let latest_grant = grant_lock.read().await.clone();
+                match create_encrypted_pairing_handoff(
+                    &user_sk,
+                    latest_grant.user_cert.clone(),
+                    &req.pairing_id,
+                    &req.node_name,
+                    &req_node_pk,
+                    &req_eph_pk,
+                    cfg.servers.clone(),
+                    Some(op_url.clone()),
+                ) {
+                    Ok(envelope) => {
+                        if let Err(e) = respond_to_pairing_request_http(
+                            &op_url,
+                            &latest_grant,
+                            &cfg.node_signing_key,
+                            &req.pairing_id,
+                            true,
+                            Some(&envelope),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Failed to submit pairing approval for {}: {:#}",
+                                req.pairing_id,
+                                e
+                            );
+                        } else {
+                            tracing::info!(
+                                "Approved pairing request {} for workstation '{}'",
+                                req.pairing_id,
+                                req.node_name
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to build encrypted pairing handoff for {}: {:#}",
+                            req.pairing_id,
+                            e
+                        );
+                    }
+                }
+            } else {
+                let latest_grant = grant_lock.read().await.clone();
+                if let Err(e) = respond_to_pairing_request_http(
+                    &op_url,
+                    &latest_grant,
+                    &cfg.node_signing_key,
+                    &req.pairing_id,
+                    false,
+                    None,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Failed to submit pairing denial for {}: {:#}",
+                        req.pairing_id,
+                        e
+                    );
+                } else {
+                    tracing::info!(
+                        "Denied pairing request {} for workstation '{}'",
+                        req.pairing_id,
+                        req.node_name
+                    );
+                }
+            }
+        }
+
+        if !handled_any && poll_started.elapsed() < Duration::from_millis(500) {
+            if sleep_or_shutdown(Duration::from_millis(500), &mut shutdown_rx).await {
+                break;
+            }
+        }
+    }
+}
+
 async fn sync_cert_if_needed(
     cfg: &ClientConfig,
     grant_lock: &Arc<RwLock<NodeGrant>>,
@@ -574,21 +977,7 @@ async fn sync_cert_if_needed(
         grant_guard.clone()
     };
 
-    let mut op_url = resolved_operator_url.read().await.clone();
-    if op_url.is_none() {
-        let explicit = cfg.operator_url.clone();
-        let servers = cfg.servers.clone();
-        op_url = tokio::task::spawn_blocking(move || {
-            resolve_operator_url(explicit.as_deref(), &servers)
-        })
-        .await
-        .ok()
-        .flatten();
-        if let Some(ref discovered) = op_url {
-            *resolved_operator_url.write().await = Some(discovered.clone());
-        }
-    }
-    let Some(op_url) = op_url else {
+    let Some(op_url) = resolve_or_cache_operator_url(cfg, resolved_operator_url).await else {
         return false;
     };
 

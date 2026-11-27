@@ -2370,3 +2370,344 @@ async fn test_cli_recovery_and_interactive_login_subprocesses() {
 
     srv_handle.abort();
 }
+
+#[tokio::test]
+async fn test_workstation_manager_background_pairing_listener_approves_peer() {
+    use sshcast_client::config::UserKeyFile;
+    use sshcast_client::operator::{
+        complete_paired_enrollment, poll_enrollment_once, start_github_enrollment, EnrollPollStep,
+    };
+    use sshcast_client::prompt::PairingPromptDetails;
+    use sshcast_proto::crypto::derive_user_id;
+
+    struct PairingCapturePrompter {
+        prompt_tx: mpsc::Sender<PairingPromptDetails>,
+        approve: bool,
+    }
+
+    #[tonic::async_trait]
+    impl ApprovalPrompter for PairingCapturePrompter {
+        async fn prompt_user(
+            &self,
+            _details: PromptDetails,
+            _cancel_rx: watch::Receiver<Option<String>>,
+        ) -> ApprovalDecision {
+            ApprovalDecision::Deny
+        }
+
+        async fn prompt_pairing(
+            &self,
+            details: PairingPromptDetails,
+            _cancel_rx: watch::Receiver<Option<String>>,
+        ) -> bool {
+            let _ = self.prompt_tx.send(details).await;
+            self.approve
+        }
+    }
+
+    let user_sk_a = SigningKey::from_bytes(&[0xE5; 32]);
+    let user_pk_a = user_sk_a.verifying_key().to_bytes();
+    let user_id_a = derive_user_id(&user_pk_a);
+    let user_pub_token_a = format!("sc_pub_{}", hex::encode(user_pk_a));
+    let coord_url = "http://127.0.0.1:1".to_string();
+
+    let (op_url, _op_state, srv_handle) = spawn_mock_operator(&user_sk_a, "octocat").await;
+
+    // Set up Workstation A on disk in tmp_a with matching user_key.toml + client.toml
+    let tmp_a = TempDir::new().unwrap();
+    let key_path_a = tmp_a.path().join("user_key.toml");
+    let cfg_path_a = tmp_a.path().join("client.toml");
+    sshcast_client::enroll::save_user_signing_key(&user_sk_a, Some(&key_path_a), false).unwrap();
+
+    let bundle_a = mint_enrollment_bundle(
+        &user_sk_a,
+        "workstation-a",
+        NodeRole::Client,
+        vec![coord_url.clone()],
+        0,
+    )
+    .unwrap();
+    write_client_config_from_bundle(&bundle_a, Some(&cfg_path_a), false).unwrap();
+    {
+        let (_, mut cfg_file_a) =
+            sshcast_client::config::ClientConfigFile::load(Some(&cfg_path_a)).unwrap();
+        cfg_file_a.operator_url = Some(op_url.clone());
+        cfg_file_a.zellij_listen_port = 0;
+        cfg_file_a.save(Some(&cfg_path_a)).unwrap();
+    }
+    let cfg_a = ClientConfig::load(Some(&cfg_path_a)).unwrap();
+
+    let (prompt_tx, mut prompt_rx) = mpsc::channel(4);
+    let prompter_a: Arc<dyn ApprovalPrompter> = Arc::new(PairingCapturePrompter {
+        prompt_tx,
+        approve: true,
+    });
+    let connector_a = Arc::new(LocalAgentConnector::with_options(
+        None,
+        KeyFilterConfig::default(),
+        true,
+    ));
+    let policy_a = Arc::new(PolicyEngine::default());
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let manager_a = WorkstationManager::new(cfg_a, connector_a, policy_a, prompter_a);
+    let manager_handle = tokio::spawn(async move { manager_a.run(shutdown_rx).await });
+
+    // Workstation B starts GitHub enrollment and hits PairingRequired
+    let tmp_b = TempDir::new().unwrap();
+    let key_path_b = tmp_b.path().join("user_key.toml");
+    let cfg_path_b = tmp_b.path().join("client.toml");
+    let started_b = start_github_enrollment(
+        std::slice::from_ref(&coord_url),
+        Some(&op_url),
+        Some("workstation-b"),
+        Some(&key_path_b),
+        Some(&cfg_path_b),
+        false,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let info = match poll_enrollment_once(&started_b).await.unwrap() {
+        EnrollPollStep::PairingRequired(info) => info,
+        other => panic!("expected PairingRequired, got {other:?}"),
+    };
+
+    // Workstation A's background pairing listener receives the request and invokes prompt_pairing
+    let captured = tokio::time::timeout(Duration::from_secs(5), prompt_rx.recv())
+        .await
+        .expect("timed out waiting for Workstation A pairing prompt")
+        .expect("pairing prompt channel closed");
+    assert_eq!(captured.pairing_id, info.pairing_id);
+    assert_eq!(captured.node_name, "workstation-b");
+    assert_eq!(captured.github_login, "octocat");
+    assert_eq!(captured.sas_code, info.sas_code);
+    assert_eq!(captured.existing_user_id, user_id_a);
+    assert!(!captured.os_name.is_empty());
+
+    // Workstation B polls until it receives EnrollPollStep::Paired
+    let paired_step = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match poll_enrollment_once(&started_b).await.unwrap() {
+                step @ EnrollPollStep::Paired { .. } => break step,
+                EnrollPollStep::PairingRequired(_) | EnrollPollStep::Pending => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => panic!("unexpected enrollment poll step: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for Workstation B to receive Paired response");
+
+    let (pairing_id, existing_pk, approver_node, envelope) = match paired_step {
+        EnrollPollStep::Paired {
+            pairing_id,
+            existing_user_pubkey,
+            approver_node_id,
+            envelope,
+        } => (pairing_id, existing_user_pubkey, approver_node_id, envelope),
+        _ => unreachable!(),
+    };
+    assert_eq!(approver_node, "workstation-a");
+
+    let outcome_b = complete_paired_enrollment(started_b, &existing_pk, &pairing_id, &envelope)
+        .await
+        .unwrap();
+    assert!(outcome_b.enrolled_new_client);
+    assert_eq!(outcome_b.user_pubkey_token, user_pub_token_a);
+    assert!(key_path_b.exists());
+    assert!(cfg_path_b.exists());
+
+    let loaded_sk_b = load_user_signing_key(Some(&key_path_b)).unwrap();
+    assert_eq!(loaded_sk_b.to_bytes(), user_sk_a.to_bytes());
+    let (_, uk_b) = UserKeyFile::load(Some(&key_path_b)).unwrap();
+    assert!(uk_b.user_cert_token.is_some());
+
+    let cfg_b = ClientConfig::load(Some(&cfg_path_b)).unwrap();
+    assert_eq!(cfg_b.grant.node_id, "workstation-b");
+    assert_eq!(cfg_b.grant.user_pubkey, user_pk_a);
+    assert!(cfg_b.grant.user_cert.is_some());
+
+    let _ = shutdown_tx.send(true);
+    let run_res = tokio::time::timeout(Duration::from_secs(3), manager_handle)
+        .await
+        .expect("WorkstationManager shutdown timed out")
+        .unwrap();
+    run_res.unwrap();
+
+    srv_handle.abort();
+}
+
+#[tokio::test]
+async fn test_workstation_manager_pairing_listener_skips_without_root_key_and_dismisses_canceled_prompt(
+) {
+    use sshcast_client::operator::{
+        cancel_enrollment_pairing, poll_enrollment_once, start_github_enrollment, EnrollPollStep,
+    };
+    use sshcast_client::prompt::PairingPromptDetails;
+
+    struct BlockingUntilCanceledPrompter {
+        opened_tx: mpsc::Sender<PairingPromptDetails>,
+        canceled_tx: mpsc::Sender<Option<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl ApprovalPrompter for BlockingUntilCanceledPrompter {
+        async fn prompt_user(
+            &self,
+            _details: PromptDetails,
+            _cancel_rx: watch::Receiver<Option<String>>,
+        ) -> ApprovalDecision {
+            ApprovalDecision::Deny
+        }
+
+        async fn prompt_pairing(
+            &self,
+            details: PairingPromptDetails,
+            mut cancel_rx: watch::Receiver<Option<String>>,
+        ) -> bool {
+            let _ = self.opened_tx.send(details).await;
+            let _ = cancel_rx.changed().await;
+            let reason = cancel_rx.borrow().clone();
+            let _ = self.canceled_tx.send(reason).await;
+            false
+        }
+    }
+
+    let user_sk_a = SigningKey::from_bytes(&[0xF6; 32]);
+    let coord_url = "http://127.0.0.1:1".to_string();
+    let (op_url, _op_state, srv_handle) = spawn_mock_operator(&user_sk_a, "octocat").await;
+
+    // 1. Secondary workstation WITHOUT user_key.toml must NOT invoke prompt_pairing
+    let tmp_no_key = TempDir::new().unwrap();
+    let cfg_path_no_key = tmp_no_key.path().join("client.toml");
+    let bundle_no_key = mint_enrollment_bundle(
+        &user_sk_a,
+        "secondary-no-key",
+        NodeRole::Client,
+        vec![coord_url.clone()],
+        0,
+    )
+    .unwrap();
+    write_client_config_from_bundle(&bundle_no_key, Some(&cfg_path_no_key), false).unwrap();
+    {
+        let (_, mut f) =
+            sshcast_client::config::ClientConfigFile::load(Some(&cfg_path_no_key)).unwrap();
+        f.operator_url = Some(op_url.clone());
+        f.zellij_listen_port = 0;
+        f.save(Some(&cfg_path_no_key)).unwrap();
+    }
+    let cfg_no_key = ClientConfig::load(Some(&cfg_path_no_key)).unwrap();
+
+    let tmp_b = TempDir::new().unwrap();
+    let started_b = start_github_enrollment(
+        std::slice::from_ref(&coord_url),
+        Some(&op_url),
+        Some("workstation-b-cancel"),
+        Some(&tmp_b.path().join("user_key.toml")),
+        Some(&tmp_b.path().join("client.toml")),
+        false,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        poll_enrollment_once(&started_b).await.unwrap(),
+        EnrollPollStep::PairingRequired(_)
+    ));
+
+    let (no_key_opened_tx, mut no_key_opened_rx) = mpsc::channel(2);
+    let (no_key_canceled_tx, _) = mpsc::channel(2);
+    let (shutdown_no_key_tx, shutdown_no_key_rx) = watch::channel(false);
+    let mgr_no_key = WorkstationManager::new(
+        cfg_no_key,
+        Arc::new(LocalAgentConnector::with_options(
+            None,
+            KeyFilterConfig::default(),
+            true,
+        )),
+        Arc::new(PolicyEngine::default()),
+        Arc::new(BlockingUntilCanceledPrompter {
+            opened_tx: no_key_opened_tx,
+            canceled_tx: no_key_canceled_tx,
+        }),
+    );
+    let no_key_handle = tokio::spawn(async move { mgr_no_key.run(shutdown_no_key_rx).await });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), no_key_opened_rx.recv())
+            .await
+            .is_err(),
+        "workstation without local user_key.toml should not prompt for pairing"
+    );
+    let _ = shutdown_no_key_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), no_key_handle)
+        .await
+        .unwrap();
+
+    // 2. Primary workstation WITH user_key.toml opens prompt, and 3s monitor auto-dismisses when canceled externally
+    let tmp_a = TempDir::new().unwrap();
+    let key_path_a = tmp_a.path().join("user_key.toml");
+    let cfg_path_a = tmp_a.path().join("client.toml");
+    sshcast_client::enroll::save_user_signing_key(&user_sk_a, Some(&key_path_a), false).unwrap();
+    let bundle_a = mint_enrollment_bundle(
+        &user_sk_a,
+        "workstation-a-monitor",
+        NodeRole::Client,
+        vec![coord_url],
+        0,
+    )
+    .unwrap();
+    write_client_config_from_bundle(&bundle_a, Some(&cfg_path_a), false).unwrap();
+    {
+        let (_, mut f) =
+            sshcast_client::config::ClientConfigFile::load(Some(&cfg_path_a)).unwrap();
+        f.operator_url = Some(op_url.clone());
+        f.zellij_listen_port = 0;
+        f.save(Some(&cfg_path_a)).unwrap();
+    }
+    let cfg_a = ClientConfig::load(Some(&cfg_path_a)).unwrap();
+
+    let (opened_tx, mut opened_rx) = mpsc::channel(2);
+    let (canceled_tx, mut canceled_rx) = mpsc::channel(2);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mgr_a = WorkstationManager::new(
+        cfg_a,
+        Arc::new(LocalAgentConnector::with_options(
+            None,
+            KeyFilterConfig::default(),
+            true,
+        )),
+        Arc::new(PolicyEngine::default()),
+        Arc::new(BlockingUntilCanceledPrompter {
+            opened_tx,
+            canceled_tx,
+        }),
+    );
+    let mgr_a_handle = tokio::spawn(async move { mgr_a.run(shutdown_rx).await });
+
+    let opened_details = tokio::time::timeout(Duration::from_secs(3), opened_rx.recv())
+        .await
+        .expect("timed out waiting for pairing prompt to open")
+        .unwrap();
+    assert_eq!(opened_details.node_name, "workstation-b-cancel");
+
+    // Cancel enrollment externally while the prompt is open; the 3s monitor should dismiss it!
+    cancel_enrollment_pairing(&started_b).await.unwrap();
+    let cancel_reason = tokio::time::timeout(Duration::from_secs(5), canceled_rx.recv())
+        .await
+        .expect("timed out waiting for 3s pairing monitor to cancel prompt")
+        .unwrap();
+    assert_eq!(cancel_reason.as_deref(), Some("Handled or canceled"));
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(3), mgr_a_handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    srv_handle.abort();
+}

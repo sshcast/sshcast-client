@@ -34,7 +34,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config::{default_config_dir, ClientConfig};
 use crate::local_agent::LocalAgentConnector;
 use crate::policy::ApprovalDecision;
-use crate::prompt::PromptDetails;
+use crate::prompt::{PairingPromptDetails, PromptDetails};
 use crate::win_dialogs::{
     cleanup_dialog_fonts, is_any_management_dialog_message, show_backends_window,
     show_bundle_generator_window, show_enroll_window, show_ssh_keys_window,
@@ -118,16 +118,13 @@ unsafe extern "system" fn task_dialog_callback(
     S_OK
 }
 
-/// Displays a native Windows `TaskDialogIndirect` (`comctl32.dll` v6) modal with Command-Link buttons
-/// and automatically dismisses it if `cancel_rx` fires (`CancelSignRequest` from coordinator).
-pub async fn prompt_task_dialog(
-    details: &PromptDetails,
+async fn run_cancellable_task_dialog<F>(
     cancel_rx: &mut watch::Receiver<Option<String>>,
-) -> Option<ApprovalDecision> {
-    if cancel_rx.borrow().is_some() {
-        return Some(ApprovalDecision::Deny);
-    }
-
+    show_dialog: F,
+) -> Option<i32>
+where
+    F: FnOnce(isize) -> Option<i32> + Send + 'static,
+{
     let state = Arc::new(DialogCancelState {
         hwnd: Mutex::new(None),
         canceled: AtomicBool::new(false),
@@ -164,10 +161,31 @@ pub async fn prompt_task_dialog(
         }
     });
 
-    let details_cloned = details.clone();
     let state_for_dialog = Arc::clone(&state);
+    let join_res = tokio::task::spawn_blocking(move || {
+        let state_ptr = Arc::as_ptr(&state_for_dialog) as isize;
+        show_dialog(state_ptr)
+    })
+    .await;
 
-    let join_res = tokio::task::spawn_blocking(move || unsafe {
+    let _ = done_tx.send(());
+    cancel_task.abort();
+
+    join_res.ok().flatten()
+}
+
+/// Displays a native Windows `TaskDialogIndirect` (`comctl32.dll` v6) modal with Command-Link buttons
+/// and automatically dismisses it if `cancel_rx` fires (`CancelSignRequest` from coordinator).
+pub async fn prompt_task_dialog(
+    details: &PromptDetails,
+    cancel_rx: &mut watch::Receiver<Option<String>>,
+) -> Option<ApprovalDecision> {
+    if cancel_rx.borrow().is_some() {
+        return Some(ApprovalDecision::Deny);
+    }
+
+    let details_cloned = details.clone();
+    let selected = run_cancellable_task_dialog(cancel_rx, move |state_ptr| unsafe {
         let window_title = to_wide("Sshcast SSH Agent Approval");
         let main_instruction = to_wide(&format!(
             "SSH Agent Signature Request from {}",
@@ -231,8 +249,6 @@ pub async fn prompt_task_dialog(
             },
         ];
 
-        let state_ptr = Arc::as_ptr(&state_for_dialog) as isize;
-
         let config = TASKDIALOGCONFIG {
             cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
             hwndParent: null_mut(),
@@ -277,20 +293,119 @@ pub async fn prompt_task_dialog(
     })
     .await;
 
-    let _ = done_tx.send(());
-    cancel_task.abort();
-
     if cancel_rx.borrow().is_some() {
         return Some(ApprovalDecision::Deny);
     }
 
-    let selected = join_res.ok()??;
+    let selected = selected?;
     match selected {
         BTN_APPROVE_ONCE => Some(ApprovalDecision::ApproveOnce),
         BTN_APPROVE_TOOL_15M => Some(ApprovalDecision::ApproveToolOnHost15m),
         BTN_APPROVE_HOST_15M => Some(ApprovalDecision::ApproveAllOnHost15m),
         _ => Some(ApprovalDecision::Deny),
     }
+}
+
+/// Displays a native Windows `TaskDialogIndirect` (`comctl32.dll` v6) modal for a new device
+/// pairing request and automatically dismisses it if `cancel_rx` fires.
+pub async fn prompt_pairing_task_dialog(
+    details: &PairingPromptDetails,
+    cancel_rx: &mut watch::Receiver<Option<String>>,
+) -> Option<bool> {
+    if cancel_rx.borrow().is_some() {
+        return Some(false);
+    }
+
+    let details_cloned = details.clone();
+    let selected = run_cancellable_task_dialog(cancel_rx, move |state_ptr| unsafe {
+        let window_title = to_wide("Sshcast Device Pairing Request");
+        let main_instruction = to_wide(&format!(
+            "Approve new workstation '{}'?",
+            details_cloned.node_name
+        ));
+        let login_display = if details_cloned.github_login.is_empty() {
+            details_cloned.existing_user_id.clone()
+        } else {
+            format!("@{}", details_cloned.github_login)
+        };
+        let content = to_wide(&format!(
+            "GitHub User: {}\n\
+             OS: {}\n\
+             Account ID: {}\n\
+             Verification Code: {}",
+            login_display,
+            details_cloned.os_name,
+            details_cloned.existing_user_id,
+            details_cloned.sas_code,
+        ));
+        let footer = to_wide(
+            "Confirm the 6-digit verification code matches the new device before approving.",
+        );
+
+        let btn_approve_text =
+            to_wide("Approve\nApprove this workstation and sync your Sshcast root key");
+        let btn_deny_text = to_wide("Deny (Esc)\nReject this pairing request");
+
+        let buttons = [
+            TASKDIALOG_BUTTON {
+                nButtonID: BTN_APPROVE_ONCE,
+                pszButtonText: btn_approve_text.as_ptr(),
+            },
+            TASKDIALOG_BUTTON {
+                nButtonID: BTN_DENY,
+                pszButtonText: btn_deny_text.as_ptr(),
+            },
+        ];
+
+        let config = TASKDIALOGCONFIG {
+            cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+            hwndParent: null_mut(),
+            hInstance: null_mut(),
+            dwFlags: TDF_USE_COMMAND_LINKS
+                | TDF_ALLOW_DIALOG_CANCELLATION
+                | TDF_CALLBACK_TIMER
+                | TDF_SIZE_TO_CONTENT,
+            dwCommonButtons: TDCBF_CANCEL_BUTTON,
+            pszWindowTitle: window_title.as_ptr(),
+            Anonymous1: TASKDIALOGCONFIG_0 {
+                pszMainIcon: TD_SHIELD_ICON,
+            },
+            pszMainInstruction: main_instruction.as_ptr(),
+            pszContent: content.as_ptr(),
+            cButtons: buttons.len() as u32,
+            pButtons: buttons.as_ptr(),
+            nDefaultButton: BTN_APPROVE_ONCE,
+            cRadioButtons: 0,
+            pRadioButtons: null(),
+            nDefaultRadioButton: 0,
+            pszVerificationText: null(),
+            pszExpandedInformation: null(),
+            pszExpandedControlText: null(),
+            pszCollapsedControlText: null(),
+            Anonymous2: TASKDIALOGCONFIG_1 {
+                pszFooterIcon: TD_INFORMATION_ICON,
+            },
+            pszFooter: footer.as_ptr(),
+            pfCallback: Some(task_dialog_callback),
+            lpCallbackData: state_ptr,
+            cxWidth: 0,
+        };
+
+        let mut selected_button: i32 = 0;
+        let hr = TaskDialogIndirect(&config, &mut selected_button, null_mut(), null_mut());
+        if hr != S_OK {
+            return None;
+        }
+        Some(selected_button)
+    })
+    .await;
+
+    if cancel_rx.borrow().is_some() {
+        return Some(false);
+    }
+
+    let selected = selected?;
+    Some(selected == BTN_APPROVE_ONCE)
 }
 
 /// Displays a native Windows error dialog.

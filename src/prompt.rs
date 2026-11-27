@@ -20,6 +20,16 @@ use crate::policy::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingPromptDetails {
+    pub pairing_id: String,
+    pub node_name: String,
+    pub os_name: String,
+    pub github_login: String,
+    pub sas_code: String,
+    pub existing_user_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptDetails {
     pub request_id: String,
     pub verified_host: String,
@@ -104,6 +114,14 @@ mod native_prompter {
             details: PromptDetails,
             cancel_rx: watch::Receiver<Option<String>>,
         ) -> ApprovalDecision;
+
+        async fn prompt_pairing(
+            &self,
+            _details: PairingPromptDetails,
+            _cancel_rx: watch::Receiver<Option<String>>,
+        ) -> bool {
+            false
+        }
     }
 
 /// Static prompter used for automated `--auto-approve` or `--auto-deny` modes and integration tests.
@@ -208,6 +226,119 @@ impl ApprovalPrompter for InteractivePrompter {
 
         prompt_terminal_interactive(&details, &mut cancel_rx).await
     }
+
+    async fn prompt_pairing(
+        &self,
+        details: PairingPromptDetails,
+        mut cancel_rx: watch::Receiver<Option<String>>,
+    ) -> bool {
+        if cancel_rx.borrow().is_some() {
+            return false;
+        }
+
+        let _guard = tokio::select! {
+            guard = self.prompt_lock.lock() => guard,
+            _ = cancel_rx.changed() => {
+                return false;
+            }
+        };
+
+        if cancel_rx.borrow().is_some() {
+            return false;
+        }
+
+        let login_display = if details.github_login.is_empty() {
+            details.existing_user_id.clone()
+        } else {
+            format!("@{}", details.github_login)
+        };
+
+        // Best-effort desktop notification on Linux / macOS
+        #[cfg(target_os = "linux")]
+        {
+            let _ = Command::new("notify-send")
+                .args([
+                    "-u",
+                    "critical",
+                    "-t",
+                    "10000",
+                    "Sshcast Device Pairing Request",
+                    &format!(
+                        "Device: {} ({})\nGitHub: {}\nVerification Code: {}",
+                        details.node_name, details.os_name, login_display, details.sas_code
+                    ),
+                ])
+                .status()
+                .await;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let notif_script = format!(
+                "display notification \"Device: {} ({}) | {} | Code: {}\" with title \"Sshcast Device Pairing Request\"",
+                details.node_name.replace('"', "'"),
+                details.os_name.replace('"', "'"),
+                login_display.replace('"', "'"),
+                details.sas_code.replace('"', "'")
+            );
+            let _ = Command::new("osascript")
+                .args(["-e", &notif_script])
+                .status()
+                .await;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = &login_display;
+
+        if let Some(approved) = try_native_pairing_dialog(&details, &mut cancel_rx).await {
+            return approved;
+        }
+
+        prompt_pairing_terminal_interactive(&details, &mut cancel_rx).await
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(feature = "gui", not(target_os = "windows"))
+))]
+async fn spawn_internal_gui_prompt<T: Serialize>(
+    subcommand: &str,
+    details: &T,
+    cancel_rx: &mut watch::Receiver<Option<String>>,
+) -> Option<Option<String>> {
+    let has_display = if cfg!(target_os = "linux") {
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    } else {
+        true
+    };
+    if !has_display {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let json_str = serde_json::to_string(details).ok()?;
+    let mut cmd = Command::new(exe);
+    cmd.args([subcommand, "--payload-json", &json_str])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+
+    tokio::select! {
+        _ = cancel_rx.changed() => {
+            let _ = child.kill().await;
+            Some(None)
+        }
+        status_res = child.wait() => {
+            match status_res {
+                Ok(st) if st.success() => {
+                    let mut out_bytes = Vec::new();
+                    let _ = stdout.read_to_end(&mut out_bytes).await;
+                    Some(Some(String::from_utf8_lossy(&out_bytes).trim().to_string()))
+                }
+                _ => None,
+            }
+        }
+    }
 }
 
 async fn try_native_gui_dialog(
@@ -240,48 +371,21 @@ async fn try_native_gui_dialog(
         all(feature = "gui", not(target_os = "windows"))
     ))]
     {
-        let has_display = if cfg!(target_os = "linux") {
-            std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
-        } else {
-            true
-        };
-        if has_display {
-            if let Ok(exe) = std::env::current_exe() {
-                if let Ok(json_str) = serde_json::to_string(details) {
-                    let mut cmd = Command::new(exe);
-                    cmd.args(["internal-gui-prompt", "--payload-json", &json_str])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
-                        .kill_on_drop(true);
-                    if let Ok(mut child) = cmd.spawn() {
-                        if let Some(mut stdout) = child.stdout.take() {
-                            let egui_res = tokio::select! {
-                                _ = cancel_rx.changed() => {
-                                    let _ = child.kill().await;
-                                    Some(ApprovalDecision::Deny)
-                                }
-                                status_res = child.wait() => {
-                                    match status_res {
-                                        Ok(st) if st.success() => {
-                                            let mut out_bytes = Vec::new();
-                                            let _ = stdout.read_to_end(&mut out_bytes).await;
-                                            let token = String::from_utf8_lossy(&out_bytes);
-                                            match token.trim() {
-                                                "ONCE" => Some(ApprovalDecision::ApproveOnce),
-                                                "TOOL_15M" => Some(ApprovalDecision::ApproveToolOnHost15m),
-                                                "HOST_15M" => Some(ApprovalDecision::ApproveAllOnHost15m),
-                                                "DENY" => Some(ApprovalDecision::Deny),
-                                                _ => None,
-                                            }
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                            };
-                            if let Some(decision) = egui_res {
-                                return Some(decision);
-                            }
-                        }
+        if let Some(res) =
+            spawn_internal_gui_prompt("internal-gui-prompt", details, cancel_rx).await
+        {
+            match res {
+                None => return Some(ApprovalDecision::Deny),
+                Some(token) => {
+                    let decision = match token.as_str() {
+                        "ONCE" => Some(ApprovalDecision::ApproveOnce),
+                        "TOOL_15M" => Some(ApprovalDecision::ApproveToolOnHost15m),
+                        "HOST_15M" => Some(ApprovalDecision::ApproveAllOnHost15m),
+                        "DENY" => Some(ApprovalDecision::Deny),
+                        _ => None,
+                    };
+                    if let Some(d) = decision {
+                        return Some(d);
                     }
                 }
             }
@@ -483,6 +587,146 @@ async fn try_native_gui_dialog(
     }
 }
 
+async fn try_native_pairing_dialog(
+    details: &PairingPromptDetails,
+    cancel_rx: &mut watch::Receiver<Option<String>>,
+) -> Option<bool> {
+    if cancel_rx.borrow().is_some() {
+        return Some(false);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(approved) = crate::win_native::prompt_pairing_task_dialog(details, cancel_rx).await
+        {
+            return Some(approved);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(approved) = crate::mac_native::prompt_pairing_macos_dialog(details, cancel_rx).await
+        {
+            return Some(approved);
+        }
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(feature = "gui", not(target_os = "windows"))
+    ))]
+    {
+        if let Some(res) =
+            spawn_internal_gui_prompt("internal-gui-pairing-prompt", details, cancel_rx).await
+        {
+            match res {
+                None => return Some(false),
+                Some(token) => match token.as_str() {
+                    "APPROVE" => return Some(true),
+                    "DENY" => return Some(false),
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let login_display = if details.github_login.is_empty() {
+            details.existing_user_id.as_str()
+        } else {
+            details.github_login.as_str()
+        };
+        let script = format!(
+            "display dialog \"New Workstation: {}\\nOS: {}\\nAccount: {}\\nVerification Code: {}\\n\\nApprove pairing and sync your Sshcast root key?\" \
+             with title \"Sshcast Device Pairing Request\" \
+             buttons {{\"Deny\", \"Approve\"}} \
+             default button \"Deny\" \
+             cancel button \"Deny\"",
+            details.node_name.replace('"', "'"),
+            details.os_name.replace('"', "'"),
+            login_display.replace('"', "'"),
+            details.sas_code.replace('"', "'"),
+        );
+        if let Ok(mut child) = Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            if let Some(mut stdout) = child.stdout.take() {
+                tokio::select! {
+                    _ = cancel_rx.changed() => {
+                        let _ = child.kill().await;
+                        return Some(false);
+                    }
+                    status_res = child.wait() => {
+                        if let Ok(status) = status_res {
+                            if !status.success() {
+                                return Some(false);
+                            }
+                            let mut out_bytes = Vec::new();
+                            let _ = stdout.read_to_end(&mut out_bytes).await;
+                            let s = String::from_utf8_lossy(&out_bytes);
+                            return Some(s.contains("Approve"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            let login_display = if details.github_login.is_empty() {
+                details.existing_user_id.clone()
+            } else {
+                format!("@{}", details.github_login)
+            };
+            let text = format!(
+                "New Workstation: {}\nOS: {}\nGitHub Account: {} ({})\nVerification Code: {}\n\nApprove pairing and sync your Sshcast root key?",
+                details.node_name,
+                details.os_name,
+                login_display,
+                details.existing_user_id,
+                details.sas_code
+            );
+            if let Ok(mut child) = Command::new("zenity")
+                .args([
+                    "--question",
+                    "--title=Sshcast Device Pairing Request",
+                    "--width=520",
+                    "--ok-label=Approve",
+                    "--cancel-label=Deny",
+                    &format!("--text={text}"),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+            {
+                tokio::select! {
+                    _ = cancel_rx.changed() => {
+                        let _ = child.kill().await;
+                        return Some(false);
+                    }
+                    status_res = child.wait() => {
+                        if let Ok(status) = status_res {
+                            return Some(status.success());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = (details, cancel_rx);
+    None
+}
+
 async fn prompt_terminal_interactive(
     details: &PromptDetails,
     cancel_rx: &mut watch::Receiver<Option<String>>,
@@ -534,7 +778,81 @@ async fn prompt_terminal_interactive(
         }
     }
 }
+
+async fn prompt_pairing_terminal_interactive(
+    details: &PairingPromptDetails,
+    cancel_rx: &mut watch::Receiver<Option<String>>,
+) -> bool {
+    if cancel_rx.borrow().is_some() {
+        return false;
+    }
+
+    let login_display = if details.github_login.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        format!("@{}", details.github_login)
+    };
+
+    eprintln!("\n+=========================================================================+");
+    eprintln!("|                   SSHCAST DEVICE PAIRING REQUEST                        |");
+    eprintln!("+=========================================================================+");
+    eprintln!("  New Workstation:   {}", details.node_name);
+    eprintln!("  Operating System:  {}", details.os_name);
+    eprintln!("  GitHub Account:    {} ({})", login_display, details.existing_user_id);
+    eprintln!("  Verification Code: {}", details.sas_code);
+    eprintln!("---------------------------------------------------------------------------");
+    eprintln!("  Confirm the 6-digit Verification Code matches the new device before approving.");
+    eprint!("Approve pairing and sync your Sshcast root key? [y/N]: ");
+    let _ = std::io::stderr().flush();
+
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+
+    tokio::select! {
+        _ = cancel_rx.changed() => {
+            if let Some(reason) = cancel_rx.borrow().as_deref() {
+                eprintln!("\n[Pairing prompt canceled: {reason}]");
+            }
+            false
+        }
+        res = stdin.read_line(&mut line) => {
+            match res {
+                Ok(0) | Err(_) => false,
+                Ok(_) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+            }
+        }
+    }
+}
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_prompter::{ApprovalPrompter, InteractivePrompter, StaticPrompter};
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pairing_prompt_details_serde_and_cancel_handling() {
+        let details = PairingPromptDetails {
+            pairing_id: "pair_abc".to_string(),
+            node_name: "laptop-new".to_string(),
+            os_name: "linux".to_string(),
+            github_login: "octocat".to_string(),
+            sas_code: "123-456".to_string(),
+            existing_user_id: "sc_u_1234".to_string(),
+        };
+        let json = serde_json::to_string(&details).unwrap();
+        let parsed: PairingPromptDetails = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pairing_id, "pair_abc");
+        assert_eq!(parsed.sas_code, "123-456");
+
+        let static_prompter = StaticPrompter::new(ApprovalDecision::ApproveOnce);
+        let (_tx, rx) = watch::channel(None);
+        assert!(!static_prompter.prompt_pairing(parsed.clone(), rx).await);
+
+        let interactive = InteractivePrompter::new();
+        let (_cancel_tx, cancel_rx) = watch::channel(Some("Already handled".to_string()));
+        assert!(!interactive.prompt_pairing(parsed, cancel_rx).await);
+    }
+}

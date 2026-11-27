@@ -8,7 +8,7 @@ use sshcast_client::enroll::{
     mint_enrollment_bundle_with_cert, run_keygen, write_client_config_and_optional_root_key,
     write_client_config_from_bundle,
 };
-use sshcast_client::gui::run_egui_modal_process;
+use sshcast_client::gui::{run_egui_modal_process, run_egui_pairing_modal_process};
 use sshcast_client::local_agent::LocalAgentConnector;
 use sshcast_client::operator::{
     cancel_enrollment_pairing, complete_paired_enrollment, confirm_replace_lost_root_key,
@@ -19,7 +19,9 @@ use sshcast_client::operator::{
 };
 use sshcast_client::pairing::{encrypt_recovery_vault, ScryptParams, VaultDecryptError};
 use sshcast_client::policy::{ApprovalDecision, PolicyEngine};
-use sshcast_client::prompt::{ApprovalPrompter, InteractivePrompter, PromptDetails, StaticPrompter};
+use sshcast_client::prompt::{
+    ApprovalPrompter, InteractivePrompter, PairingPromptDetails, PromptDetails, StaticPrompter,
+};
 use sshcast_proto::v1::NodeRole;
 use std::future::Future;
 use std::path::PathBuf;
@@ -278,6 +280,12 @@ enum Commands {
     /// Internal helper subcommand that renders the native `eframe`/`egui` approval modal window
     #[command(hide = true)]
     InternalGuiPrompt {
+        #[arg(long)]
+        payload_json: String,
+    },
+    /// Internal helper subcommand that renders the native `eframe`/`egui` device pairing approval window
+    #[command(hide = true)]
+    InternalGuiPairingPrompt {
         #[arg(long)]
         payload_json: String,
     },
@@ -687,6 +695,13 @@ async fn main() -> Result<()> {
                 ApprovalDecision::Deny => "DENY",
             };
             println!("{token}");
+            Ok(())
+        }
+        Commands::InternalGuiPairingPrompt { payload_json } => {
+            let details: PairingPromptDetails = serde_json::from_str(&payload_json)
+                .context("failed to deserialize PairingPromptDetails JSON")?;
+            let approved = run_egui_pairing_modal_process(details)?;
+            println!("{}", if approved { "APPROVE" } else { "DENY" });
             Ok(())
         }
     }
@@ -1296,6 +1311,18 @@ mod tests {
             Some(Commands::Recovery {
                 action: RecoveryAction::Remove { .. }
             })
+        ));
+
+        let pairing_gui = Cli::try_parse_from([
+            "sshcast-client",
+            "internal-gui-pairing-prompt",
+            "--payload-json",
+            "{}",
+        ])
+        .unwrap();
+        assert!(matches!(
+            pairing_gui.command,
+            Some(Commands::InternalGuiPairingPrompt { .. })
         ));
     }
 }
