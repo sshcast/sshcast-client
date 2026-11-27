@@ -10,14 +10,24 @@ use sshcast_client::enroll::{
 };
 use sshcast_client::gui::run_egui_modal_process;
 use sshcast_client::local_agent::LocalAgentConnector;
-use sshcast_client::operator::login_and_enroll;
+use sshcast_client::operator::{
+    cancel_enrollment_pairing, complete_paired_enrollment, confirm_replace_lost_root_key,
+    delete_recovery_vault_http, finalize_new_or_same_key_enrollment,
+    get_recovery_vault_status_http, is_terminal_enroll_error, poll_enrollment_once,
+    resolve_operator_url, start_github_enrollment, unlock_with_recovery_passphrase,
+    upload_recovery_vault_http, EnrollPollStep, LoginOutcome, PendingPairingInfo,
+};
+use sshcast_client::pairing::{encrypt_recovery_vault, ScryptParams, VaultDecryptError};
 use sshcast_client::policy::{ApprovalDecision, PolicyEngine};
 use sshcast_client::prompt::{ApprovalPrompter, InteractivePrompter, PromptDetails, StaticPrompter};
 use sshcast_proto::v1::NodeRole;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -260,11 +270,58 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Manage the optional passphrase-encrypted recovery vault stored on the Sshcast Operator
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryAction,
+    },
     /// Internal helper subcommand that renders the native `eframe`/`egui` approval modal window
     #[command(hide = true)]
     InternalGuiPrompt {
         #[arg(long)]
         payload_json: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RecoveryAction {
+    /// Encrypt and upload your user root key with a recovery passphrase for offline device enrollment
+    Set {
+        /// Optional path to `client.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Optional path to `user_key.toml`
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+
+        /// Explicit Operator URL override (e.g. `https://op.sshcast.net`)
+        #[arg(long)]
+        operator: Option<String>,
+
+        /// Read the recovery passphrase as a single line from stdin instead of prompting interactively
+        #[arg(long, default_value_t = false)]
+        passphrase_stdin: bool,
+    },
+    /// Check whether a recovery vault is currently configured on the Operator
+    Status {
+        /// Optional path to `client.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Explicit Operator URL override (e.g. `https://op.sshcast.net`)
+        #[arg(long)]
+        operator: Option<String>,
+    },
+    /// Remove the encrypted recovery vault from the Operator
+    Remove {
+        /// Optional path to `client.toml`
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Explicit Operator URL override (e.g. `https://op.sshcast.net`)
+        #[arg(long)]
+        operator: Option<String>,
     },
 }
 
@@ -296,40 +353,15 @@ async fn main() -> Result<()> {
             config,
             no_browser,
         } => {
-            let outcome = login_and_enroll(
-                std::slice::from_ref(&domain),
+            run_interactive_login(
+                &domain,
                 operator.as_deref(),
                 node.as_deref(),
                 key_file.as_deref(),
                 config.as_deref(),
                 !no_browser,
-                |auth_url| {
-                    println!("Opening GitHub sign-in in your browser:");
-                    println!("  {auth_url}");
-                    println!("Waiting for authentication...");
-                },
             )
-            .await?;
-            println!("Authenticated Sshcast user '{}'!", outcome.user_id);
-            println!("  Operator:          {}", outcome.operator_url);
-            println!("  Root key:          {}", outcome.key_path.display());
-            println!(
-                "  Client config:     {}{}",
-                outcome.config_path.display(),
-                if outcome.enrolled_new_client {
-                    " (newly enrolled)"
-                } else {
-                    ""
-                }
-            );
-            if outcome.cert.expires_at_unix_sec > 0 {
-                println!(
-                    "  Certificate exp:   unix {} (auto-renewed)",
-                    outcome.cert.expires_at_unix_sec
-                );
-            }
-            println!("\nNext: start the workstation client (`sshcast-client run`) or tray app!");
-            Ok(())
+            .await
         }
         Commands::Keygen { key_file, force } => {
             let out = run_keygen(key_file.as_deref(), force)?;
@@ -643,6 +675,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Recovery { action } => run_recovery_command(action).await,
         Commands::InternalGuiPrompt { payload_json } => {
             let details: PromptDetails = serde_json::from_str(&payload_json)
                 .context("failed to deserialize PromptDetails JSON")?;
@@ -656,5 +689,613 @@ async fn main() -> Result<()> {
             println!("{token}");
             Ok(())
         }
+    }
+}
+
+#[cfg(unix)]
+mod terminal_echo {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::Mutex;
+
+    static SAVED_TERMIOS: Mutex<Option<libc::termios>> = Mutex::new(None);
+
+    pub struct TermiosRestoreGuard {
+        active: bool,
+    }
+
+    impl TermiosRestoreGuard {
+        pub fn disable_echo() -> Option<Self> {
+            let fd = std::io::stdin().as_raw_fd();
+            unsafe {
+                if libc::isatty(fd) != 1 {
+                    return None;
+                }
+                let mut orig: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(fd, &mut orig) != 0 {
+                    return None;
+                }
+                if let Ok(mut saved) = SAVED_TERMIOS.lock() {
+                    if saved.is_none() {
+                        *saved = Some(orig);
+                    }
+                }
+                let mut no_echo = orig;
+                no_echo.c_lflag &= !libc::ECHO;
+                if libc::tcsetattr(fd, libc::TCSANOW, &no_echo) != 0 {
+                    if let Ok(mut saved) = SAVED_TERMIOS.lock() {
+                        *saved = None;
+                    }
+                    return None;
+                }
+            }
+            Some(Self { active: true })
+        }
+    }
+
+    impl Drop for TermiosRestoreGuard {
+        fn drop(&mut self) {
+            if self.active {
+                restore_terminal_echo();
+            }
+        }
+    }
+
+    pub fn restore_terminal_echo() {
+        if let Ok(mut saved) = SAVED_TERMIOS.lock() {
+            if let Some(orig) = saved.take() {
+                let fd = std::io::stdin().as_raw_fd();
+                unsafe {
+                    let _ = libc::tcsetattr(fd, libc::TCSANOW, &orig);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod terminal_echo {
+    pub struct TermiosRestoreGuard;
+
+    impl TermiosRestoreGuard {
+        pub fn disable_echo() -> Option<Self> {
+            None
+        }
+    }
+
+    pub fn restore_terminal_echo() {}
+}
+
+fn read_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush().context("failed to flush stdout")?;
+
+    let guard = terminal_echo::TermiosRestoreGuard::disable_echo();
+    let mut line = Zeroizing::new(String::new());
+    let n = std::io::stdin()
+        .read_line(&mut line)
+        .context("failed to read passphrase from stdin")?;
+    let had_echo_disabled = guard.is_some();
+    drop(guard);
+    if had_echo_disabled {
+        println!();
+    }
+    if n == 0 {
+        anyhow::bail!("unexpected end of input while reading passphrase");
+    }
+    Ok(Zeroizing::new(
+        line.trim_end_matches(['\r', '\n']).to_string(),
+    ))
+}
+
+async fn read_passphrase_cancellable<F>(prompt: &str, ctrl_c: &mut F) -> Result<Zeroizing<String>>
+where
+    F: Future<Output = std::io::Result<()>> + Unpin,
+{
+    let prompt_owned = prompt.to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_passphrase(&prompt_owned));
+    });
+    tokio::select! {
+        _ = ctrl_c => {
+            terminal_echo::restore_terminal_echo();
+            println!();
+            anyhow::bail!("canceled");
+        }
+        res = rx => res.context("passphrase input thread aborted")?,
+    }
+}
+
+async fn read_line_cancellable<F>(prompt: &str, ctrl_c: &mut F) -> Result<String>
+where
+    F: Future<Output = std::io::Result<()>> + Unpin,
+{
+    let prompt_owned = prompt.to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let res = (|| -> Result<String> {
+            print!("{prompt_owned}");
+            std::io::stdout().flush().context("failed to flush stdout")?;
+            let mut line = String::new();
+            let n = std::io::stdin()
+                .read_line(&mut line)
+                .context("failed to read input from stdin")?;
+            if n == 0 {
+                anyhow::bail!("unexpected end of input");
+            }
+            Ok(line)
+        })();
+        let _ = tx.send(res);
+    });
+    tokio::select! {
+        _ = ctrl_c => {
+            terminal_echo::restore_terminal_echo();
+            println!();
+            anyhow::bail!("canceled");
+        }
+        res = rx => res.context("input thread aborted")?,
+    }
+}
+
+struct StdinCommandReader {
+    line_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    next_tx: std::sync::mpsc::Sender<()>,
+}
+
+fn spawn_stdin_line_reader() -> StdinCommandReader {
+    let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (next_tx, next_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || loop {
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if line_tx.send(line).is_err() {
+                    break;
+                }
+                if next_rx.recv().is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    StdinCommandReader { line_rx, next_tx }
+}
+
+async fn next_stdin_line(reader: &mut Option<StdinCommandReader>) -> Option<String> {
+    match reader {
+        Some(r) => r.line_rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn print_login_success(outcome: &LoginOutcome, show_recovery_tip: bool) {
+    println!("Authenticated Sshcast user '{}'!", outcome.user_id);
+    println!("  Operator:          {}", outcome.operator_url);
+    println!("  Root key:          {}", outcome.key_path.display());
+    println!(
+        "  Client config:     {}{}",
+        outcome.config_path.display(),
+        if outcome.enrolled_new_client {
+            " (newly enrolled)"
+        } else {
+            ""
+        }
+    );
+    if outcome.cert.expires_at_unix_sec > 0 {
+        println!(
+            "  Certificate exp:   unix {} (auto-renewed)",
+            outcome.cert.expires_at_unix_sec
+        );
+    }
+    if show_recovery_tip && outcome.enrolled_new_client {
+        println!(
+            "\nTip: run `sshcast-client recovery set` to set an optional recovery passphrase for offline device enrollment."
+        );
+    }
+    println!("\nNext: start the workstation client (`sshcast-client run`) or tray app!");
+}
+
+fn is_wrong_passphrase_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<VaultDecryptError>(),
+            Some(VaultDecryptError::WrongPassphrase)
+        )
+    })
+}
+
+async fn run_interactive_login(
+    domain: &str,
+    operator: Option<&str>,
+    node: Option<&str>,
+    key_file: Option<&std::path::Path>,
+    config: Option<&std::path::Path>,
+    open_browser: bool,
+) -> Result<()> {
+    let started = start_github_enrollment(
+        &[domain.to_string()],
+        operator,
+        node,
+        key_file,
+        config,
+        open_browser,
+        |auth_url| {
+            println!("Opening GitHub sign-in in your browser:");
+            println!("  {auth_url}");
+            println!("Waiting for authentication...");
+        },
+    )
+    .await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut poll_sleep = std::pin::pin!(tokio::time::sleep(Duration::from_secs(2)));
+    let mut logged_awaiting = false;
+    let mut displayed_pairing_id: Option<String> = None;
+    let mut current_pairing_info: Option<PendingPairingInfo> = None;
+    let mut stdin_reader: Option<StdinCommandReader> = None;
+
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                terminal_echo::restore_terminal_echo();
+                println!("\nCanceling GitHub login...");
+                let _ = cancel_enrollment_pairing(&started).await;
+                anyhow::bail!("GitHub login canceled");
+            }
+            maybe_line = next_stdin_line(&mut stdin_reader) => {
+                let Some(line) = maybe_line else {
+                    stdin_reader = None;
+                    continue;
+                };
+                let Some(ref info) = current_pairing_info else {
+                    if let Some(ref reader) = stdin_reader {
+                        let _ = reader.next_tx.send(());
+                    }
+                    continue;
+                };
+
+                let cmd = line.trim().to_ascii_lowercase();
+                if cmd == "p" {
+                    if !info.has_recovery_vault {
+                        println!("No recovery passphrase is configured on this account.");
+                    } else {
+                        let passphrase = match read_passphrase_cancellable(
+                            "Enter recovery passphrase: ",
+                            &mut ctrl_c,
+                        )
+                        .await
+                        {
+                            Ok(p) => p,
+                            Err(e) if e.to_string() == "canceled" => {
+                                let _ = cancel_enrollment_pairing(&started).await;
+                                anyhow::bail!("GitHub login canceled");
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        match unlock_with_recovery_passphrase(&started, info, &passphrase).await {
+                            Ok(outcome) => {
+                                println!("Unlocked account root key using recovery passphrase!");
+                                print_login_success(&outcome, false);
+                                return Ok(());
+                            }
+                            Err(e) if is_wrong_passphrase_error(&e) => {
+                                eprintln!("Incorrect recovery passphrase. Try again ('p'), reset ('r'), or approve on an existing workstation.");
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                } else if cmd == "r" {
+                    let confirm = match read_line_cancellable(
+                        "Type RESET to confirm replacing your root key (old workstations and relays will stop renewing): ",
+                        &mut ctrl_c,
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(e) if e.to_string() == "canceled" => {
+                            let _ = cancel_enrollment_pairing(&started).await;
+                            anyhow::bail!("GitHub login canceled");
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if confirm.trim() == "RESET" {
+                        let outcome = confirm_replace_lost_root_key(&started).await?;
+                        println!("Replaced account root key and enrolled this workstation.");
+                        print_login_success(&outcome, true);
+                        return Ok(());
+                    } else {
+                        println!("Root key reset canceled. Waiting for pairing approval...");
+                    }
+                } else if !cmd.is_empty() {
+                    println!(
+                        "Unrecognized input. Enter 'p' for recovery passphrase, 'r' to reset root key, or approve on an existing workstation."
+                    );
+                }
+
+                if let Some(ref reader) = stdin_reader {
+                    let _ = reader.next_tx.send(());
+                }
+            }
+            _ = &mut poll_sleep => {
+                if tokio::time::Instant::now() >= deadline {
+                    let _ = cancel_enrollment_pairing(&started).await;
+                    anyhow::bail!("timed out waiting for GitHub OAuth enrollment completion");
+                }
+                poll_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(2));
+
+                let step_res = tokio::select! {
+                    _ = &mut ctrl_c => {
+                        terminal_echo::restore_terminal_echo();
+                        println!("\nCanceling GitHub login...");
+                        let _ = cancel_enrollment_pairing(&started).await;
+                        anyhow::bail!("GitHub login canceled");
+                    }
+                    res = poll_enrollment_once(&started) => res,
+                };
+
+                let step = match step_res {
+                    Ok(s) => s,
+                    Err(e) if is_terminal_enroll_error(&e) => return Err(e),
+                    Err(e) => {
+                        tracing::debug!("Enrollment poll transient error: {e:#}");
+                        continue;
+                    }
+                };
+
+                match step {
+                    EnrollPollStep::Pending => {}
+                    EnrollPollStep::AwaitingApproval => {
+                        if !logged_awaiting {
+                            logged_awaiting = true;
+                            println!(
+                                "GitHub sign-in completed; waiting for operator approval in /console/..."
+                            );
+                        }
+                    }
+                    EnrollPollStep::Approved { cert_token } => {
+                        let outcome = finalize_new_or_same_key_enrollment(&started, &cert_token)?;
+                        print_login_success(&outcome, true);
+                        return Ok(());
+                    }
+                    EnrollPollStep::Paired {
+                        pairing_id,
+                        existing_user_pubkey,
+                        approver_node_id,
+                        envelope,
+                    } => {
+                        if !approver_node_id.is_empty() {
+                            println!("Pairing approved by workstation '{approver_node_id}'!");
+                        } else {
+                            println!("Pairing approved by existing workstation!");
+                        }
+                        let outcome = complete_paired_enrollment(
+                            started,
+                            &existing_user_pubkey,
+                            &pairing_id,
+                            &envelope,
+                        )
+                        .await?;
+                        print_login_success(&outcome, false);
+                        return Ok(());
+                    }
+                    EnrollPollStep::PairingRequired(info) => {
+                        if displayed_pairing_id.as_deref() != Some(&info.pairing_id) {
+                            displayed_pairing_id = Some(info.pairing_id.clone());
+                            println!();
+                            if info.github_login.is_empty() {
+                                println!(
+                                    "Existing Sshcast account detected ({}).",
+                                    info.existing_user_pubkey_token
+                                );
+                            } else {
+                                println!(
+                                    "Existing account @{} detected ({}).",
+                                    info.github_login, info.existing_user_pubkey_token
+                                );
+                            }
+                            println!("  Verification Code: {}", info.sas_code);
+                            println!(
+                                "  Click Approve on an existing Sshcast workstation to pair this device."
+                            );
+                            if info.has_recovery_vault {
+                                println!(
+                                    "  [p] Or press 'p' + Enter to unlock with your recovery passphrase"
+                                );
+                            }
+                            println!(
+                                "  [r] Lost old devices? Type 'r' + Enter to reset account & replace root key"
+                            );
+                            if stdin_reader.is_none() {
+                                stdin_reader = Some(spawn_stdin_line_reader());
+                            }
+                        }
+                        current_pairing_info = Some(info);
+                    }
+                    EnrollPollStep::Denied(reason) => {
+                        anyhow::bail!("enrollment rejected ({reason})");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn resolve_recovery_operator_url(
+    cfg: &ClientConfig,
+    operator_override: Option<&str>,
+) -> Result<String> {
+    let explicit = operator_override
+        .map(str::to_string)
+        .or_else(|| cfg.operator_url.clone());
+    let servers = cfg.servers.clone();
+    tokio::task::spawn_blocking(move || resolve_operator_url(explicit.as_deref(), &servers))
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not discover operator URL via _sshcast DNS TXT for {:?}; pass --operator https://...",
+                cfg.servers
+            )
+        })
+}
+
+async fn run_recovery_command(action: RecoveryAction) -> Result<()> {
+    match action {
+        RecoveryAction::Set {
+            config,
+            key_file,
+            operator,
+            passphrase_stdin,
+        } => {
+            let cfg = ClientConfig::load(config.as_deref())?;
+            let op_url = resolve_recovery_operator_url(&cfg, operator.as_deref()).await?;
+            let user_sk = load_user_signing_key(key_file.as_deref())?;
+            if user_sk.verifying_key().to_bytes().as_slice() != cfg.grant.user_pubkey.as_slice() {
+                anyhow::bail!(
+                    "local user_key.toml does not match this workstation's enrolled user ({}) in client.toml",
+                    cfg.grant.user_id
+                );
+            }
+
+            let passphrase = if passphrase_stdin {
+                let mut line = Zeroizing::new(String::new());
+                let n = std::io::stdin()
+                    .read_line(&mut line)
+                    .context("failed to read recovery passphrase from stdin")?;
+                if n == 0 {
+                    anyhow::bail!("failed to read recovery passphrase from stdin (empty input)");
+                }
+                Zeroizing::new(line.trim_end_matches(['\r', '\n']).to_string())
+            } else {
+                let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+                let first = read_passphrase_cancellable(
+                    "Enter new recovery passphrase (minimum 8 characters): ",
+                    &mut ctrl_c,
+                )
+                .await?;
+                if first.chars().count() < 8 {
+                    anyhow::bail!("recovery passphrase must be at least 8 characters long");
+                }
+                let second =
+                    read_passphrase_cancellable("Confirm recovery passphrase: ", &mut ctrl_c)
+                        .await?;
+                if *first != *second {
+                    anyhow::bail!("recovery passphrases do not match");
+                }
+                first
+            };
+
+            if passphrase.chars().count() < 8 {
+                anyhow::bail!("recovery passphrase must be at least 8 characters long");
+            }
+
+            let sk_clone = user_sk.clone();
+            let vault = tokio::task::spawn_blocking(move || {
+                encrypt_recovery_vault(&sk_clone, &passphrase, ScryptParams::default())
+            })
+            .await??;
+
+            let updated_at =
+                upload_recovery_vault_http(&op_url, &cfg.grant, &cfg.node_signing_key, &vault)
+                    .await?;
+            println!(
+                "Recovery vault uploaded for '{}' (operator: {}, updated_at: unix {}).",
+                cfg.grant.user_id, op_url, updated_at
+            );
+            println!(
+                "Keep this passphrase safe — it allows enrolling new workstations when no existing device is online."
+            );
+            Ok(())
+        }
+        RecoveryAction::Status { config, operator } => {
+            let cfg = ClientConfig::load(config.as_deref())?;
+            let op_url = resolve_recovery_operator_url(&cfg, operator.as_deref()).await?;
+            let (configured, updated_at) =
+                get_recovery_vault_status_http(&op_url, &cfg.grant, &cfg.node_signing_key).await?;
+            if configured {
+                println!(
+                    "Recovery vault: configured (updated_at: unix {}, operator: {})",
+                    updated_at, op_url
+                );
+            } else {
+                println!("Recovery vault: not configured (operator: {op_url})");
+                println!(
+                    "Run `sshcast-client recovery set` to configure an encrypted recovery passphrase."
+                );
+            }
+            Ok(())
+        }
+        RecoveryAction::Remove { config, operator } => {
+            let cfg = ClientConfig::load(config.as_deref())?;
+            let op_url = resolve_recovery_operator_url(&cfg, operator.as_deref()).await?;
+            delete_recovery_vault_http(&op_url, &cfg.grant, &cfg.node_signing_key).await?;
+            println!(
+                "Removed recovery vault from operator {op_url} for '{}'.",
+                cfg.grant.user_id
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parses_login_and_recovery_subcommands() {
+        let login = Cli::try_parse_from([
+            "sshcast-client",
+            "login",
+            "--domain",
+            "sshcast.net",
+            "--operator",
+            "https://op.sshcast.net",
+            "--node",
+            "my-laptop",
+            "--no-browser",
+        ])
+        .unwrap();
+        assert!(matches!(login.command, Some(Commands::Login { .. })));
+
+        let rec_set = Cli::try_parse_from([
+            "sshcast-client",
+            "recovery",
+            "set",
+            "--passphrase-stdin",
+            "--operator",
+            "https://op.sshcast.net",
+        ])
+        .unwrap();
+        assert!(matches!(
+            rec_set.command,
+            Some(Commands::Recovery {
+                action: RecoveryAction::Set {
+                    passphrase_stdin: true,
+                    ..
+                }
+            })
+        ));
+
+        let rec_status = Cli::try_parse_from(["sshcast-client", "recovery", "status"]).unwrap();
+        assert!(matches!(
+            rec_status.command,
+            Some(Commands::Recovery {
+                action: RecoveryAction::Status { .. }
+            })
+        ));
+
+        let rec_remove = Cli::try_parse_from(["sshcast-client", "recovery", "remove"]).unwrap();
+        assert!(matches!(
+            rec_remove.command,
+            Some(Commands::Recovery {
+                action: RecoveryAction::Remove { .. }
+            })
+        ));
     }
 }

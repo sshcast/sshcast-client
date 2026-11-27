@@ -1269,3 +1269,1104 @@ async fn test_operator_renewal_and_github_login_roundtrip() {
 
     srv_handle.abort();
 }
+
+struct MockOperatorEnrollSession {
+    poll_token: String,
+    candidate_user_pubkey: String,
+    node_name: String,
+    os_name: String,
+    node_pubkey_b64: String,
+    eph_x25519_pub_b64: String,
+    status: String,
+    pairing_id: String,
+    cert_token: String,
+    approver_node_id: String,
+    approver_eph_x25519_pub_b64: String,
+    approver_signature_b64: String,
+    handoff_nonce_b64: String,
+    encrypted_handoff_b64: String,
+}
+
+struct MockOperatorState {
+    op_sk: SigningKey,
+    github_login: String,
+    existing_user_pubkey: String,
+    recovery_vault: Option<(sshcast_client::pairing::RecoveryVaultBlob, i64)>,
+    sessions: std::collections::HashMap<String, MockOperatorEnrollSession>,
+    next_seq: u64,
+    cancel_calls: usize,
+    replace_calls: usize,
+    renew_calls: usize,
+}
+
+async fn read_http_request_parts(
+    stream: &mut tokio::net::TcpStream,
+) -> Option<(String, String, Vec<(String, String)>, String)> {
+    let mut buf = vec![0u8; 32768];
+    let mut total = 0usize;
+    loop {
+        let n = stream.read(&mut buf[total..]).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        total += n;
+        let text = String::from_utf8_lossy(&buf[..total]);
+        if let Some(hdr_end) = text.find("\r\n\r\n") {
+            let hdrs = &text[..hdr_end];
+            let content_len: usize = hdrs
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        v.trim().parse().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if total >= hdr_end + 4 + content_len {
+                break;
+            }
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    let req_text = String::from_utf8_lossy(&buf[..total]);
+    let (hdr_block, body) = req_text.split_once("\r\n\r\n").unwrap_or((&req_text, ""));
+    let mut lines = hdr_block.lines();
+    let first_line = lines.next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let headers = lines
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        })
+        .collect();
+    Some((method, path, headers, body.to_string()))
+}
+
+fn verify_mock_operator_node_auth(
+    val: &serde_json::Value,
+    expected_user_pubkey_token: &str,
+    now_sec: u64,
+) -> NodeGrant {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use prost::Message;
+    use sshcast_proto::v1::NodeAuth;
+
+    let auth_b64 = val["node_auth_proto_b64"].as_str().unwrap();
+    let auth_raw = STANDARD.decode(auth_b64).unwrap();
+    let node_auth = NodeAuth::decode(auth_raw.as_slice()).unwrap();
+    verify_node_auth(
+        &node_auth,
+        Some(NodeRole::Client),
+        now_sec * 1000,
+        DEFAULT_MAX_CLOCK_SKEW_MS,
+    )
+    .unwrap();
+    let grant = node_auth.grant.unwrap();
+    let got_tok = format!("sc_pub_{}", hex::encode(&grant.user_pubkey));
+    assert_eq!(got_tok, expected_user_pubkey_token);
+    grant
+}
+
+fn sign_mock_user_cert(op_sk: &SigningKey, user_pubkey: &[u8], now_sec: u64) -> String {
+    use sshcast_proto::bundle::encode_user_cert_token;
+    use sshcast_proto::crypto::{derive_user_id, sign_user_cert};
+    use sshcast_proto::v1::UserCert;
+
+    let mut cert = UserCert {
+        user_id: derive_user_id(user_pubkey),
+        user_pubkey: user_pubkey.to_vec(),
+        operator_pubkey: Vec::new(),
+        issued_at_unix_sec: now_sec,
+        expires_at_unix_sec: now_sec + 7 * 86_400,
+        operator_signature: Vec::new(),
+    };
+    sign_user_cert(&mut cert, op_sk);
+    encode_user_cert_token(&cert)
+}
+
+async fn spawn_mock_operator(
+    existing_user_sk: &SigningKey,
+    github_login: &str,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<MockOperatorState>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let existing_user_pubkey = format!(
+        "sc_pub_{}",
+        hex::encode(existing_user_sk.verifying_key().to_bytes())
+    );
+    let state = Arc::new(tokio::sync::Mutex::new(MockOperatorState {
+        op_sk: SigningKey::from_bytes(&[0x92; 32]),
+        github_login: github_login.to_string(),
+        existing_user_pubkey,
+        recovery_vault: None,
+        sessions: std::collections::HashMap::new(),
+        next_seq: 1,
+        cancel_calls: 0,
+        replace_calls: 0,
+        renew_calls: 0,
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    let base_url_srv = base_url.clone();
+    let state_srv = Arc::clone(&state);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let Some((_method, path, headers, body)) = read_http_request_parts(&mut stream).await
+            else {
+                continue;
+            };
+            let now_sec = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let bearer = headers
+                .iter()
+                .find(|(k, _)| k == "authorization")
+                .and_then(|(_, v)| v.strip_prefix("Bearer "))
+                .map(str::to_string);
+
+            let (http_status, resp_body) = {
+                let mut st = state_srv.lock().await;
+                if path == "/api/v1/enroll/start" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let candidate_user_pubkey =
+                        val["user_pubkey"].as_str().unwrap().to_string();
+                    let supports_pairing =
+                        val["supports_pairing"].as_bool().unwrap_or(false);
+                    assert!(supports_pairing);
+                    st.next_seq += 1;
+                    let seq = st.next_seq;
+                    let state_id = format!("state_{seq}");
+                    let poll_token = format!("poll_tok_{seq}");
+                    let pairing_id = format!("pair_{seq}");
+
+                    let (status, cert_token) =
+                        if candidate_user_pubkey == st.existing_user_pubkey {
+                            let pub_raw = hex::decode(
+                                candidate_user_pubkey.strip_prefix("sc_pub_").unwrap(),
+                            )
+                            .unwrap();
+                            (
+                                "approved".to_string(),
+                                sign_mock_user_cert(&st.op_sk, &pub_raw, now_sec),
+                            )
+                        } else {
+                            ("pairing_required".to_string(), String::new())
+                        };
+
+                    st.sessions.insert(
+                        state_id.clone(),
+                        MockOperatorEnrollSession {
+                            poll_token: poll_token.clone(),
+                            candidate_user_pubkey,
+                            node_name: val["node_name"].as_str().unwrap_or("").to_string(),
+                            os_name: val["os_name"].as_str().unwrap_or("").to_string(),
+                            node_pubkey_b64: val["node_pubkey_b64"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                            eph_x25519_pub_b64: val["eph_x25519_pub_b64"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                            status,
+                            pairing_id,
+                            cert_token,
+                            approver_node_id: String::new(),
+                            approver_eph_x25519_pub_b64: String::new(),
+                            approver_signature_b64: String::new(),
+                            handoff_nonce_b64: String::new(),
+                            encrypted_handoff_b64: String::new(),
+                        },
+                    );
+
+                    (
+                        200u16,
+                        serde_json::json!({
+                            "ok": true,
+                            "state": state_id,
+                            "poll_token": poll_token,
+                            "auth_url": format!("{base_url_srv}/auth/github/start?state=state_{seq}"),
+                        })
+                        .to_string(),
+                    )
+                } else if path.starts_with("/api/v1/enroll/poll") {
+                    let state_id = path.split("state=").nth(1).unwrap_or("");
+                    let existing_pk = st.existing_user_pubkey.clone();
+                    let login = st.github_login.clone();
+                    let vault_opt = st.recovery_vault.as_ref().map(|(v, _)| v.clone());
+                    if let Some(sess) = st.sessions.get(state_id) {
+                        assert_eq!(bearer.as_deref(), Some(sess.poll_token.as_str()));
+                        match sess.status.as_str() {
+                            "approved" => (
+                                200,
+                                serde_json::json!({
+                                    "ok": true,
+                                    "status": "approved",
+                                    "cert_token": sess.cert_token,
+                                })
+                                .to_string(),
+                            ),
+                            "pairing_required" => (
+                                200,
+                                serde_json::json!({
+                                    "ok": true,
+                                    "status": "pairing_required",
+                                    "pairing_id": sess.pairing_id,
+                                    "existing_user_pubkey": existing_pk,
+                                    "github_login": login,
+                                    "has_recovery_vault": vault_opt.is_some(),
+                                    "recovery_vault": vault_opt,
+                                })
+                                .to_string(),
+                            ),
+                            "paired" => (
+                                200,
+                                serde_json::json!({
+                                    "ok": true,
+                                    "status": "paired",
+                                    "pairing_id": sess.pairing_id,
+                                    "existing_user_pubkey": existing_pk,
+                                    "approver_node_id": sess.approver_node_id,
+                                    "approver_eph_x25519_pub_b64": sess.approver_eph_x25519_pub_b64,
+                                    "approver_signature_b64": sess.approver_signature_b64,
+                                    "handoff_nonce_b64": sess.handoff_nonce_b64,
+                                    "encrypted_handoff_b64": sess.encrypted_handoff_b64,
+                                })
+                                .to_string(),
+                            ),
+                            "denied" | "banned" => (
+                                403,
+                                serde_json::json!({
+                                    "ok": false,
+                                    "status": sess.status,
+                                    "error": "denied by user",
+                                })
+                                .to_string(),
+                            ),
+                            "canceled" => (
+                                409,
+                                serde_json::json!({
+                                    "ok": false,
+                                    "status": "canceled",
+                                    "error": "canceled",
+                                })
+                                .to_string(),
+                            ),
+                            "expired" => (
+                                410,
+                                serde_json::json!({
+                                    "ok": false,
+                                    "status": "expired",
+                                    "error": "expired",
+                                })
+                                .to_string(),
+                            ),
+                            other => (
+                                200,
+                                serde_json::json!({
+                                    "ok": true,
+                                    "status": other,
+                                })
+                                .to_string(),
+                            ),
+                        }
+                    } else {
+                        (
+                            404,
+                            serde_json::json!({ "ok": false, "error": "unknown state" })
+                                .to_string(),
+                        )
+                    }
+                } else if path == "/api/v1/enroll/cancel" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let state_id = val["state"].as_str().unwrap();
+                    if let Some(sess) = st.sessions.get_mut(state_id) {
+                        assert_eq!(bearer.as_deref(), Some(sess.poll_token.as_str()));
+                        sess.status = "canceled".to_string();
+                        st.cancel_calls += 1;
+                        (200, serde_json::json!({ "ok": true }).to_string())
+                    } else {
+                        (
+                            404,
+                            serde_json::json!({ "ok": false, "error": "unknown state" })
+                                .to_string(),
+                        )
+                    }
+                } else if path == "/api/v1/enroll/replace" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let state_id = val["state"].as_str().unwrap().to_string();
+                    let op_sk_clone = st.op_sk.clone();
+                    if let Some(sess) = st.sessions.get_mut(&state_id) {
+                        assert_eq!(bearer.as_deref(), Some(sess.poll_token.as_str()));
+                        let new_pub_hex = sess
+                            .candidate_user_pubkey
+                            .strip_prefix("sc_pub_")
+                            .unwrap()
+                            .to_string();
+                        let new_pub_raw = hex::decode(&new_pub_hex).unwrap();
+                        let cert_tok = sign_mock_user_cert(&op_sk_clone, &new_pub_raw, now_sec);
+                        sess.status = "approved".to_string();
+                        sess.cert_token = cert_tok.clone();
+                        let new_pub_tok = sess.candidate_user_pubkey.clone();
+                        st.existing_user_pubkey = new_pub_tok;
+                        st.replace_calls += 1;
+                        (
+                            200,
+                            serde_json::json!({
+                                "ok": true,
+                                "status": "approved",
+                                "cert_token": cert_tok,
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        (
+                            404,
+                            serde_json::json!({ "ok": false, "error": "unknown state" })
+                                .to_string(),
+                        )
+                    }
+                } else if path == "/api/v1/pairing/poll" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    verify_mock_operator_node_auth(&val, &st.existing_user_pubkey, now_sec);
+                    let reqs: Vec<serde_json::Value> = st
+                        .sessions
+                        .values()
+                        .filter(|s| s.status == "pairing_required")
+                        .map(|s| {
+                            serde_json::json!({
+                                "pairing_id": s.pairing_id,
+                                "node_name": s.node_name,
+                                "os_name": s.os_name,
+                                "github_login": st.github_login,
+                                "node_pubkey_b64": s.node_pubkey_b64,
+                                "eph_x25519_pub_b64": s.eph_x25519_pub_b64,
+                                "expires_at": (now_sec + 300) as i64,
+                                "created_at": now_sec as i64,
+                            })
+                        })
+                        .collect();
+                    (
+                        200,
+                        serde_json::json!({ "ok": true, "requests": reqs }).to_string(),
+                    )
+                } else if path == "/api/v1/pairing/respond" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let grant =
+                        verify_mock_operator_node_auth(&val, &st.existing_user_pubkey, now_sec);
+                    let pairing_id = val["pairing_id"].as_str().unwrap();
+                    let approved = val["approved"].as_bool().unwrap();
+                    if let Some(sess) = st
+                        .sessions
+                        .values_mut()
+                        .find(|s| s.pairing_id == pairing_id)
+                    {
+                        if approved {
+                            sess.status = "paired".to_string();
+                            sess.approver_node_id = grant.node_id;
+                            sess.approver_eph_x25519_pub_b64 = val["approver_eph_x25519_pub_b64"]
+                                .as_str()
+                                .unwrap()
+                                .to_string();
+                            sess.approver_signature_b64 =
+                                val["approver_signature_b64"].as_str().unwrap().to_string();
+                            sess.handoff_nonce_b64 =
+                                val["handoff_nonce_b64"].as_str().unwrap().to_string();
+                            sess.encrypted_handoff_b64 =
+                                val["encrypted_handoff_b64"].as_str().unwrap().to_string();
+                        } else {
+                            sess.status = "denied".to_string();
+                        }
+                        (200, serde_json::json!({ "ok": true }).to_string())
+                    } else {
+                        (
+                            404,
+                            serde_json::json!({ "ok": false, "error": "unknown pairing_id" })
+                                .to_string(),
+                        )
+                    }
+                } else if path == "/api/v1/recovery-vault" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    verify_mock_operator_node_auth(&val, &st.existing_user_pubkey, now_sec);
+                    let vault: sshcast_client::pairing::RecoveryVaultBlob =
+                        serde_json::from_value(val["vault"].clone()).unwrap();
+                    let updated_at = now_sec as i64;
+                    st.recovery_vault = Some((vault, updated_at));
+                    (
+                        200,
+                        serde_json::json!({ "ok": true, "updated_at": updated_at }).to_string(),
+                    )
+                } else if path == "/api/v1/recovery-vault/status" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    verify_mock_operator_node_auth(&val, &st.existing_user_pubkey, now_sec);
+                    let (configured, updated_at) = match &st.recovery_vault {
+                        Some((_, ts)) => (true, *ts),
+                        None => (false, 0),
+                    };
+                    (
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "configured": configured,
+                            "updated_at": updated_at,
+                        })
+                        .to_string(),
+                    )
+                } else if path == "/api/v1/recovery-vault/delete" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    verify_mock_operator_node_auth(&val, &st.existing_user_pubkey, now_sec);
+                    st.recovery_vault = None;
+                    (
+                        200,
+                        serde_json::json!({ "ok": true, "deleted": true }).to_string(),
+                    )
+                } else if path == "/api/v1/renew" {
+                    let val: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let grant =
+                        verify_mock_operator_node_auth(&val, &st.existing_user_pubkey, now_sec);
+                    st.renew_calls += 1;
+                    let cert_tok = sign_mock_user_cert(&st.op_sk, &grant.user_pubkey, now_sec);
+                    (
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "cert_token": cert_tok,
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (
+                        404,
+                        serde_json::json!({ "ok": false, "error": "not found" }).to_string(),
+                    )
+                }
+            };
+
+            let status_reason = match http_status {
+                200 => "200 OK",
+                403 => "403 Forbidden",
+                404 => "404 Not Found",
+                409 => "409 Conflict",
+                410 => "410 Gone",
+                _ => "500 Internal Server Error",
+            };
+            let http_resp = format!(
+                "HTTP/1.1 {status_reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(http_resp.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    (base_url, state, handle)
+}
+
+#[tokio::test]
+async fn test_device_pairing_handoff_end_to_end() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use sshcast_client::config::{ClientConfigFile, UserKeyFile};
+    use sshcast_client::operator::{
+        cancel_enrollment_pairing, complete_paired_enrollment, is_terminal_enroll_error,
+        poll_enrollment_once, poll_pending_pairing_requests_http, respond_to_pairing_request_http,
+        start_github_enrollment, EnrollPollStep,
+    };
+    use sshcast_client::pairing::{compute_pairing_sas_code, create_encrypted_pairing_handoff};
+
+    let user_sk_a = SigningKey::from_bytes(&[0xA1; 32]);
+    let user_pk_a = user_sk_a.verifying_key().to_bytes();
+    let user_pub_token_a = format!("sc_pub_{}", hex::encode(user_pk_a));
+    let coord_url = "https://coord.example.com".to_string();
+
+    let bundle_a = mint_enrollment_bundle(
+        &user_sk_a,
+        "workstation-a",
+        NodeRole::Client,
+        vec![coord_url.clone()],
+        0,
+    )
+    .unwrap();
+
+    let (op_url, op_state, srv_handle) = spawn_mock_operator(&user_sk_a, "octocat").await;
+
+    let tmp_b = TempDir::new().unwrap();
+    let key_path_b = tmp_b.path().join("user_key.toml");
+    let cfg_path_b = tmp_b.path().join("client.toml");
+
+    // Workstation B starts enrollment without an existing user_key.toml; nothing is written yet.
+    let mut seen_auth_url = String::new();
+    let started = start_github_enrollment(
+        std::slice::from_ref(&coord_url),
+        Some(&op_url),
+        Some("workstation-b"),
+        Some(&key_path_b),
+        Some(&cfg_path_b),
+        false,
+        |u| seen_auth_url = u.to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(seen_auth_url.contains("/auth/github/start"));
+    assert!(!key_path_b.exists());
+    assert!(!cfg_path_b.exists());
+
+    // Operator tells B that @octocat already exists with user_sk_a.
+    let info = match poll_enrollment_once(&started).await.unwrap() {
+        EnrollPollStep::PairingRequired(info) => info,
+        other => panic!("expected PairingRequired, got {other:?}"),
+    };
+    assert_eq!(info.github_login, "octocat");
+    assert_eq!(info.existing_user_pubkey_token, user_pub_token_a);
+    assert_eq!(info.existing_user_pubkey, user_pk_a);
+    assert!(!info.has_recovery_vault);
+
+    // Workstation A polls pending requests, verifies SAS code matches B's display, and approves.
+    let pending = poll_pending_pairing_requests_http(
+        &op_url,
+        &bundle_a.grant,
+        &bundle_a.node_signing_key,
+        5,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pending.len(), 1);
+    let req = &pending[0];
+    assert_eq!(req.pairing_id, info.pairing_id);
+    assert_eq!(req.node_name, "workstation-b");
+    assert_eq!(req.github_login, "octocat");
+
+    let req_node_pub: [u8; 32] = STANDARD
+        .decode(&req.node_pubkey_b64)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let req_eph_pub: [u8; 32] = STANDARD
+        .decode(&req.eph_x25519_pub_b64)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let sas_a = compute_pairing_sas_code(&user_pk_a, &req_eph_pub);
+    assert_eq!(sas_a, info.sas_code);
+
+    let envelope = create_encrypted_pairing_handoff(
+        &user_sk_a,
+        None,
+        &req.pairing_id,
+        &req.node_name,
+        &req_node_pub,
+        &req_eph_pub,
+        vec![coord_url.clone()],
+        Some(op_url.clone()),
+    )
+    .unwrap();
+    respond_to_pairing_request_http(
+        &op_url,
+        &bundle_a.grant,
+        &bundle_a.node_signing_key,
+        &req.pairing_id,
+        true,
+        Some(&envelope),
+    )
+    .await
+    .unwrap();
+
+    // Workstation B polls once more -> receives Paired -> completes enrollment and renews cert!
+    let (pairing_id, existing_pk, approver_node, rx_env) =
+        match poll_enrollment_once(&started).await.unwrap() {
+            EnrollPollStep::Paired {
+                pairing_id,
+                existing_user_pubkey,
+                approver_node_id,
+                envelope,
+            } => (pairing_id, existing_user_pubkey, approver_node_id, envelope),
+            other => panic!("expected Paired, got {other:?}"),
+        };
+    assert_eq!(approver_node, "workstation-a");
+
+    let outcome =
+        complete_paired_enrollment(started, &existing_pk, &pairing_id, &rx_env)
+            .await
+            .unwrap();
+    assert!(outcome.enrolled_new_client);
+    assert_eq!(outcome.user_pubkey_token, user_pub_token_a);
+    assert!(key_path_b.exists());
+    assert!(cfg_path_b.exists());
+
+    let loaded_sk_b = load_user_signing_key(Some(&key_path_b)).unwrap();
+    assert_eq!(loaded_sk_b.to_bytes(), user_sk_a.to_bytes());
+
+    let (_, uk_b) = UserKeyFile::load(Some(&key_path_b)).unwrap();
+    assert!(uk_b.user_cert_token.is_some());
+
+    let cfg_b = ClientConfig::load(Some(&cfg_path_b)).unwrap();
+    assert_eq!(cfg_b.grant.node_id, "workstation-b");
+    assert_eq!(cfg_b.grant.user_pubkey, user_pk_a);
+    assert!(cfg_b.grant.user_cert.is_some());
+    assert_eq!(cfg_b.operator_url.as_deref(), Some(op_url.as_str()));
+    let (_, cfg_file_b) = ClientConfigFile::load(Some(&cfg_path_b)).unwrap();
+    assert_eq!(cfg_file_b.servers, vec![coord_url.clone()]);
+    assert_eq!(op_state.lock().await.renew_calls, 1);
+
+    // Also verify terminal rejections (canceled -> 409) return a terminal Err from poll_enrollment_once.
+    let tmp_cancel = TempDir::new().unwrap();
+    let started_cancel = start_github_enrollment(
+        std::slice::from_ref(&coord_url),
+        Some(&op_url),
+        Some("workstation-c"),
+        Some(&tmp_cancel.path().join("user_key.toml")),
+        Some(&tmp_cancel.path().join("client.toml")),
+        false,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    cancel_enrollment_pairing(&started_cancel).await.unwrap();
+    let cancel_err = poll_enrollment_once(&started_cancel).await.unwrap_err();
+    assert!(is_terminal_enroll_error(&cancel_err));
+
+    // Also verify denied (403) and expired (410) return terminal errors.
+    for (status_str, node) in [("denied", "workstation-d"), ("expired", "workstation-e")] {
+        let tmp_term = TempDir::new().unwrap();
+        let started_term = start_github_enrollment(
+            &[coord_url.clone()],
+            Some(&op_url),
+            Some(node),
+            Some(&tmp_term.path().join("user_key.toml")),
+            Some(&tmp_term.path().join("client.toml")),
+            false,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        op_state
+            .lock()
+            .await
+            .sessions
+            .get_mut(&started_term.state)
+            .unwrap()
+            .status = status_str.to_string();
+        let term_err = poll_enrollment_once(&started_term).await.unwrap_err();
+        assert!(is_terminal_enroll_error(&term_err));
+    }
+
+    srv_handle.abort();
+}
+
+#[tokio::test]
+async fn test_recovery_vault_upload_status_unlock_and_delete() {
+    use sshcast_client::config::UserKeyFile;
+    use sshcast_client::operator::{
+        delete_recovery_vault_http, get_recovery_vault_status_http, poll_enrollment_once,
+        start_github_enrollment, unlock_with_recovery_passphrase, upload_recovery_vault_http,
+        EnrollPollStep,
+    };
+    use sshcast_client::pairing::{encrypt_recovery_vault, ScryptParams, VaultDecryptError};
+
+    let user_sk_a = SigningKey::from_bytes(&[0xB2; 32]);
+    let user_pk_a = user_sk_a.verifying_key().to_bytes();
+    let user_pub_token_a = format!("sc_pub_{}", hex::encode(user_pk_a));
+    let coord_url = "https://coord.example.com".to_string();
+
+    let bundle_a = mint_enrollment_bundle(
+        &user_sk_a,
+        "workstation-a",
+        NodeRole::Client,
+        vec![coord_url.clone()],
+        0,
+    )
+    .unwrap();
+
+    let (op_url, op_state, srv_handle) = spawn_mock_operator(&user_sk_a, "octocat").await;
+
+    let (configured_before, _) =
+        get_recovery_vault_status_http(&op_url, &bundle_a.grant, &bundle_a.node_signing_key)
+            .await
+            .unwrap();
+    assert!(!configured_before);
+
+    let passphrase = "correct-horse-battery-staple";
+    let vault = encrypt_recovery_vault(
+        &user_sk_a,
+        passphrase,
+        ScryptParams {
+            log_n: 10,
+            r: 8,
+            p: 1,
+        },
+    )
+    .unwrap();
+    let uploaded_at = upload_recovery_vault_http(
+        &op_url,
+        &bundle_a.grant,
+        &bundle_a.node_signing_key,
+        &vault,
+    )
+    .await
+    .unwrap();
+    let (configured_after, status_ts) =
+        get_recovery_vault_status_http(&op_url, &bundle_a.grant, &bundle_a.node_signing_key)
+            .await
+            .unwrap();
+    assert!(configured_after);
+    assert_eq!(status_ts, uploaded_at);
+
+    // Workstation B enrolls offline using the recovery passphrase.
+    let tmp_b = TempDir::new().unwrap();
+    let key_path_b = tmp_b.path().join("user_key.toml");
+    let cfg_path_b = tmp_b.path().join("client.toml");
+
+    let started = start_github_enrollment(
+        &[coord_url],
+        Some(&op_url),
+        Some("workstation-recovery"),
+        Some(&key_path_b),
+        Some(&cfg_path_b),
+        false,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let info = match poll_enrollment_once(&started).await.unwrap() {
+        EnrollPollStep::PairingRequired(info) => info,
+        other => panic!("expected PairingRequired, got {other:?}"),
+    };
+    assert!(info.has_recovery_vault);
+    assert!(info.recovery_vault.is_some());
+
+    // Wrong passphrase fails with VaultDecryptError::WrongPassphrase and leaves disk untouched.
+    let wrong_err = unlock_with_recovery_passphrase(&started, &info, "wrong-passphrase")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_err.downcast_ref::<VaultDecryptError>(),
+        Some(VaultDecryptError::WrongPassphrase)
+    ));
+    assert!(!key_path_b.exists());
+    assert!(!cfg_path_b.exists());
+
+    // Right passphrase succeeds, writes user_key.toml + client.toml + renewed cert, and cancels pairing.
+    let outcome = unlock_with_recovery_passphrase(&started, &info, passphrase)
+        .await
+        .unwrap();
+    assert!(outcome.enrolled_new_client);
+    assert_eq!(outcome.user_pubkey_token, user_pub_token_a);
+    assert!(key_path_b.exists());
+    assert!(cfg_path_b.exists());
+
+    let loaded_sk_b = load_user_signing_key(Some(&key_path_b)).unwrap();
+    assert_eq!(loaded_sk_b.to_bytes(), user_sk_a.to_bytes());
+    let (_, uk_b) = UserKeyFile::load(Some(&key_path_b)).unwrap();
+    assert!(uk_b.user_cert_token.is_some());
+
+    let cfg_b = ClientConfig::load(Some(&cfg_path_b)).unwrap();
+    assert_eq!(cfg_b.grant.node_id, "workstation-recovery");
+    assert_eq!(cfg_b.grant.user_pubkey, user_pk_a);
+    assert!(cfg_b.grant.user_cert.is_some());
+    assert_eq!(cfg_b.operator_url.as_deref(), Some(op_url.as_str()));
+    assert_eq!(op_state.lock().await.cancel_calls, 1);
+
+    // Delete recovery vault and verify status returns false.
+    delete_recovery_vault_http(&op_url, &bundle_a.grant, &bundle_a.node_signing_key)
+        .await
+        .unwrap();
+    let (configured_deleted, _) =
+        get_recovery_vault_status_http(&op_url, &bundle_a.grant, &bundle_a.node_signing_key)
+            .await
+            .unwrap();
+    assert!(!configured_deleted);
+
+    srv_handle.abort();
+}
+
+#[tokio::test]
+async fn test_confirm_replace_lost_root_key_flow() {
+    use sshcast_client::config::UserKeyFile;
+    use sshcast_client::operator::{
+        confirm_replace_lost_root_key, poll_enrollment_once, start_github_enrollment,
+        EnrollPollStep,
+    };
+
+    let lost_user_sk = SigningKey::from_bytes(&[0xC3; 32]);
+    let lost_user_pk = lost_user_sk.verifying_key().to_bytes();
+    let coord_url = "https://coord.example.com".to_string();
+
+    let (op_url, op_state, srv_handle) = spawn_mock_operator(&lost_user_sk, "octocat").await;
+
+    // Pre-seed a stale key/config on Workstation B to verify replacement overwrites cleanly.
+    let tmp_b = TempDir::new().unwrap();
+    let key_path_b = tmp_b.path().join("user_key.toml");
+    let cfg_path_b = tmp_b.path().join("client.toml");
+    let stale_out = run_keygen(Some(&key_path_b), false).unwrap();
+    let stale_sk = load_user_signing_key(Some(&key_path_b)).unwrap();
+    let stale_bundle = mint_enrollment_bundle(
+        &stale_sk,
+        "old-node",
+        NodeRole::Client,
+        vec![coord_url.clone()],
+        0,
+    )
+    .unwrap();
+    write_client_config_from_bundle(&stale_bundle, Some(&cfg_path_b), false).unwrap();
+
+    let started = start_github_enrollment(
+        &[coord_url],
+        Some(&op_url),
+        Some("workstation-reset"),
+        Some(&key_path_b),
+        Some(&cfg_path_b),
+        false,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let info = match poll_enrollment_once(&started).await.unwrap() {
+        EnrollPollStep::PairingRequired(info) => info,
+        other => panic!("expected PairingRequired, got {other:?}"),
+    };
+    assert_eq!(info.existing_user_pubkey, lost_user_pk);
+
+    let outcome = confirm_replace_lost_root_key(&started).await.unwrap();
+    assert!(outcome.enrolled_new_client);
+    assert_eq!(outcome.user_pubkey_token, stale_out.user_pubkey_token);
+    assert_ne!(
+        outcome.user_pubkey_token,
+        format!("sc_pub_{}", hex::encode(lost_user_pk))
+    );
+
+    let (_, uk_b) = UserKeyFile::load(Some(&key_path_b)).unwrap();
+    assert!(uk_b.user_cert_token.is_some());
+
+    let cfg_b = ClientConfig::load(Some(&cfg_path_b)).unwrap();
+    assert_eq!(cfg_b.grant.node_id, "workstation-reset");
+    assert_eq!(
+        cfg_b.grant.user_pubkey,
+        stale_sk.verifying_key().to_bytes().to_vec()
+    );
+    assert!(cfg_b.grant.user_cert.is_some());
+    assert_eq!(cfg_b.operator_url.as_deref(), Some(op_url.as_str()));
+    assert_eq!(op_state.lock().await.replace_calls, 1);
+
+    // Also test fresh workstation (no pre-existing user_key.toml / client.toml) replacing lost key.
+    let tmp_fresh = TempDir::new().unwrap();
+    let fresh_key = tmp_fresh.path().join("user_key.toml");
+    let fresh_cfg = tmp_fresh.path().join("client.toml");
+    // Reset operator's existing key back to lost_user_sk for this second check.
+    op_state.lock().await.existing_user_pubkey =
+        format!("sc_pub_{}", hex::encode(lost_user_pk));
+
+    let started_fresh = start_github_enrollment(
+        &["https://coord.example.com".to_string()],
+        Some(&op_url),
+        Some("workstation-fresh-reset"),
+        Some(&fresh_key),
+        Some(&fresh_cfg),
+        false,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(!fresh_key.exists());
+    assert!(!fresh_cfg.exists());
+
+    let fresh_info = match poll_enrollment_once(&started_fresh).await.unwrap() {
+        EnrollPollStep::PairingRequired(info) => info,
+        other => panic!("expected PairingRequired, got {other:?}"),
+    };
+    assert_eq!(fresh_info.existing_user_pubkey, lost_user_pk);
+
+    let fresh_outcome = confirm_replace_lost_root_key(&started_fresh)
+        .await
+        .unwrap();
+    assert!(fresh_outcome.enrolled_new_client);
+    assert!(fresh_key.exists());
+    assert!(fresh_cfg.exists());
+    let loaded_fresh_cfg = ClientConfig::load(Some(&fresh_cfg)).unwrap();
+    assert_eq!(loaded_fresh_cfg.grant.node_id, "workstation-fresh-reset");
+    assert!(loaded_fresh_cfg.grant.user_cert.is_some());
+    assert_ne!(
+        loaded_fresh_cfg.grant.user_pubkey.as_slice(),
+        lost_user_pk.as_slice()
+    );
+
+    srv_handle.abort();
+}
+
+#[tokio::test]
+async fn test_cli_recovery_and_interactive_login_subprocesses() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let user_sk_a = SigningKey::from_bytes(&[0xD4; 32]);
+    let user_pk_a = user_sk_a.verifying_key().to_bytes();
+    let coord_url = "https://coord.example.com".to_string();
+
+    let (op_url, _op_state, srv_handle) = spawn_mock_operator(&user_sk_a, "octocat").await;
+
+    let tmp_a = TempDir::new().unwrap();
+    let key_a = tmp_a.path().join("user_key.toml");
+    let cfg_a = tmp_a.path().join("client.toml");
+    sshcast_client::enroll::save_user_signing_key(&user_sk_a, Some(&key_a), false).unwrap();
+    let bundle_a = mint_enrollment_bundle(
+        &user_sk_a,
+        "workstation-a",
+        NodeRole::Client,
+        vec![coord_url.clone()],
+        0,
+    )
+    .unwrap();
+    write_client_config_from_bundle(&bundle_a, Some(&cfg_a), false).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_sshcast-client");
+    let passphrase = "super-secret-passphrase-123";
+
+    // 1. `sshcast-client recovery set --passphrase-stdin`
+    let mut set_child = Command::new(bin)
+        .args([
+            "recovery",
+            "set",
+            "--config",
+            cfg_a.to_str().unwrap(),
+            "--key-file",
+            key_a.to_str().unwrap(),
+            "--operator",
+            &op_url,
+            "--passphrase-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    set_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{passphrase}\n").as_bytes())
+        .unwrap();
+    let set_out = tokio::task::spawn_blocking(move || set_child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        set_out.status.success(),
+        "recovery set failed: {}",
+        String::from_utf8_lossy(&set_out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&set_out.stdout).contains("Recovery vault uploaded"));
+
+    // 2. `sshcast-client recovery status`
+    let op_url_s = op_url.clone();
+    let cfg_a_s = cfg_a.clone();
+    let status_out = tokio::task::spawn_blocking(move || {
+        Command::new(bin)
+            .args([
+                "recovery",
+                "status",
+                "--config",
+                cfg_a_s.to_str().unwrap(),
+                "--operator",
+                &op_url_s,
+            ])
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status_out.status.success());
+    assert!(String::from_utf8_lossy(&status_out.stdout).contains("Recovery vault: configured"));
+
+    // 3. `sshcast-client login` on Workstation B -> PairingRequired -> 'p' -> wrong passphrase -> retry 'p' -> right passphrase!
+    let tmp_b = TempDir::new().unwrap();
+    let key_b = tmp_b.path().join("user_key.toml");
+    let cfg_b = tmp_b.path().join("client.toml");
+    let mut login_child = Command::new(bin)
+        .args([
+            "login",
+            "--domain",
+            &coord_url,
+            "--operator",
+            &op_url,
+            "--node",
+            "workstation-b-cli",
+            "--key-file",
+            key_b.to_str().unwrap(),
+            "--config",
+            cfg_b.to_str().unwrap(),
+            "--no-browser",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    login_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("p\nwrong-pass\np\n{passphrase}\n").as_bytes())
+        .unwrap();
+    let login_out = tokio::task::spawn_blocking(move || login_child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let login_stdout = String::from_utf8_lossy(&login_out.stdout);
+    let login_stderr = String::from_utf8_lossy(&login_out.stderr);
+    assert!(
+        login_out.status.success(),
+        "cli login failed:\nstdout: {login_stdout}\nstderr: {login_stderr}"
+    );
+    assert!(login_stdout.contains("Existing account @octocat detected"));
+    assert!(login_stdout.contains("Verification Code:"));
+    assert!(login_stderr.contains("Incorrect recovery passphrase"));
+    assert!(!login_stdout.contains("sshcast-client recovery set"));
+
+    let loaded_sk_b = load_user_signing_key(Some(&key_b)).unwrap();
+    assert_eq!(loaded_sk_b.to_bytes(), user_sk_a.to_bytes());
+    let loaded_cfg_b = ClientConfig::load(Some(&cfg_b)).unwrap();
+    assert_eq!(loaded_cfg_b.grant.node_id, "workstation-b-cli");
+    assert_eq!(loaded_cfg_b.grant.user_pubkey, user_pk_a);
+    assert!(loaded_cfg_b.grant.user_cert.is_some());
+
+    // 4. `sshcast-client recovery remove`
+    let op_url_r = op_url.clone();
+    let cfg_a_r = cfg_a.clone();
+    let rm_out = tokio::task::spawn_blocking(move || {
+        Command::new(bin)
+            .args([
+                "recovery",
+                "remove",
+                "--config",
+                cfg_a_r.to_str().unwrap(),
+                "--operator",
+                &op_url_r,
+            ])
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(rm_out.status.success());
+    assert!(String::from_utf8_lossy(&rm_out.stdout).contains("Removed recovery vault"));
+
+    srv_handle.abort();
+}
