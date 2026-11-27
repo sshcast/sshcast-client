@@ -1,11 +1,15 @@
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use ed25519_dalek::SigningKey;
 use sshcast_proto::bundle::USER_CERT_PREFIX;
+use sshcast_proto::crypto::derive_user_id;
 use sshcast_proto::v1::NodeRole;
+use zeroize::Zeroizing;
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, S_OK, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -35,20 +39,33 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
-use crate::config::{default_client_config_path, ClientConfigFile, UserKeyFile};
+use crate::config::{default_client_config_path, ClientConfig, ClientConfigFile, UserKeyFile};
 use crate::enroll::{
     decode_enrollment_bundle_token, encode_enrollment_bundle_token, export_user_root_key,
     import_user_cert, import_user_root_key, load_user_cert, load_user_signing_key,
     mint_enrollment_bundle, run_keygen, write_client_config_and_optional_root_key,
     write_client_config_from_bundle, USER_KEY_TOKEN_PREFIX,
 };
-use crate::win_native::{show_tray_error_dialog, TraySharedContext};
+use crate::operator::{
+    cancel_enrollment_pairing, complete_paired_enrollment, confirm_replace_lost_root_key,
+    delete_recovery_vault_http, finalize_new_or_same_key_enrollment,
+    get_recovery_vault_status_http, is_terminal_enroll_error, poll_enrollment_once,
+    resolve_operator_url, start_github_enrollment, unlock_with_recovery_passphrase,
+    upload_recovery_vault_http, EnrollPollStep, LoginOutcome, PendingPairingInfo,
+};
+use crate::pairing::{encrypt_recovery_vault, ScryptParams, VaultDecryptError};
+use crate::win_native::{
+    show_tray_error_dialog, TraySharedContext, WM_TRAY_GITHUB_LOGIN_DONE,
+    WM_TRAY_OPEN_PAIRING_WINDOW, WM_TRAY_PAIRING_UPDATE,
+};
 
+const ES_CENTER: u32 = 0x0001;
 const ES_PASSWORD: u32 = 0x0020;
 const ES_AUTOHSCROLL: u32 = 0x0080;
 const ES_READONLY: u32 = 0x0800;
 
 const BS_PUSHBUTTON: u32 = 0x0000;
+const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const BS_AUTORADIOBUTTON: u32 = 0x0009;
 const BS_COMMANDLINK: u32 = 0x000E;
@@ -104,10 +121,56 @@ const ID_ENROLL_BTN_PASTE_CERT: i32 = 2013;
 const ID_ENROLL_BTN_IMPORT_CERT: i32 = 2014;
 const ID_ENROLL_BTN_GITHUB_LOGIN: i32 = 2015;
 const WM_ENROLL_GITHUB_DONE: u32 = WM_APP + 20;
+const WM_ENROLL_PAIRING_REQUIRED: u32 = WM_APP + 21;
+const WM_PAIRING_UPDATE: u32 = WM_APP + 22;
+const WM_ENROLL_STATUS_TEXT: u32 = WM_APP + 23;
+const WM_RECOVERY_ASYNC_DONE: u32 = WM_APP + 30;
+
+#[derive(Debug, Clone)]
+enum PairingUiAction {
+    Unlock(Zeroizing<String>),
+    Reset,
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+enum PairingUiEvent {
+    Completed(LoginOutcome),
+    TransientError { message: String, show_dialog: bool },
+    TerminalError(String),
+    Canceled,
+}
+
+struct PairingUiState {
+    session_gen: u64,
+    info: PendingPairingInfo,
+    completed: bool,
+    events: VecDeque<PairingUiEvent>,
+}
+
+enum RecoveryAsyncKind {
+    StatusChecked {
+        gen: u64,
+        res: Result<(bool, i64), String>,
+    },
+    Saved(Result<i64, String>),
+    Removed(Result<(), String>),
+}
+
+struct RecoveryAsyncEvent {
+    kind: RecoveryAsyncKind,
+}
 
 static GITHUB_LOGIN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static GITHUB_LOGIN_RESULT: Mutex<Option<Result<crate::operator::LoginOutcome, String>>> =
+static LOGIN_SESSION_GEN: AtomicU64 = AtomicU64::new(0);
+static GITHUB_LOGIN_RESULT: Mutex<Option<Result<LoginOutcome, String>>> = Mutex::new(None);
+static ENROLL_STATUS_TEXT: Mutex<Option<String>> = Mutex::new(None);
+static ACTIVE_PAIRING_TX: Mutex<Option<tokio::sync::mpsc::UnboundedSender<PairingUiAction>>> =
     Mutex::new(None);
+static PAIRING_UI_STATE: Mutex<Option<PairingUiState>> = Mutex::new(None);
+static RECOVERY_EVENTS: Mutex<VecDeque<RecoveryAsyncEvent>> = Mutex::new(VecDeque::new());
+static RECOVERY_OP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static RECOVERY_STATUS_GEN: AtomicU64 = AtomicU64::new(0);
 
 // Control IDs for Bundle Generator Window
 const ID_BUNDLE_ROOT_PUBKEY_EDIT: i32 = 1952;
@@ -146,6 +209,23 @@ const ID_SSHKEYS_BTN_ADD_FILE: i32 = 5007;
 const ID_SSHKEYS_BTN_PASTE_PEM: i32 = 5008;
 const ID_SSHKEYS_BTN_CLOSE: i32 = 5009;
 
+// Control IDs for Device Pairing Wait Window
+const ID_PAIRING_SAS_EDIT: i32 = 1955;
+const ID_PAIRING_ACCOUNT_LABEL: i32 = 6001;
+const ID_PAIRING_STATUS_LABEL: i32 = 6002;
+const ID_PAIRING_PASS_EDIT: i32 = 6003;
+const ID_PAIRING_BTN_UNLOCK: i32 = 6004;
+const ID_PAIRING_BTN_RESET: i32 = 6005;
+const ID_PAIRING_BTN_CANCEL: i32 = 6006;
+
+// Control IDs for Recovery Passphrase Window
+const ID_RECOVERY_STATUS_LABEL: i32 = 7001;
+const ID_RECOVERY_PASS_EDIT: i32 = 7002;
+const ID_RECOVERY_CONFIRM_EDIT: i32 = 7003;
+const ID_RECOVERY_BTN_SAVE: i32 = 7004;
+const ID_RECOVERY_BTN_REMOVE: i32 = 7005;
+const ID_RECOVERY_BTN_CLOSE: i32 = 7006;
+
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
@@ -168,10 +248,13 @@ struct DialogResources {
     bundle_hwnd: isize,
     backends_hwnd: isize,
     ssh_keys_hwnd: isize,
+    pairing_hwnd: isize,
+    recovery_hwnd: isize,
     font_title: isize,
     font_section: isize,
     font_ui: isize,
     font_mono: isize,
+    font_sas: isize,
     brush_white: isize,
     brush_code_bg: isize,
     brush_footer_bg: isize,
@@ -184,10 +267,13 @@ static DIALOG_RES: Mutex<DialogResources> = Mutex::new(DialogResources {
     bundle_hwnd: 0,
     backends_hwnd: 0,
     ssh_keys_hwnd: 0,
+    pairing_hwnd: 0,
+    recovery_hwnd: 0,
     font_title: 0,
     font_section: 0,
     font_ui: 0,
     font_mono: 0,
+    font_sas: 0,
     brush_white: 0,
     brush_code_bg: 0,
     brush_footer_bg: 0,
@@ -218,6 +304,7 @@ struct ThemeAssets {
     font_section: HFONT,
     font_ui: HFONT,
     font_mono: HFONT,
+    font_sas: HFONT,
     brush_white: HBRUSH,
     brush_code_bg: HBRUSH,
     brush_footer_bg: HBRUSH,
@@ -299,6 +386,23 @@ unsafe fn ensure_theme_assets(dpi: i32) -> ThemeAssets {
             consolas.as_ptr(),
         ) as isize;
 
+        g.font_sas = CreateFontW(
+            -scale_px(20, dpi),
+            0,
+            0,
+            0,
+            FW_SEMIBOLD as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            (DEFAULT_PITCH | FF_DONTCARE) as u32,
+            consolas.as_ptr(),
+        ) as isize;
+
         g.brush_white = CreateSolidBrush(COLOR_WHITE) as isize;
         g.brush_code_bg = CreateSolidBrush(COLOR_CODE_BG) as isize;
         g.brush_footer_bg = CreateSolidBrush(COLOR_FOOTER_BG) as isize;
@@ -311,6 +415,7 @@ unsafe fn ensure_theme_assets(dpi: i32) -> ThemeAssets {
         font_section: g.font_section as HFONT,
         font_ui: g.font_ui as HFONT,
         font_mono: g.font_mono as HFONT,
+        font_sas: g.font_sas as HFONT,
         brush_white: g.brush_white as HBRUSH,
         brush_code_bg: g.brush_code_bg as HBRUSH,
         brush_footer_bg: g.brush_footer_bg as HBRUSH,
@@ -326,6 +431,7 @@ pub unsafe fn cleanup_dialog_fonts() {
             g.font_section,
             g.font_ui,
             g.font_mono,
+            g.font_sas,
             g.brush_white,
             g.brush_code_bg,
             g.brush_footer_bg,
@@ -336,6 +442,7 @@ pub unsafe fn cleanup_dialog_fonts() {
         g.font_section = 0;
         g.font_ui = 0;
         g.font_mono = 0;
+        g.font_sas = 0;
         g.brush_white = 0;
         g.brush_code_bg = 0;
         g.brush_footer_bg = 0;
@@ -350,26 +457,21 @@ pub unsafe fn cleanup_dialog_fonts() {
 }
 
 pub unsafe fn is_any_management_dialog_message(msg: &MSG) -> bool {
-    let (h1, h2, h3, h4) = match DIALOG_RES.lock() {
-        Ok(g) => (
+    let hwnds = match DIALOG_RES.lock() {
+        Ok(g) => [
             g.enroll_hwnd as HWND,
             g.bundle_hwnd as HWND,
             g.backends_hwnd as HWND,
             g.ssh_keys_hwnd as HWND,
-        ),
+            g.pairing_hwnd as HWND,
+            g.recovery_hwnd as HWND,
+        ],
         Err(_) => return false,
     };
-    if !h1.is_null() && IsWindow(h1) != 0 && IsDialogMessageW(h1, msg) != 0 {
-        return true;
-    }
-    if !h2.is_null() && IsWindow(h2) != 0 && IsDialogMessageW(h2, msg) != 0 {
-        return true;
-    }
-    if !h3.is_null() && IsWindow(h3) != 0 && IsDialogMessageW(h3, msg) != 0 {
-        return true;
-    }
-    if !h4.is_null() && IsWindow(h4) != 0 && IsDialogMessageW(h4, msg) != 0 {
-        return true;
+    for h in hwnds {
+        if !h.is_null() && IsWindow(h) != 0 && IsDialogMessageW(h, msg) != 0 {
+            return true;
+        }
     }
     false
 }
@@ -432,11 +534,12 @@ unsafe fn create_label(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn create_edit(
+unsafe fn create_edit_with_style(
     parent: HWND,
     text: &str,
     cue_banner: &str,
-    readonly: bool,
+    style: u32,
+    apply_cue: bool,
     x: i32,
     y: i32,
     w: i32,
@@ -445,7 +548,6 @@ unsafe fn create_edit(
     dpi: i32,
     font: HFONT,
 ) -> HWND {
-    let style = ES_AUTOHSCROLL | WS_TABSTOP | if readonly { ES_READONLY } else { 0 };
     let hwnd = create_child_ex(
         parent,
         WS_EX_CLIENTEDGE,
@@ -460,11 +562,99 @@ unsafe fn create_edit(
         dpi,
         font,
     );
-    if !hwnd.is_null() && !cue_banner.is_empty() && !readonly {
+    if !hwnd.is_null() && apply_cue && !cue_banner.is_empty() {
         let cue_w = to_wide(cue_banner);
         SendMessageW(hwnd, EM_SETCUEBANNER, 1, cue_w.as_ptr() as isize);
     }
     hwnd
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_edit(
+    parent: HWND,
+    text: &str,
+    cue_banner: &str,
+    readonly: bool,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: i32,
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    let style = ES_AUTOHSCROLL | WS_TABSTOP | if readonly { ES_READONLY } else { 0 };
+    create_edit_with_style(
+        parent,
+        text,
+        cue_banner,
+        style,
+        !readonly,
+        x,
+        y,
+        w,
+        h,
+        id,
+        dpi,
+        font,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_password_edit(
+    parent: HWND,
+    cue_banner: &str,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: i32,
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    create_edit_with_style(
+        parent,
+        "",
+        cue_banner,
+        ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP,
+        true,
+        x,
+        y,
+        w,
+        h,
+        id,
+        dpi,
+        font,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_button_styled(
+    parent: HWND,
+    text: &str,
+    btn_style: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: i32,
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    create_child_ex(
+        parent,
+        0,
+        "BUTTON",
+        text,
+        btn_style | WS_TABSTOP,
+        x,
+        y,
+        w,
+        h,
+        id,
+        dpi,
+        font,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,20 +669,36 @@ unsafe fn create_button(
     dpi: i32,
     font: HFONT,
 ) -> HWND {
-    create_child_ex(
-        parent,
-        0,
-        "BUTTON",
-        text,
-        BS_PUSHBUTTON | WS_TABSTOP,
-        x,
-        y,
-        w,
-        h,
-        id,
-        dpi,
-        font,
-    )
+    create_button_styled(parent, text, BS_PUSHBUTTON, x, y, w, h, id, dpi, font)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_default_button(
+    parent: HWND,
+    text: &str,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: i32,
+    dpi: i32,
+    font: HFONT,
+) -> HWND {
+    create_button_styled(parent, text, BS_DEFPUSHBUTTON, x, y, w, h, id, dpi, font)
+}
+
+unsafe fn set_ctrl_enabled(hwnd: HWND, id: i32, enabled: bool) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnableWindow(
+            hwnd: HWND,
+            benable: windows_sys::Win32::Foundation::BOOL,
+        ) -> windows_sys::Win32::Foundation::BOOL;
+    }
+    let ctrl = GetDlgItem(hwnd, id);
+    if !ctrl.is_null() {
+        EnableWindow(ctrl, if enabled { 1 } else { 0 });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -629,7 +835,9 @@ unsafe fn handle_ctlcolor(wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         SetBkColor(hdc, COLOR_WHITE);
         return assets.brush_white as LRESULT;
     }
-    if (ID_STYLE_SECTION_HEADER_1..=ID_STYLE_SECTION_HEADER_3).contains(&id) {
+    if (ID_STYLE_SECTION_HEADER_1..=ID_STYLE_SECTION_HEADER_3).contains(&id)
+        || id == ID_RECOVERY_STATUS_LABEL
+    {
         SetTextColor(hdc, COLOR_SECTION_TITLE);
         SetBkColor(hdc, COLOR_WHITE);
         return assets.brush_white as LRESULT;
@@ -815,12 +1023,47 @@ fn parse_servers_input(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn format_root_key_allowlist() -> Option<String> {
-    if let Ok((_, uk)) = UserKeyFile::load(None) {
-        Some(uk.user_pubkey_token)
-    } else {
-        None
+pub(crate) fn resolve_tray_user_key_path(
+    config_path: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(sibling) = config_path
+        .and_then(|p| p.parent())
+        .map(|d| d.join("user_key.toml"))
+    {
+        if sibling.exists() {
+            return Some(sibling);
+        }
     }
+    None
+}
+
+pub(crate) fn load_tray_user_key_file(
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<(std::path::PathBuf, UserKeyFile)> {
+    if let Some(sibling) = resolve_tray_user_key_path(config_path) {
+        if let Ok(loaded) = UserKeyFile::load(Some(&sibling)) {
+            return Ok(loaded);
+        }
+    }
+    UserKeyFile::load(None)
+}
+
+pub(crate) fn load_tray_user_signing_key(
+    config_path: Option<&std::path::Path>,
+) -> anyhow::Result<SigningKey> {
+    if let Some(sibling) = resolve_tray_user_key_path(config_path) {
+        if let Ok(sk) = load_user_signing_key(Some(&sibling)) {
+            return Ok(sk);
+        }
+    }
+    load_user_signing_key(None)
+}
+
+fn format_root_key_allowlist() -> Option<String> {
+    let cfg_path = crate::win_native::get_tray_context().and_then(|c| c.config_path.clone());
+    load_tray_user_key_file(cfg_path.as_deref())
+        .ok()
+        .map(|(_, uk)| uk.user_pubkey_token)
 }
 
 fn format_user_cert_status(cfg_path: Option<&std::path::Path>) -> Option<String> {
@@ -1310,13 +1553,31 @@ unsafe extern "system" fn enroll_wnd_proc(
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                             .is_err()
                         {
-                            set_dlg_item_string(
-                                hwnd,
-                                ID_STYLE_FOOTER_STATUS,
-                                "GitHub sign-in is already in progress in your browser...",
-                            );
+                            let existing_pairing = DIALOG_RES
+                                .lock()
+                                .ok()
+                                .map(|g| g.pairing_hwnd as HWND)
+                                .unwrap_or(null_mut());
+                            if !existing_pairing.is_null() && IsWindow(existing_pairing) != 0 {
+                                ShowWindow(existing_pairing, SW_RESTORE);
+                                SetForegroundWindow(existing_pairing);
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    "Device pairing window is already open.",
+                                );
+                            } else {
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    "GitHub sign-in is already in progress in your browser...",
+                                );
+                            }
                             return 0;
                         }
+                        let my_gen = LOGIN_SESSION_GEN
+                            .fetch_add(1, Ordering::SeqCst)
+                            .wrapping_add(1);
                         let node_name = get_dlg_item_string(hwnd, ID_ENROLL_NODE_EDIT);
                         let servers_raw = get_dlg_item_string(hwnd, ID_ENROLL_SERVERS_EDIT);
                         let servers = parse_servers_input(&servers_raw);
@@ -1333,27 +1594,14 @@ unsafe extern "system" fn enroll_wnd_proc(
                         );
                         let hwnd_raw = hwnd as isize;
                         std::thread::spawn(move || {
-                            let res = match tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                            {
-                                Ok(rt) => rt.block_on(crate::operator::login_and_enroll(
-                                    &servers,
-                                    explicit_op.as_deref(),
-                                    Some(node_name.trim()).filter(|s| !s.is_empty()),
-                                    None,
-                                    cfg_path.as_deref(),
-                                    true,
-                                    |_| {},
-                                ))
-                                .map_err(|e| format!("{e:#}")),
-                                Err(e) => Err(format!("failed to start async runtime: {e}")),
-                            };
-                            if let Ok(mut guard) = GITHUB_LOGIN_RESULT.lock() {
-                                *guard = Some(res);
-                            }
-                            GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
-                            PostMessageW(hwnd_raw as HWND, WM_ENROLL_GITHUB_DONE, 0, 0);
+                            run_github_login_actor_thread(
+                                my_gen,
+                                hwnd_raw,
+                                servers,
+                                explicit_op,
+                                node_name,
+                                cfg_path,
+                            );
                         });
                     }
                     ID_ENROLL_BTN_ENROLL_PRIMARY => {
@@ -1640,37 +1888,21 @@ unsafe extern "system" fn enroll_wnd_proc(
             0
         }
         WM_ENROLL_GITHUB_DONE => {
-            let outcome_opt = GITHUB_LOGIN_RESULT.lock().ok().and_then(|mut g| g.take());
-            if let Some(outcome_res) = outcome_opt {
-                match outcome_res {
-                    Ok(outcome) => {
-                        set_dlg_item_string(
-                            hwnd,
-                            ID_ENROLL_ROOT_KEY_EDIT,
-                            &outcome.user_pubkey_token,
-                        );
-                        let cfg_path = crate::win_native::get_tray_context()
-                            .and_then(|c| c.config_path.clone())
-                            .or_else(|| default_client_config_path().ok());
-                        if let Some(status) = format_user_cert_status(cfg_path.as_deref()) {
-                            set_dlg_item_string(hwnd, ID_ENROLL_CERT_EDIT, &status);
-                        }
-                        crate::win_native::reload_tray_configuration();
-                        set_dlg_item_string(
-                            hwnd,
-                            ID_STYLE_FOOTER_STATUS,
-                            &format!("Signed in via GitHub as '{}' — connecting!", outcome.user_id),
-                        );
-                    }
-                    Err(err_msg) => {
-                        set_dlg_item_string(hwnd, ID_STYLE_FOOTER_STATUS, "GitHub sign-in failed.");
-                        show_tray_error_dialog(
-                            "GitHub Sign-In Failed",
-                            "Could not complete GitHub OAuth enrollment",
-                            &err_msg,
-                        );
-                    }
-                }
+            handle_github_login_done_from_tray();
+            0
+        }
+        WM_ENROLL_PAIRING_REQUIRED => {
+            set_dlg_item_string(
+                hwnd,
+                ID_STYLE_FOOTER_STATUS,
+                "Device pairing required — complete verification in the pairing window.",
+            );
+            show_pairing_wait_window();
+            0
+        }
+        WM_ENROLL_STATUS_TEXT => {
+            if let Some(txt) = ENROLL_STATUS_TEXT.lock().ok().and_then(|mut g| g.take()) {
+                set_dlg_item_string(hwnd, ID_STYLE_FOOTER_STATUS, &txt);
             }
             0
         }
@@ -3244,6 +3476,1743 @@ pub unsafe fn show_ssh_keys_window() {
     let hwnd = create_centered_dialog_window(&class_name, &title, 620, 490, dpi);
     if !hwnd.is_null() {
         DIALOG_RES.lock().unwrap().ssh_keys_hwnd = hwnd as isize;
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+// ============================================================================
+// 5. GITHUB LOGIN & DEVICE PAIRING WAIT WINDOW (560 x 430 Client Area)
+// ============================================================================
+
+struct LoginActorGuard {
+    session_gen: u64,
+}
+
+impl Drop for LoginActorGuard {
+    fn drop(&mut self) {
+        if LOGIN_SESSION_GEN.load(Ordering::SeqCst) == self.session_gen {
+            GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+            if let Ok(mut tx_guard) = ACTIVE_PAIRING_TX.lock() {
+                *tx_guard = None;
+            }
+        }
+    }
+}
+
+fn post_to_tray_or_dialog(tray_msg: u32, fallback_hwnd_raw: isize, fallback_msg: u32) {
+    let tray_raw = crate::win_native::get_tray_context()
+        .map(|c| c.tray_hwnd.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    unsafe {
+        if tray_raw != 0 && IsWindow(tray_raw as HWND) != 0 {
+            PostMessageW(tray_raw as HWND, tray_msg, 0, 0);
+        } else if fallback_hwnd_raw != 0 && IsWindow(fallback_hwnd_raw as HWND) != 0 {
+            PostMessageW(fallback_hwnd_raw as HWND, fallback_msg, 0, 0);
+        }
+    }
+}
+
+fn post_enroll_status_update(text: &str) {
+    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let enroll_raw = DIALOG_RES
+        .lock()
+        .ok()
+        .map(|g| g.enroll_hwnd)
+        .unwrap_or(0);
+    if enroll_raw == 0 {
+        return;
+    }
+    if let Ok(mut guard) = ENROLL_STATUS_TEXT.lock() {
+        *guard = Some(text.to_string());
+    }
+    unsafe {
+        if IsWindow(enroll_raw as HWND) != 0 {
+            PostMessageW(enroll_raw as HWND, WM_ENROLL_STATUS_TEXT, 0, 0);
+        }
+    }
+}
+
+fn finish_github_login_with_result(
+    session_gen: u64,
+    enroll_hwnd_raw: isize,
+    res: Result<LoginOutcome, String>,
+) {
+    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+        return;
+    }
+    if let Ok(mut guard) = GITHUB_LOGIN_RESULT.lock() {
+        *guard = Some(res);
+    }
+    GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+    let current_enroll_raw = DIALOG_RES
+        .lock()
+        .ok()
+        .map(|g| g.enroll_hwnd)
+        .filter(|&h| h != 0)
+        .unwrap_or(enroll_hwnd_raw);
+    post_to_tray_or_dialog(
+        WM_TRAY_GITHUB_LOGIN_DONE,
+        current_enroll_raw,
+        WM_ENROLL_GITHUB_DONE,
+    );
+}
+
+fn open_pairing_wait_from_actor(
+    session_gen: u64,
+    enroll_hwnd_raw: isize,
+    info: PendingPairingInfo,
+    action_tx: tokio::sync::mpsc::UnboundedSender<PairingUiAction>,
+) {
+    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+        return;
+    }
+    if let Ok(mut tx_guard) = ACTIVE_PAIRING_TX.lock() {
+        *tx_guard = Some(action_tx);
+    }
+    if let Ok(mut state_guard) = PAIRING_UI_STATE.lock() {
+        *state_guard = Some(PairingUiState {
+            session_gen,
+            info,
+            completed: false,
+            events: VecDeque::new(),
+        });
+    }
+    let current_enroll_raw = DIALOG_RES
+        .lock()
+        .ok()
+        .map(|g| g.enroll_hwnd)
+        .filter(|&h| h != 0)
+        .unwrap_or(enroll_hwnd_raw);
+    post_to_tray_or_dialog(
+        WM_TRAY_OPEN_PAIRING_WINDOW,
+        current_enroll_raw,
+        WM_ENROLL_PAIRING_REQUIRED,
+    );
+}
+
+fn push_pairing_event_from_actor(session_gen: u64, event: PairingUiEvent) {
+    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+        return;
+    }
+    if let Ok(mut state_guard) = PAIRING_UI_STATE.lock() {
+        if let Some(ref mut st) = *state_guard {
+            if st.session_gen == session_gen {
+                st.events.push_back(event);
+            }
+        }
+    }
+    let pairing_raw = DIALOG_RES
+        .lock()
+        .ok()
+        .map(|g| g.pairing_hwnd)
+        .unwrap_or(0);
+    post_to_tray_or_dialog(WM_TRAY_PAIRING_UPDATE, pairing_raw, WM_PAIRING_UPDATE);
+}
+
+fn finish_pairing_with_outcome(session_gen: u64, res: Result<LoginOutcome, String>) {
+    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+        return;
+    }
+    if let Ok(mut tx_guard) = ACTIVE_PAIRING_TX.lock() {
+        *tx_guard = None;
+    }
+    GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+    let event = match res {
+        Ok(outcome) => PairingUiEvent::Completed(outcome),
+        Err(msg) => PairingUiEvent::TerminalError(msg),
+    };
+    push_pairing_event_from_actor(session_gen, event);
+}
+
+fn run_github_login_actor_thread(
+    session_gen: u64,
+    enroll_hwnd_raw: isize,
+    servers: Vec<String>,
+    explicit_op: Option<String>,
+    node_name: String,
+    cfg_path: Option<std::path::PathBuf>,
+) {
+    let _guard = LoginActorGuard { session_gen };
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            finish_github_login_with_result(
+                session_gen,
+                enroll_hwnd_raw,
+                Err(format!("failed to start async runtime: {e}")),
+            );
+            return;
+        }
+    };
+
+    rt.block_on(async move {
+        let key_file = resolve_tray_user_key_path(cfg_path.as_deref());
+        let started = match start_github_enrollment(
+            &servers,
+            explicit_op.as_deref(),
+            Some(node_name.trim()).filter(|s| !s.is_empty()),
+            key_file.as_deref(),
+            cfg_path.as_deref(),
+            true,
+            |_| {},
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                finish_github_login_with_result(
+                    session_gen,
+                    enroll_hwnd_raw,
+                    Err(format!("{e:#}")),
+                );
+                return;
+            }
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        let mut poll_sleep = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_secs(2)));
+        let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<PairingUiAction>();
+        let mut current_pairing_info: Option<PendingPairingInfo> = None;
+        let mut displayed_pairing_id: Option<String> = None;
+        let mut logged_awaiting = false;
+
+        loop {
+            if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+                let _ = cancel_enrollment_pairing(&started).await;
+                return;
+            }
+
+            tokio::select! {
+                maybe_action = action_rx.recv() => {
+                    let Some(action) = maybe_action else {
+                        return;
+                    };
+                    match action {
+                        PairingUiAction::Unlock(pass) => {
+                            let Some(ref info) = current_pairing_info else {
+                                push_pairing_event_from_actor(
+                                    session_gen,
+                                    PairingUiEvent::TransientError {
+                                        message: "Pairing details are not ready yet; please wait.".to_string(),
+                                        show_dialog: false,
+                                    },
+                                );
+                                continue;
+                            };
+                            match unlock_with_recovery_passphrase(&started, info, &pass).await {
+                                Ok(outcome) => {
+                                    finish_pairing_with_outcome(session_gen, Ok(outcome));
+                                    return;
+                                }
+                                Err(e) => {
+                                    let is_wrong_pass = e.chain().any(|cause| {
+                                        matches!(
+                                            cause.downcast_ref::<VaultDecryptError>(),
+                                            Some(VaultDecryptError::WrongPassphrase)
+                                        )
+                                    });
+                                    if is_wrong_pass {
+                                        push_pairing_event_from_actor(
+                                            session_gen,
+                                            PairingUiEvent::TransientError {
+                                                message: "Incorrect recovery passphrase. Please try again.".to_string(),
+                                                show_dialog: false,
+                                            },
+                                        );
+                                    } else {
+                                        push_pairing_event_from_actor(
+                                            session_gen,
+                                            PairingUiEvent::TransientError {
+                                                message: format!("Recovery unlock failed: {e:#}"),
+                                                show_dialog: true,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        PairingUiAction::Reset => {
+                            match confirm_replace_lost_root_key(&started).await {
+                                Ok(outcome) => {
+                                    finish_pairing_with_outcome(session_gen, Ok(outcome));
+                                    return;
+                                }
+                                Err(e) => {
+                                    push_pairing_event_from_actor(
+                                        session_gen,
+                                        PairingUiEvent::TransientError {
+                                            message: format!("Failed to replace lost root key: {e:#}"),
+                                            show_dialog: true,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        PairingUiAction::Cancel => {
+                            let _ = cancel_enrollment_pairing(&started).await;
+                            push_pairing_event_from_actor(session_gen, PairingUiEvent::Canceled);
+                            return;
+                        }
+                    }
+                }
+                _ = &mut poll_sleep => {
+                    if tokio::time::Instant::now() >= deadline {
+                        let _ = cancel_enrollment_pairing(&started).await;
+                        let msg = "Timed out waiting for GitHub OAuth enrollment completion.".to_string();
+                        if current_pairing_info.is_some() {
+                            finish_pairing_with_outcome(session_gen, Err(msg));
+                        } else {
+                            finish_github_login_with_result(session_gen, enroll_hwnd_raw, Err(msg));
+                        }
+                        return;
+                    }
+                    poll_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+
+                    let step = match poll_enrollment_once(&started).await {
+                        Ok(s) => s,
+                        Err(e) if is_terminal_enroll_error(&e) => {
+                            let msg = format!("{e:#}");
+                            if current_pairing_info.is_some() {
+                                finish_pairing_with_outcome(session_gen, Err(msg));
+                            } else {
+                                finish_github_login_with_result(session_gen, enroll_hwnd_raw, Err(msg));
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::debug!("Enrollment poll transient error: {e:#}");
+                            continue;
+                        }
+                    };
+
+                    if LOGIN_SESSION_GEN.load(Ordering::SeqCst) != session_gen {
+                        let _ = cancel_enrollment_pairing(&started).await;
+                        return;
+                    }
+
+                    match step {
+                        EnrollPollStep::Pending => {}
+                        EnrollPollStep::AwaitingApproval => {
+                            if !logged_awaiting {
+                                logged_awaiting = true;
+                                post_enroll_status_update(
+                                    "GitHub sign-in completed; waiting for operator approval...",
+                                );
+                            }
+                        }
+                        EnrollPollStep::Approved { cert_token } => {
+                            let res = finalize_new_or_same_key_enrollment(&started, &cert_token)
+                                .map_err(|e| format!("{e:#}"));
+                            if current_pairing_info.is_some() {
+                                finish_pairing_with_outcome(session_gen, res);
+                            } else {
+                                finish_github_login_with_result(session_gen, enroll_hwnd_raw, res);
+                            }
+                            return;
+                        }
+                        EnrollPollStep::Paired {
+                            pairing_id,
+                            existing_user_pubkey,
+                            envelope,
+                            ..
+                        } => {
+                            let res = complete_paired_enrollment(
+                                started,
+                                &existing_user_pubkey,
+                                &pairing_id,
+                                &envelope,
+                            )
+                            .await
+                            .map_err(|e| format!("{e:#}"));
+                            if current_pairing_info.is_some() {
+                                finish_pairing_with_outcome(session_gen, res);
+                            } else {
+                                finish_github_login_with_result(session_gen, enroll_hwnd_raw, res);
+                            }
+                            return;
+                        }
+                        EnrollPollStep::PairingRequired(info) => {
+                            let is_new = displayed_pairing_id.as_deref() != Some(&info.pairing_id);
+                            current_pairing_info = Some(info.clone());
+                            if is_new {
+                                displayed_pairing_id = Some(info.pairing_id.clone());
+                                open_pairing_wait_from_actor(
+                                    session_gen,
+                                    enroll_hwnd_raw,
+                                    info,
+                                    action_tx.clone(),
+                                );
+                            }
+                        }
+                        EnrollPollStep::Denied(reason) => {
+                            let msg = format!("Enrollment rejected ({reason})");
+                            if current_pairing_info.is_some() {
+                                finish_pairing_with_outcome(session_gen, Err(msg));
+                            } else {
+                                finish_github_login_with_result(session_gen, enroll_hwnd_raw, Err(msg));
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+unsafe fn apply_login_outcome_to_ui(outcome: &LoginOutcome) {
+    crate::win_native::reload_tray_configuration();
+    let enroll_hwnd = DIALOG_RES
+        .lock()
+        .ok()
+        .map(|g| g.enroll_hwnd as HWND)
+        .unwrap_or(null_mut());
+    if !enroll_hwnd.is_null() && IsWindow(enroll_hwnd) != 0 {
+        set_dlg_item_string(
+            enroll_hwnd,
+            ID_ENROLL_ROOT_KEY_EDIT,
+            &outcome.user_pubkey_token,
+        );
+        if let Some(status) = format_user_cert_status(Some(&outcome.config_path)) {
+            set_dlg_item_string(enroll_hwnd, ID_ENROLL_CERT_EDIT, &status);
+        }
+        set_dlg_item_string(
+            enroll_hwnd,
+            ID_STYLE_FOOTER_STATUS,
+            &format!("Signed in via GitHub as '{}' — connecting!", outcome.user_id),
+        );
+    }
+}
+
+pub unsafe fn handle_github_login_done_from_tray() {
+    let outcome_opt = GITHUB_LOGIN_RESULT.lock().ok().and_then(|mut g| g.take());
+    if let Some(outcome_res) = outcome_opt {
+        match outcome_res {
+            Ok(outcome) => {
+                apply_login_outcome_to_ui(&outcome);
+            }
+            Err(err_msg) => {
+                let enroll_hwnd = DIALOG_RES
+                    .lock()
+                    .ok()
+                    .map(|g| g.enroll_hwnd as HWND)
+                    .unwrap_or(null_mut());
+                if !enroll_hwnd.is_null() && IsWindow(enroll_hwnd) != 0 {
+                    set_dlg_item_string(
+                        enroll_hwnd,
+                        ID_STYLE_FOOTER_STATUS,
+                        "GitHub sign-in failed.",
+                    );
+                }
+                show_tray_error_dialog(
+                    "GitHub Sign-In Failed",
+                    "Could not complete GitHub OAuth enrollment",
+                    &err_msg,
+                );
+            }
+        }
+    }
+}
+
+unsafe fn drain_pairing_events() -> Vec<PairingUiEvent> {
+    let mut out = Vec::new();
+    if let Ok(mut state_guard) = PAIRING_UI_STATE.lock() {
+        if let Some(ref mut st) = *state_guard {
+            while let Some(ev) = st.events.pop_front() {
+                out.push(ev);
+            }
+        }
+    }
+    out
+}
+
+unsafe fn mark_pairing_completed() {
+    if let Ok(mut state_guard) = PAIRING_UI_STATE.lock() {
+        if let Some(ref mut st) = *state_guard {
+            st.completed = true;
+        }
+    }
+}
+
+unsafe fn set_pairing_action_buttons_enabled(hwnd: HWND, enabled: bool) {
+    set_ctrl_enabled(hwnd, ID_PAIRING_BTN_UNLOCK, enabled);
+    set_ctrl_enabled(hwnd, ID_PAIRING_BTN_RESET, enabled);
+}
+
+unsafe fn cancel_and_close_pairing_window(hwnd: HWND) {
+    let should_cancel = if let Ok(mut state_guard) = PAIRING_UI_STATE.lock() {
+        if let Some(ref mut st) = *state_guard {
+            if st.completed {
+                false
+            } else {
+                st.completed = true;
+                true
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if should_cancel {
+        let tx_opt = ACTIVE_PAIRING_TX.lock().ok().and_then(|mut g| g.take());
+        LOGIN_SESSION_GEN.fetch_add(1, Ordering::SeqCst);
+        GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+        if let Some(tx) = tx_opt {
+            let _ = tx.send(PairingUiAction::Cancel);
+        }
+        let enroll_hwnd = DIALOG_RES
+            .lock()
+            .ok()
+            .map(|g| g.enroll_hwnd as HWND)
+            .unwrap_or(null_mut());
+        if !enroll_hwnd.is_null() && IsWindow(enroll_hwnd) != 0 {
+            set_dlg_item_string(
+                enroll_hwnd,
+                ID_STYLE_FOOTER_STATUS,
+                "GitHub sign-in / pairing canceled.",
+            );
+        }
+    }
+    DestroyWindow(hwnd);
+}
+
+unsafe fn process_pairing_events(hwnd_opt: Option<HWND>) {
+    let events = drain_pairing_events();
+    for ev in events {
+        match ev {
+            PairingUiEvent::Completed(outcome) => {
+                mark_pairing_completed();
+                apply_login_outcome_to_ui(&outcome);
+                if let Some(hwnd) = hwnd_opt {
+                    if !hwnd.is_null() && IsWindow(hwnd) != 0 {
+                        set_dlg_item_string(hwnd, ID_PAIRING_PASS_EDIT, "");
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_STYLE_FOOTER_STATUS,
+                            "Workstation paired and enrolled! Closing...",
+                        );
+                        DestroyWindow(hwnd);
+                    }
+                }
+            }
+            PairingUiEvent::TransientError {
+                message,
+                show_dialog,
+            } => {
+                if let Some(hwnd) = hwnd_opt {
+                    if !hwnd.is_null() && IsWindow(hwnd) != 0 {
+                        set_pairing_action_buttons_enabled(hwnd, true);
+                        set_dlg_item_string(hwnd, ID_STYLE_FOOTER_STATUS, &message);
+                        if !show_dialog {
+                            set_dlg_item_string(hwnd, ID_PAIRING_PASS_EDIT, "");
+                        }
+                    }
+                }
+                if show_dialog {
+                    show_tray_error_dialog(
+                        "Device Pairing Error",
+                        "Could not complete pairing action",
+                        &message,
+                    );
+                }
+            }
+            PairingUiEvent::TerminalError(err_msg) => {
+                mark_pairing_completed();
+                if let Some(hwnd) = hwnd_opt {
+                    if !hwnd.is_null() && IsWindow(hwnd) != 0 {
+                        set_dlg_item_string(hwnd, ID_PAIRING_PASS_EDIT, "");
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_STYLE_FOOTER_STATUS,
+                            "Pairing failed or expired.",
+                        );
+                        DestroyWindow(hwnd);
+                    }
+                }
+                let enroll_hwnd = DIALOG_RES
+                    .lock()
+                    .ok()
+                    .map(|g| g.enroll_hwnd as HWND)
+                    .unwrap_or(null_mut());
+                if !enroll_hwnd.is_null() && IsWindow(enroll_hwnd) != 0 {
+                    set_dlg_item_string(
+                        enroll_hwnd,
+                        ID_STYLE_FOOTER_STATUS,
+                        "Device pairing failed.",
+                    );
+                }
+                show_tray_error_dialog(
+                    "Device Pairing Failed",
+                    "Could not complete workstation pairing",
+                    &err_msg,
+                );
+            }
+            PairingUiEvent::Canceled => {
+                mark_pairing_completed();
+                let enroll_hwnd = DIALOG_RES
+                    .lock()
+                    .ok()
+                    .map(|g| g.enroll_hwnd as HWND)
+                    .unwrap_or(null_mut());
+                if !enroll_hwnd.is_null() && IsWindow(enroll_hwnd) != 0 {
+                    set_dlg_item_string(
+                        enroll_hwnd,
+                        ID_STYLE_FOOTER_STATUS,
+                        "GitHub sign-in / pairing canceled.",
+                    );
+                }
+                if let Some(hwnd) = hwnd_opt {
+                    if !hwnd.is_null() && IsWindow(hwnd) != 0 {
+                        DestroyWindow(hwnd);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub unsafe fn handle_pairing_update_from_tray() {
+    let pairing_hwnd = DIALOG_RES
+        .lock()
+        .ok()
+        .map(|g| g.pairing_hwnd as HWND)
+        .unwrap_or(null_mut());
+    let hwnd_opt = if !pairing_hwnd.is_null() && IsWindow(pairing_hwnd) != 0 {
+        Some(pairing_hwnd)
+    } else {
+        None
+    };
+    process_pairing_events(hwnd_opt);
+}
+
+unsafe extern "system" fn pairing_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let has_vault = PAIRING_UI_STATE
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|s| s.info.has_recovery_vault))
+                .unwrap_or(false);
+            if has_vault {
+                paint_taskdialog_frame(hwnd, &[56, 202, 304]);
+            } else {
+                paint_taskdialog_frame(hwnd, &[56, 202]);
+            }
+            0
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => handle_ctlcolor(wparam, lparam),
+        WM_CREATE => {
+            let dpi = get_dpi_scale();
+            let assets = ensure_theme_assets(dpi);
+            let info_opt = PAIRING_UI_STATE
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|s| s.info.clone()));
+            let Some(info) = info_opt else {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            };
+
+            let user_id = derive_user_id(&info.existing_user_pubkey);
+            let account_text = if info.github_login.trim().is_empty() {
+                format!("Existing Sshcast Account (User ID: {user_id})")
+            } else {
+                format!(
+                    "GitHub: @{}   (User ID: {user_id})",
+                    info.github_login.trim()
+                )
+            };
+
+            create_label(
+                hwnd,
+                "Approve This Workstation",
+                62,
+                18,
+                474,
+                28,
+                ID_STYLE_MAIN_HEADER,
+                dpi,
+                assets.font_title,
+            );
+
+            create_label(
+                hwnd,
+                "1. Pair with an Existing Workstation",
+                24,
+                68,
+                512,
+                20,
+                ID_STYLE_SECTION_HEADER_1,
+                dpi,
+                assets.font_section,
+            );
+            create_label(
+                hwnd,
+                &account_text,
+                24,
+                92,
+                512,
+                18,
+                ID_PAIRING_ACCOUNT_LABEL,
+                dpi,
+                assets.font_ui,
+            );
+
+            let sas_text = format!("Verification Code: {}", info.sas_code);
+            create_edit_with_style(
+                hwnd,
+                &sas_text,
+                "",
+                ES_CENTER | ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP,
+                false,
+                24,
+                116,
+                512,
+                38,
+                ID_PAIRING_SAS_EDIT,
+                dpi,
+                assets.font_sas,
+            );
+
+            create_label(
+                hwnd,
+                "Verify this code matches and click Approve on an existing Sshcast workstation.",
+                24,
+                162,
+                512,
+                32,
+                ID_PAIRING_STATUS_LABEL,
+                dpi,
+                assets.font_ui,
+            );
+
+            let footer_y = if info.has_recovery_vault {
+                create_label(
+                    hwnd,
+                    "2. Or Unlock Offline with Recovery Passphrase",
+                    24,
+                    214,
+                    512,
+                    20,
+                    ID_STYLE_SECTION_HEADER_2,
+                    dpi,
+                    assets.font_section,
+                );
+                create_label(
+                    hwnd,
+                    "Recovery Passphrase:",
+                    24,
+                    240,
+                    512,
+                    18,
+                    0,
+                    dpi,
+                    assets.font_ui,
+                );
+                create_password_edit(
+                    hwnd,
+                    "Enter recovery passphrase",
+                    24,
+                    262,
+                    404,
+                    26,
+                    ID_PAIRING_PASS_EDIT,
+                    dpi,
+                    assets.font_ui,
+                );
+                create_default_button(
+                    hwnd,
+                    "Unlock",
+                    436,
+                    261,
+                    100,
+                    28,
+                    ID_PAIRING_BTN_UNLOCK,
+                    dpi,
+                    assets.font_ui,
+                );
+
+                create_button(
+                    hwnd,
+                    "Lost Old Devices? Reset Account...",
+                    24,
+                    318,
+                    250,
+                    30,
+                    ID_PAIRING_BTN_RESET,
+                    dpi,
+                    assets.font_ui,
+                );
+                create_label(
+                    hwnd,
+                    "Replaces lost root key; stops old renewals.",
+                    284,
+                    324,
+                    252,
+                    20,
+                    0,
+                    dpi,
+                    assets.font_ui,
+                );
+                376
+            } else {
+                create_label(
+                    hwnd,
+                    "No recovery passphrase is configured on this account.",
+                    24,
+                    214,
+                    512,
+                    18,
+                    0,
+                    dpi,
+                    assets.font_ui,
+                );
+                create_button(
+                    hwnd,
+                    "Lost Old Devices? Reset Account...",
+                    24,
+                    244,
+                    250,
+                    30,
+                    ID_PAIRING_BTN_RESET,
+                    dpi,
+                    assets.font_ui,
+                );
+                create_label(
+                    hwnd,
+                    "Replaces lost root key; stops old renewals.",
+                    284,
+                    250,
+                    252,
+                    20,
+                    0,
+                    dpi,
+                    assets.font_ui,
+                );
+                296
+            };
+
+            create_label(
+                hwnd,
+                "Waiting for approval on an existing workstation...",
+                24,
+                footer_y + 9,
+                396,
+                36,
+                ID_STYLE_FOOTER_STATUS,
+                dpi,
+                assets.font_ui,
+            );
+            create_button(
+                hwnd,
+                "Cancel",
+                436,
+                footer_y + 12,
+                100,
+                30,
+                ID_PAIRING_BTN_CANCEL,
+                dpi,
+                assets.font_ui,
+            );
+
+            PostMessageW(hwnd, WM_PAIRING_UPDATE, 0, 0);
+            0
+        }
+        WM_PAIRING_UPDATE => {
+            process_pairing_events(Some(hwnd));
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam & 0xFFFF) as i32;
+            let code = ((wparam >> 16) & 0xFFFF) as u32;
+            if code == BN_CLICKED {
+                match id {
+                    ID_PAIRING_BTN_UNLOCK => {
+                        let pass = Zeroizing::new(get_dlg_item_string(hwnd, ID_PAIRING_PASS_EDIT));
+                        if pass.is_empty() {
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "Please enter your recovery passphrase first.",
+                            );
+                            return 0;
+                        }
+                        let tx_opt = ACTIVE_PAIRING_TX.lock().ok().and_then(|g| g.clone());
+                        if let Some(tx) = tx_opt {
+                            set_pairing_action_buttons_enabled(hwnd, false);
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "Unlocking root key with recovery passphrase...",
+                            );
+                            if tx.send(PairingUiAction::Unlock(pass)).is_err() {
+                                set_pairing_action_buttons_enabled(hwnd, true);
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    "Pairing session ended; please close and sign in again.",
+                                );
+                            }
+                        } else {
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "No active pairing session.",
+                            );
+                        }
+                    }
+                    ID_PAIRING_BTN_RESET => {
+                        if !confirm_overwrite_dialog(
+                            null_mut(),
+                            "Replace Lost Account Root Key?",
+                            "Replacing your lost root key is irreversible.",
+                            "This will generate a new root key for your GitHub account. Existing workstations and relays enrolled with the old root key will stop renewing certificates and must be re-enrolled.\n\nAre you sure you want to reset your account root key?",
+                        ) {
+                            return 0;
+                        }
+                        let still_active = IsWindow(hwnd) != 0
+                            && PAIRING_UI_STATE
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.as_ref().map(|st| !st.completed))
+                                .unwrap_or(false);
+                        if !still_active {
+                            return 0;
+                        }
+                        let tx_opt = ACTIVE_PAIRING_TX.lock().ok().and_then(|g| g.clone());
+                        if let Some(tx) = tx_opt {
+                            set_pairing_action_buttons_enabled(hwnd, false);
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "Replacing lost root key and enrolling workstation...",
+                            );
+                            if tx.send(PairingUiAction::Reset).is_err() {
+                                set_pairing_action_buttons_enabled(hwnd, true);
+                                set_dlg_item_string(
+                                    hwnd,
+                                    ID_STYLE_FOOTER_STATUS,
+                                    "Pairing session ended; please close and sign in again.",
+                                );
+                            }
+                        }
+                    }
+                    2 | ID_PAIRING_BTN_CANCEL => {
+                        cancel_and_close_pairing_window(hwnd);
+                    }
+                    _ => {}
+                }
+            }
+            0
+        }
+        WM_CLOSE => {
+            cancel_and_close_pairing_window(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            set_dlg_item_string(hwnd, ID_PAIRING_PASS_EDIT, "");
+            if let Ok(mut g) = DIALOG_RES.lock() {
+                if g.pairing_hwnd == hwnd as isize {
+                    g.pairing_hwnd = 0;
+                }
+            }
+            // Safety cancel if destroyed externally without WM_CLOSE while still incomplete
+            let should_cancel = PAIRING_UI_STATE
+                .lock()
+                .ok()
+                .and_then(|mut g| {
+                    g.as_mut().map(|st| {
+                        if st.completed {
+                            false
+                        } else {
+                            st.completed = true;
+                            true
+                        }
+                    })
+                })
+                .unwrap_or(false);
+            if should_cancel {
+                let tx_opt = ACTIVE_PAIRING_TX.lock().ok().and_then(|mut g| g.take());
+                LOGIN_SESSION_GEN.fetch_add(1, Ordering::SeqCst);
+                GITHUB_LOGIN_IN_FLIGHT.store(false, Ordering::SeqCst);
+                if let Some(tx) = tx_opt {
+                    let _ = tx.send(PairingUiAction::Cancel);
+                }
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+pub unsafe fn show_pairing_wait_window() {
+    {
+        let enroll_hwnd = DIALOG_RES
+            .lock()
+            .ok()
+            .map(|g| g.enroll_hwnd as HWND)
+            .unwrap_or(null_mut());
+        if !enroll_hwnd.is_null() && IsWindow(enroll_hwnd) != 0 {
+            set_dlg_item_string(
+                enroll_hwnd,
+                ID_STYLE_FOOTER_STATUS,
+                "Device pairing required — complete verification in the pairing window.",
+            );
+        }
+    }
+
+    // If the pairing actor already finished or canceled before this window opened,
+    // process the pending outcome directly without flashing a window open and closed.
+    let pre_terminal = PAIRING_UI_STATE
+        .lock()
+        .ok()
+        .map(|g| {
+            match g.as_ref() {
+                None => true,
+                Some(st) => {
+                    st.completed
+                        || st.events.iter().any(|ev| {
+                            matches!(
+                                ev,
+                                PairingUiEvent::Completed(_)
+                                    | PairingUiEvent::TerminalError(_)
+                                    | PairingUiEvent::Canceled
+                            )
+                        })
+                }
+            }
+        })
+        .unwrap_or(true);
+    if pre_terminal {
+        process_pairing_events(None);
+        return;
+    }
+
+    let has_vault = PAIRING_UI_STATE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.info.has_recovery_vault))
+        .unwrap_or(false);
+
+    {
+        let g = DIALOG_RES.lock().unwrap();
+        let existing = g.pairing_hwnd as HWND;
+        if !existing.is_null() && IsWindow(existing) != 0 {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+            return;
+        }
+    }
+
+    let dpi = get_dpi_scale();
+    let assets = ensure_theme_assets(dpi);
+    let hinstance = GetModuleHandleW(null());
+    let class_name = to_wide("SshcastPairingWaitWndClassV1");
+    let title = to_wide("Sshcast — Approve This Workstation");
+
+    let wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(pairing_wnd_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: LoadIconW(null_mut(), IDI_SHIELD),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hbrBackground: assets.brush_white,
+        lpszMenuName: null(),
+        lpszClassName: class_name.as_ptr(),
+    };
+    RegisterClassW(&wc);
+
+    let client_h = if has_vault { 430 } else { 350 };
+    let hwnd = create_centered_dialog_window(&class_name, &title, 560, client_h, dpi);
+    if !hwnd.is_null() {
+        DIALOG_RES.lock().unwrap().pairing_hwnd = hwnd as isize;
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+// ============================================================================
+// 6. RECOVERY PASSPHRASE WINDOW (540 x 400 Client Area)
+// ============================================================================
+
+fn format_unix_utc(unix_sec: i64) -> String {
+    if unix_sec <= 0 {
+        return "unknown".to_string();
+    }
+    let days = unix_sec.div_euclid(86_400);
+    let secs_of_day = unix_sec.rem_euclid(86_400);
+    let hour = secs_of_day / 3600;
+    let min = (secs_of_day % 3600) / 60;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02} {hour:02}:{min:02} UTC")
+}
+
+fn push_recovery_event(kind: RecoveryAsyncKind) {
+    let live_hwnd = DIALOG_RES
+        .lock()
+        .ok()
+        .map(|g| g.recovery_hwnd)
+        .unwrap_or(0);
+    unsafe {
+        if live_hwnd != 0 && IsWindow(live_hwnd as HWND) != 0 {
+            if let Ok(mut q) = RECOVERY_EVENTS.lock() {
+                q.push_back(RecoveryAsyncEvent { kind });
+            }
+            PostMessageW(live_hwnd as HWND, WM_RECOVERY_ASYNC_DONE, 0, 0);
+            return;
+        }
+    }
+
+    // No recovery window is currently open: keep generation accurate and still surface errors.
+    match kind {
+        RecoveryAsyncKind::StatusChecked { .. } => {}
+        RecoveryAsyncKind::Saved(Ok(_)) | RecoveryAsyncKind::Removed(Ok(())) => {
+            RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst);
+        }
+        RecoveryAsyncKind::Saved(Err(err_msg)) => {
+            RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst);
+            show_tray_error_dialog(
+                "Save Recovery Passphrase Failed",
+                "Could not encrypt or upload recovery vault",
+                &err_msg,
+            );
+        }
+        RecoveryAsyncKind::Removed(Err(err_msg)) => {
+            RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst);
+            show_tray_error_dialog(
+                "Remove Recovery Passphrase Failed",
+                "Could not delete recovery vault on operator",
+                &err_msg,
+            );
+        }
+    }
+}
+
+fn resolve_recovery_operator(cfg: &ClientConfig) -> anyhow::Result<String> {
+    resolve_operator_url(cfg.operator_url.as_deref(), &cfg.servers).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not discover operator URL via _sshcast DNS TXT for {:?}",
+            cfg.servers
+        )
+    })
+}
+
+fn load_recovery_client_config(
+    cfg_path: Option<&std::path::Path>,
+) -> anyhow::Result<ClientConfig> {
+    if let Ok(cfg) = ClientConfig::load(cfg_path) {
+        return Ok(cfg);
+    }
+    crate::win_native::get_tray_context()
+        .and_then(|c| c.current_config())
+        .ok_or_else(|| anyhow::anyhow!("workstation is not enrolled (client.toml not found)"))
+}
+
+unsafe fn set_recovery_buttons_enabled(hwnd: HWND, enabled: bool) {
+    set_ctrl_enabled(hwnd, ID_RECOVERY_BTN_SAVE, enabled);
+    set_ctrl_enabled(hwnd, ID_RECOVERY_BTN_REMOVE, enabled);
+}
+
+unsafe fn spawn_recovery_status_check(hwnd: HWND) {
+    let gen = RECOVERY_STATUS_GEN
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    set_dlg_item_string(hwnd, ID_RECOVERY_STATUS_LABEL, "Status: Checking...");
+    set_dlg_item_string(
+        hwnd,
+        ID_STYLE_FOOTER_STATUS,
+        "Checking recovery vault status on operator...",
+    );
+
+    let cfg_path = crate::win_native::get_tray_context().and_then(|c| c.config_path.clone());
+    std::thread::spawn(move || {
+        let res = (|| -> anyhow::Result<(bool, i64)> {
+            let cfg = load_recovery_client_config(cfg_path.as_deref())?;
+            let op_url = resolve_recovery_operator(&cfg)?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(get_recovery_vault_status_http(
+                &op_url,
+                &cfg.grant,
+                &cfg.node_signing_key,
+            ))
+        })()
+        .map_err(|e| format!("{e:#}"));
+        push_recovery_event(RecoveryAsyncKind::StatusChecked { gen, res });
+    });
+}
+
+unsafe fn spawn_recovery_save(hwnd: HWND, passphrase: Zeroizing<String>) {
+    if RECOVERY_OP_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    set_recovery_buttons_enabled(hwnd, false);
+    set_dlg_item_string(
+        hwnd,
+        ID_STYLE_FOOTER_STATUS,
+        "Encrypting recovery vault (scrypt) and uploading...",
+    );
+
+    let cfg_path = crate::win_native::get_tray_context().and_then(|c| c.config_path.clone());
+    std::thread::spawn(move || {
+        let res = (|| -> anyhow::Result<i64> {
+            let cfg = load_recovery_client_config(cfg_path.as_deref())?;
+            let user_sk = load_tray_user_signing_key(cfg_path.as_deref())?;
+            if user_sk.verifying_key().to_bytes().as_slice() != cfg.grant.user_pubkey.as_slice() {
+                anyhow::bail!(
+                    "local user_key.toml does not match this workstation's enrolled user ({}) in client.toml",
+                    cfg.grant.user_id
+                );
+            }
+            let op_url = resolve_recovery_operator(&cfg)?;
+            let vault = encrypt_recovery_vault(&user_sk, &passphrase, ScryptParams::default())?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(upload_recovery_vault_http(
+                &op_url,
+                &cfg.grant,
+                &cfg.node_signing_key,
+                &vault,
+            ))
+        })()
+        .map_err(|e| format!("{e:#}"));
+        RECOVERY_OP_IN_FLIGHT.store(false, Ordering::SeqCst);
+        push_recovery_event(RecoveryAsyncKind::Saved(res));
+    });
+}
+
+unsafe fn spawn_recovery_remove(hwnd: HWND) {
+    if RECOVERY_OP_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    set_recovery_buttons_enabled(hwnd, false);
+    set_dlg_item_string(
+        hwnd,
+        ID_STYLE_FOOTER_STATUS,
+        "Removing recovery vault from operator...",
+    );
+
+    let cfg_path = crate::win_native::get_tray_context().and_then(|c| c.config_path.clone());
+    std::thread::spawn(move || {
+        let res = (|| -> anyhow::Result<()> {
+            let cfg = load_recovery_client_config(cfg_path.as_deref())?;
+            let op_url = resolve_recovery_operator(&cfg)?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(delete_recovery_vault_http(
+                &op_url,
+                &cfg.grant,
+                &cfg.node_signing_key,
+            ))
+        })()
+        .map_err(|e| format!("{e:#}"));
+        RECOVERY_OP_IN_FLIGHT.store(false, Ordering::SeqCst);
+        push_recovery_event(RecoveryAsyncKind::Removed(res));
+    });
+}
+
+unsafe fn process_recovery_events() {
+    let mut events = Vec::new();
+    if let Ok(mut q) = RECOVERY_EVENTS.lock() {
+        while let Some(ev) = q.pop_front() {
+            events.push(ev);
+        }
+    }
+    for ev in events {
+        let live_hwnd = DIALOG_RES
+            .lock()
+            .ok()
+            .map(|g| g.recovery_hwnd as HWND)
+            .filter(|&h| !h.is_null() && IsWindow(h) != 0);
+        match ev.kind {
+            RecoveryAsyncKind::StatusChecked { gen, res } => {
+                if gen != RECOVERY_STATUS_GEN.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let Some(hwnd) = live_hwnd else {
+                    continue;
+                };
+                match res {
+                    Ok((true, updated_at)) => {
+                        let status_text = if updated_at > 0 {
+                            format!("Status: Configured (updated {})", format_unix_utc(updated_at))
+                        } else {
+                            "Status: Configured".to_string()
+                        };
+                        set_dlg_item_string(hwnd, ID_RECOVERY_STATUS_LABEL, &status_text);
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_STYLE_FOOTER_STATUS,
+                            "Recovery vault is active on the operator.",
+                        );
+                    }
+                    Ok((false, _)) => {
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_RECOVERY_STATUS_LABEL,
+                            "Status: Not configured",
+                        );
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_STYLE_FOOTER_STATUS,
+                            "No recovery passphrase is set yet.",
+                        );
+                    }
+                    Err(e) => {
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_RECOVERY_STATUS_LABEL,
+                            "Status: Unavailable (check network / operator)",
+                        );
+                        set_dlg_item_string(
+                            hwnd,
+                            ID_STYLE_FOOTER_STATUS,
+                            &format!("Status check failed: {e}"),
+                        );
+                    }
+                }
+            }
+            RecoveryAsyncKind::Saved(res) => {
+                RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst);
+                if let Some(hwnd) = live_hwnd {
+                    set_recovery_buttons_enabled(hwnd, true);
+                }
+                match res {
+                    Ok(updated_at) => {
+                        if let Some(hwnd) = live_hwnd {
+                            set_dlg_item_string(hwnd, ID_RECOVERY_PASS_EDIT, "");
+                            set_dlg_item_string(hwnd, ID_RECOVERY_CONFIRM_EDIT, "");
+                            let status_text = if updated_at > 0 {
+                                format!(
+                                    "Status: Configured (updated {})",
+                                    format_unix_utc(updated_at)
+                                )
+                            } else {
+                                "Status: Configured".to_string()
+                            };
+                            set_dlg_item_string(hwnd, ID_RECOVERY_STATUS_LABEL, &status_text);
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "Saved encrypted recovery vault to operator!",
+                            );
+                        }
+                    }
+                    Err(err_msg) => {
+                        if let Some(hwnd) = live_hwnd {
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "Failed to upload recovery vault.",
+                            );
+                        }
+                        show_tray_error_dialog(
+                            "Save Recovery Passphrase Failed",
+                            "Could not encrypt or upload recovery vault",
+                            &err_msg,
+                        );
+                    }
+                }
+            }
+            RecoveryAsyncKind::Removed(res) => {
+                RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst);
+                if let Some(hwnd) = live_hwnd {
+                    set_recovery_buttons_enabled(hwnd, true);
+                }
+                match res {
+                    Ok(()) => {
+                        if let Some(hwnd) = live_hwnd {
+                            set_dlg_item_string(hwnd, ID_RECOVERY_PASS_EDIT, "");
+                            set_dlg_item_string(hwnd, ID_RECOVERY_CONFIRM_EDIT, "");
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_RECOVERY_STATUS_LABEL,
+                                "Status: Not configured",
+                            );
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "Removed recovery vault from operator.",
+                            );
+                        }
+                    }
+                    Err(err_msg) => {
+                        if let Some(hwnd) = live_hwnd {
+                            set_dlg_item_string(
+                                hwnd,
+                                ID_STYLE_FOOTER_STATUS,
+                                "Failed to remove recovery vault.",
+                            );
+                        }
+                        show_tray_error_dialog(
+                            "Remove Recovery Passphrase Failed",
+                            "Could not delete recovery vault on operator",
+                            &err_msg,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn recovery_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            paint_taskdialog_frame(hwnd, &[56, 158]);
+            0
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => handle_ctlcolor(wparam, lparam),
+        WM_CREATE => {
+            if let Ok(mut g) = DIALOG_RES.lock() {
+                g.recovery_hwnd = hwnd as isize;
+            }
+            let dpi = get_dpi_scale();
+            let assets = ensure_theme_assets(dpi);
+
+            create_label(
+                hwnd,
+                "Recovery Passphrase (Offline Device Sync)",
+                62,
+                18,
+                454,
+                28,
+                ID_STYLE_MAIN_HEADER,
+                dpi,
+                assets.font_title,
+            );
+
+            create_label(
+                hwnd,
+                "1. Operator Recovery Vault Status",
+                24,
+                68,
+                492,
+                20,
+                ID_STYLE_SECTION_HEADER_1,
+                dpi,
+                assets.font_section,
+            );
+            create_label(
+                hwnd,
+                "Status: Checking...",
+                24,
+                94,
+                492,
+                20,
+                ID_RECOVERY_STATUS_LABEL,
+                dpi,
+                assets.font_section,
+            );
+            create_label(
+                hwnd,
+                "Encrypts your user root key locally with scrypt + ChaCha20-Poly1305 so you can enroll new workstations when all existing devices are offline.",
+                24,
+                118,
+                492,
+                34,
+                0,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_label(
+                hwnd,
+                "2. Set or Update Recovery Passphrase",
+                24,
+                170,
+                492,
+                20,
+                ID_STYLE_SECTION_HEADER_2,
+                dpi,
+                assets.font_section,
+            );
+            create_label(
+                hwnd,
+                "New Recovery Passphrase (min 8 chars):",
+                24,
+                196,
+                492,
+                18,
+                0,
+                dpi,
+                assets.font_ui,
+            );
+            create_password_edit(
+                hwnd,
+                "Enter at least 8 characters",
+                24,
+                216,
+                492,
+                26,
+                ID_RECOVERY_PASS_EDIT,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_label(
+                hwnd,
+                "Confirm Passphrase:",
+                24,
+                250,
+                492,
+                18,
+                0,
+                dpi,
+                assets.font_ui,
+            );
+            create_password_edit(
+                hwnd,
+                "Re-enter recovery passphrase",
+                24,
+                270,
+                492,
+                26,
+                ID_RECOVERY_CONFIRM_EDIT,
+                dpi,
+                assets.font_ui,
+            );
+
+            create_default_button(
+                hwnd,
+                "Save Recovery Passphrase",
+                24,
+                306,
+                238,
+                30,
+                ID_RECOVERY_BTN_SAVE,
+                dpi,
+                assets.font_ui,
+            );
+            create_button(
+                hwnd,
+                "Remove Recovery Passphrase",
+                278,
+                306,
+                238,
+                30,
+                ID_RECOVERY_BTN_REMOVE,
+                dpi,
+                assets.font_ui,
+            );
+
+            // Footer Bar (y = 346 .. 400)
+            create_label(
+                hwnd,
+                "Checking recovery vault status on operator...",
+                24,
+                355,
+                376,
+                36,
+                ID_STYLE_FOOTER_STATUS,
+                dpi,
+                assets.font_ui,
+            );
+            create_button(
+                hwnd,
+                "Close",
+                416,
+                358,
+                100,
+                30,
+                ID_RECOVERY_BTN_CLOSE,
+                dpi,
+                assets.font_ui,
+            );
+
+            if RECOVERY_OP_IN_FLIGHT.load(Ordering::SeqCst) {
+                set_recovery_buttons_enabled(hwnd, false);
+                set_dlg_item_string(
+                    hwnd,
+                    ID_RECOVERY_STATUS_LABEL,
+                    "Status: Operation in progress...",
+                );
+                set_dlg_item_string(
+                    hwnd,
+                    ID_STYLE_FOOTER_STATUS,
+                    "Operation in progress...",
+                );
+            } else {
+                spawn_recovery_status_check(hwnd);
+            }
+            PostMessageW(hwnd, WM_RECOVERY_ASYNC_DONE, 0, 0);
+            0
+        }
+        WM_RECOVERY_ASYNC_DONE => {
+            process_recovery_events();
+            0
+        }
+        WM_COMMAND => {
+            let id = (wparam & 0xFFFF) as i32;
+            let code = ((wparam >> 16) & 0xFFFF) as u32;
+            if code == BN_CLICKED {
+                match id {
+                    ID_RECOVERY_BTN_SAVE => {
+                        let pass = Zeroizing::new(get_dlg_item_string(hwnd, ID_RECOVERY_PASS_EDIT));
+                        let confirm =
+                            Zeroizing::new(get_dlg_item_string(hwnd, ID_RECOVERY_CONFIRM_EDIT));
+                        if pass.chars().count() < 8 {
+                            show_tray_error_dialog(
+                                "Validation Error",
+                                "Recovery Passphrase Too Short",
+                                "Recovery passphrase must be at least 8 characters long.",
+                            );
+                            return 0;
+                        }
+                        if *pass != *confirm {
+                            show_tray_error_dialog(
+                                "Validation Error",
+                                "Passphrases Do Not Match",
+                                "The two recovery passphrase fields must match.",
+                            );
+                            return 0;
+                        }
+                        spawn_recovery_save(hwnd, pass);
+                    }
+                    ID_RECOVERY_BTN_REMOVE => {
+                        if RECOVERY_OP_IN_FLIGHT.load(Ordering::SeqCst) {
+                            return 0;
+                        }
+                        if !confirm_overwrite_dialog(
+                            null_mut(),
+                            "Remove Recovery Passphrase?",
+                            "Delete the encrypted recovery vault from the operator?",
+                            "If removed, enrolling a new workstation will require approval from an already-enrolled workstation unless you set a new recovery passphrase.",
+                        ) {
+                            return 0;
+                        }
+                        if IsWindow(hwnd) == 0 || RECOVERY_OP_IN_FLIGHT.load(Ordering::SeqCst) {
+                            return 0;
+                        }
+                        spawn_recovery_remove(hwnd);
+                    }
+                    2 | ID_RECOVERY_BTN_CLOSE => {
+                        DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+            }
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            set_dlg_item_string(hwnd, ID_RECOVERY_PASS_EDIT, "");
+            set_dlg_item_string(hwnd, ID_RECOVERY_CONFIRM_EDIT, "");
+            if let Ok(mut g) = DIALOG_RES.lock() {
+                if g.recovery_hwnd == hwnd as isize {
+                    g.recovery_hwnd = 0;
+                }
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+pub unsafe fn show_recovery_window() {
+    let maybe_ctx = crate::win_native::get_tray_context();
+    let is_enrolled = maybe_ctx
+        .as_ref()
+        .and_then(|c| c.current_config())
+        .is_some();
+    if !is_enrolled {
+        show_enroll_window();
+        return;
+    }
+
+    let cfg_path = maybe_ctx.as_ref().and_then(|c| c.config_path.clone());
+    if load_tray_user_key_file(cfg_path.as_deref()).is_err() {
+        show_tray_error_dialog(
+            "User Root Key Required",
+            "No user_key.toml found on this workstation",
+            "A local user root key (user_key.toml) is required to configure an encrypted recovery passphrase.",
+        );
+        return;
+    }
+
+    RECOVERY_STATUS_GEN.fetch_add(1, Ordering::SeqCst);
+
+    {
+        let g = DIALOG_RES.lock().unwrap();
+        let existing = g.recovery_hwnd as HWND;
+        if !existing.is_null() && IsWindow(existing) != 0 {
+            if !RECOVERY_OP_IN_FLIGHT.load(Ordering::SeqCst) {
+                spawn_recovery_status_check(existing);
+            }
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+            return;
+        }
+    }
+
+    let dpi = get_dpi_scale();
+    let assets = ensure_theme_assets(dpi);
+    let hinstance = GetModuleHandleW(null());
+    let class_name = to_wide("SshcastRecoveryWndClassV1");
+    let title = to_wide("Sshcast — Recovery Passphrase");
+
+    let wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(recovery_wnd_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: LoadIconW(null_mut(), IDI_SHIELD),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hbrBackground: assets.brush_white,
+        lpszMenuName: null(),
+        lpszClassName: class_name.as_ptr(),
+    };
+    RegisterClassW(&wc);
+
+    let hwnd = create_centered_dialog_window(&class_name, &title, 540, 400, dpi);
+    if !hwnd.is_null() {
+        DIALOG_RES.lock().unwrap().recovery_hwnd = hwnd as isize;
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }

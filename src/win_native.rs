@@ -36,8 +36,10 @@ use crate::local_agent::LocalAgentConnector;
 use crate::policy::ApprovalDecision;
 use crate::prompt::{PairingPromptDetails, PromptDetails};
 use crate::win_dialogs::{
-    cleanup_dialog_fonts, is_any_management_dialog_message, show_backends_window,
-    show_bundle_generator_window, show_enroll_window, show_ssh_keys_window,
+    cleanup_dialog_fonts, handle_github_login_done_from_tray, handle_pairing_update_from_tray,
+    is_any_management_dialog_message, load_tray_user_key_file, show_backends_window,
+    show_bundle_generator_window, show_enroll_window, show_pairing_wait_window,
+    show_recovery_window, show_ssh_keys_window,
 };
 
 const BTN_APPROVE_ONCE: i32 = 101;
@@ -47,6 +49,9 @@ const BTN_DENY: i32 = 104;
 
 const WM_TRAYICON: u32 = WM_APP + 1;
 const WM_TRAY_SHUTDOWN: u32 = WM_APP + 2;
+pub const WM_TRAY_OPEN_PAIRING_WINDOW: u32 = WM_APP + 3;
+pub const WM_TRAY_GITHUB_LOGIN_DONE: u32 = WM_APP + 4;
+pub const WM_TRAY_PAIRING_UPDATE: u32 = WM_APP + 5;
 const TRAY_ICON_ID: u32 = 1;
 
 const IDM_STATUS_DIALOG: u32 = 1001;
@@ -58,6 +63,7 @@ const IDM_OPEN_CONFIG_DIR: u32 = 1006;
 const IDM_QUIT: u32 = 1007;
 const IDM_ZELLIJ_DASHBOARD: u32 = 1008;
 const IDM_SSH_KEYS_WINDOW: u32 = 1009;
+const IDM_RECOVERY_WINDOW: u32 = 1010;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -704,6 +710,7 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     let backends_label = to_wide("Coordinator Backends (Servers)...");
     let bundle_label = to_wide("Generate Enrollment Bundle (Relay / Client)...");
     let enroll_label = to_wide("Initialize / Enroll Workstation...");
+    let recovery_label = to_wide("Recovery Passphrase...");
     let force_label = to_wide("Force Active Workstation");
     let open_cfg_label = to_wide("Open Config Folder");
     let quit_label = to_wide("Quit Sshcast");
@@ -713,7 +720,7 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
     AppendMenuW(hmenu, MF_SEPARATOR, 0, null());
 
     let is_enrolled = maybe_cfg.is_some();
-    let has_root_key = crate::config::UserKeyFile::load(None).is_ok();
+    let has_root_key = load_tray_user_key_file(ctx.config_path.as_deref()).is_ok();
 
     let enrolled_flags = if is_enrolled {
         MF_STRING
@@ -761,6 +768,12 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
         MF_STRING,
         IDM_ENROLL_WINDOW as usize,
         enroll_label.as_ptr(),
+    );
+    AppendMenuW(
+        hmenu,
+        bundle_flags,
+        IDM_RECOVERY_WINDOW as usize,
+        recovery_label.as_ptr(),
     );
     AppendMenuW(hmenu, MF_SEPARATOR, 0, null());
 
@@ -826,6 +839,9 @@ unsafe fn show_tray_context_menu(hwnd: HWND, ctx: &Arc<TraySharedContext>) {
         IDM_ENROLL_WINDOW => {
             show_enroll_window();
         }
+        IDM_RECOVERY_WINDOW => {
+            show_recovery_window();
+        }
         IDM_TOGGLE_FORCE_ACTIVE => {
             let prev = ctx.force_active_flag.fetch_xor(true, Ordering::SeqCst);
             tracing::info!("Toggled force_active to {}", !prev);
@@ -883,6 +899,18 @@ unsafe extern "system" fn tray_wnd_proc(
         WM_TRAY_SHUTDOWN => {
             remove_tray_icon(hwnd);
             DestroyWindow(hwnd);
+            0
+        }
+        WM_TRAY_OPEN_PAIRING_WINDOW => {
+            show_pairing_wait_window();
+            0
+        }
+        WM_TRAY_GITHUB_LOGIN_DONE => {
+            handle_github_login_done_from_tray();
+            0
+        }
+        WM_TRAY_PAIRING_UPDATE => {
+            handle_pairing_update_from_tray();
             0
         }
         WM_DESTROY => {
