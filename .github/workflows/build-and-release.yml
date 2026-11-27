@@ -66,7 +66,7 @@ jobs:
 
       - name: Set up Go for nfpm
         if: runner.os == 'Linux'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           cache: false
@@ -105,7 +105,6 @@ jobs:
                 VERSION=$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)
                 ;;
             esac
-            export BIN_DIR=dist
             export NFPM_ARCH="${{ matrix.nfpm_arch }}"
             export NFPM_VERSION="${VERSION}"
             nfpm pkg --config nfpm.yaml --packager deb --target "artifacts/sshcast-client_${VERSION}_${{ matrix.deb_arch }}.deb"

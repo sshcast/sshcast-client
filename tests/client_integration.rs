@@ -105,8 +105,15 @@ async fn spawn_mock_local_ssh_agent(tmp: &TempDir) -> String {
 
 #[cfg(windows)]
 async fn spawn_mock_local_ssh_agent(_tmp: &TempDir) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::net::windows::named_pipe::ServerOptions;
-    let pipe_name = format!(r"\\.\pipe\sshcast-mock-agent-{}", std::process::id());
+    static NEXT_PIPE_ID: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed);
+    let pipe_name = format!(
+        r"\\.\pipe\sshcast-mock-agent-{}-{}",
+        std::process::id(),
+        seq
+    );
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(&pipe_name)

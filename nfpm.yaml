@@ -8,7 +8,7 @@ homepage: https://sshcast.net
 license: MIT OR Apache-2.0
 
 contents:
-  - src: ${BIN_DIR}/sshcast-client
+  - src: dist/sshcast-client
     dst: /usr/bin/sshcast-client
     file_info:
       mode: 0755
