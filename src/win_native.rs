@@ -3,14 +3,14 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::watch;
 
 use windows_sys::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, S_OK, WPARAM};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Controls::{
-    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
+    TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
     TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS, TDCBF_CANCEL_BUTTON, TDCBF_OK_BUTTON,
     TDF_ALLOW_DIALOG_CANCELLATION, TDF_CALLBACK_TIMER, TDF_EXPANDED_BY_DEFAULT,
     TDF_SIZE_TO_CONTENT, TDF_USE_COMMAND_LINKS, TDM_CLICK_BUTTON, TDN_CREATED, TDN_DESTROYED,
@@ -67,6 +67,47 @@ const IDM_RECOVERY_WINDOW: u32 = 1010;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+}
+
+type TaskDialogIndirectFn = unsafe extern "system" fn(
+    ptaskconfig: *const TASKDIALOGCONFIG,
+    pnbutton: *mut i32,
+    pnradiobutton: *mut i32,
+    pfverificationflagchecked: *mut BOOL,
+) -> windows_sys::core::HRESULT;
+
+const E_NOTIMPL_HR: windows_sys::core::HRESULT = 0x8000_4001_u32 as windows_sys::core::HRESULT;
+
+/// Dynamically resolves `TaskDialogIndirect` from `comctl32.dll` at runtime instead of
+/// importing it statically. `TaskDialogIndirect` only exists in `comctl32.dll` v6 (loaded via
+/// the embedded SxS application manifest), so resolving it dynamically prevents unmanifested
+/// binaries (such as test harnesses or non-MSVC builds) from failing at loader startup with
+/// `0xc0000139 (STATUS_ENTRYPOINT_NOT_FOUND)`.
+pub(crate) unsafe fn call_task_dialog_indirect(
+    ptaskconfig: *const TASKDIALOGCONFIG,
+    pnbutton: *mut i32,
+    pnradiobutton: *mut i32,
+    pfverificationflagchecked: *mut BOOL,
+) -> windows_sys::core::HRESULT {
+    static TASK_DIALOG_INDIRECT: OnceLock<Option<TaskDialogIndirectFn>> = OnceLock::new();
+    let func = *TASK_DIALOG_INDIRECT.get_or_init(|| unsafe {
+        let module_name = to_wide("comctl32.dll");
+        let module = LoadLibraryW(module_name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        // Keep comctl32.dll loaded for the process lifetime so the cached function pointer
+        // remains valid across threads.
+        GetProcAddress(module, b"TaskDialogIndirect\0".as_ptr()).map(|far_proc| {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, TaskDialogIndirectFn>(
+                far_proc,
+            )
+        })
+    });
+    match func {
+        Some(f) => f(ptaskconfig, pnbutton, pnradiobutton, pfverificationflagchecked),
+        None => E_NOTIMPL_HR,
+    }
 }
 
 struct DialogCancelState {
@@ -291,7 +332,7 @@ pub async fn prompt_task_dialog(
         };
 
         let mut selected_button: i32 = 0;
-        let hr = TaskDialogIndirect(&config, &mut selected_button, null_mut(), null_mut());
+        let hr = call_task_dialog_indirect(&config, &mut selected_button, null_mut(), null_mut());
         if hr != S_OK {
             return None;
         }
@@ -398,7 +439,7 @@ pub async fn prompt_pairing_task_dialog(
         };
 
         let mut selected_button: i32 = 0;
-        let hr = TaskDialogIndirect(&config, &mut selected_button, null_mut(), null_mut());
+        let hr = call_task_dialog_indirect(&config, &mut selected_button, null_mut(), null_mut());
         if hr != S_OK {
             return None;
         }
@@ -453,7 +494,7 @@ pub fn show_tray_error_dialog(title: &str, instruction: &str, details: &str) {
         };
 
         let mut btn: i32 = 0;
-        let hr = TaskDialogIndirect(&config, &mut btn, null_mut(), null_mut());
+        let hr = call_task_dialog_indirect(&config, &mut btn, null_mut(), null_mut());
         if hr != S_OK {
             let fallback_body = to_wide(&format!("{instruction}\n\n{details}"));
             MessageBoxW(
@@ -676,7 +717,7 @@ fn spawn_status_dialog(ctx: Arc<TraySharedContext>) {
             };
 
             let mut btn: i32 = 0;
-            let _ = TaskDialogIndirect(&config, &mut btn, null_mut(), null_mut());
+            let _ = call_task_dialog_indirect(&config, &mut btn, null_mut(), null_mut());
         }
 
         ctx.status_dialog_open.store(false, Ordering::SeqCst);

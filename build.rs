@@ -55,9 +55,12 @@ fn main() {
     if target_os == "windows" && target_env == "msvc" {
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let manifest_path = manifest_dir.join("windows").join("app.manifest");
-        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+        // Embed the Common Controls v6 manifest in all linked Windows MSVC
+        // targets (binaries as well as unit/integration test executables) so
+        // comctl32.dll v6 is available consistently.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         println!(
-            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+            "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
             manifest_path.display()
         );
 

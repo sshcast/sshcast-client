@@ -24,19 +24,18 @@ use windows_sys::Win32::System::DataExchange::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::UI::Controls::{
-    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
-    TDCBF_CANCEL_BUTTON, TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_SIZE_TO_CONTENT,
-    TD_WARNING_ICON,
+    TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1, TDCBF_CANCEL_BUTTON,
+    TDCBF_YES_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_SIZE_TO_CONTENT, TD_WARNING_ICON,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DrawIconEx, GetClientRect,
     GetDlgCtrlID, GetDlgItem, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW,
-    IsDialogMessageW, IsWindow, LoadCursorW, LoadIconW, PostMessageW, RegisterClassW,
+    IsDialogMessageW, IsWindow, LoadCursorW, LoadIconW, MessageBoxW, PostMessageW, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, DI_NORMAL, IDC_ARROW,
-    IDI_SHIELD, IDYES, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOW, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_SETFONT, WNDCLASSW,
-    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    IDI_SHIELD, IDYES, MB_ICONWARNING, MB_YESNO, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE,
+    SW_SHOW, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT,
+    WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{default_client_config_path, ClientConfig, ClientConfigFile, UserKeyFile};
@@ -1012,8 +1011,17 @@ unsafe fn confirm_overwrite_dialog(
     };
 
     let mut btn: i32 = 0;
-    let hr = TaskDialogIndirect(&config, &mut btn, null_mut(), null_mut());
-    hr == S_OK && btn == IDYES
+    let hr = crate::win_native::call_task_dialog_indirect(&config, &mut btn, null_mut(), null_mut());
+    if hr == S_OK {
+        return btn == IDYES;
+    }
+    let fallback_body = to_wide(&format!("{instruction}\n\n{content}"));
+    MessageBoxW(
+        parent,
+        fallback_body.as_ptr(),
+        title_w.as_ptr(),
+        MB_YESNO | MB_ICONWARNING,
+    ) == IDYES
 }
 
 fn parse_servers_input(raw: &str) -> Vec<String> {
