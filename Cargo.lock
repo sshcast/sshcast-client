@@ -3069,6 +3069,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "prost",
  "rand",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",
@@ -3088,6 +3089,7 @@ dependencies = [
  "webbrowser",
  "webpki-roots 0.26.11",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

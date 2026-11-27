@@ -37,6 +37,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 rand = "0.8"
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-native-certs = "0.8"
 tokio = { version = "1", features = ["net", "io-util", "io-std", "sync", "time", "signal", "rt-multi-thread", "macros", "fs", "process"] }
@@ -49,6 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 webbrowser = "1"
 webpki-roots = "0.26"
+zeroize = "1"
 
 [target.'cfg(not(any(windows, target_arch = "wasm32")))'.dependencies]
 eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
