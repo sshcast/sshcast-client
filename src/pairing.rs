@@ -3,20 +3,20 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use prost::Message;
+#[cfg(not(target_arch = "wasm32"))]
 use rand::rngs::OsRng;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
-use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, X25519};
-use ring::hkdf::{Salt, HKDF_SHA256};
-use ring::pbkdf2::{derive as pbkdf2_derive, PBKDF2_HMAC_SHA256};
-use ring::rand::{SecureRandom, SystemRandom};
+#[cfg(not(target_arch = "wasm32"))]
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sshcast_proto::crypto::{sign_node_grant, verify_node_grant};
 use sshcast_proto::v1::{NodeGrant, NodeRole, UserCert};
-use std::num::NonZeroU32;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 const DOMAIN_PAIR_SAS: &[u8] = b"sshcast-pair-sas-v1\x00";
@@ -94,29 +94,31 @@ pub struct VerifiedPairingHandoff {
 #[derive(Debug)]
 pub struct RequesterPairingKeys {
     node_signing_key: SigningKey,
-    eph_private: EphemeralPrivateKey,
+    eph_secret: Zeroizing<[u8; 32]>,
     eph_public_bytes: [u8; 32],
 }
 
 impl RequesterPairingKeys {
-    /// Generates a fresh Ed25519 node signing key and an ephemeral X25519 pairing keypair.
-    pub fn generate() -> Result<Self> {
-        let node_signing_key = SigningKey::generate(&mut OsRng);
-        let rng = SystemRandom::new();
-        let eph_private = EphemeralPrivateKey::generate(&X25519, &rng)
-            .map_err(|_| anyhow!("failed to generate ephemeral X25519 keypair"))?;
-        let eph_public = eph_private
-            .compute_public_key()
-            .map_err(|_| anyhow!("failed to compute ephemeral X25519 public key"))?;
-        let eph_public_bytes: [u8; 32] = eph_public
-            .as_ref()
-            .try_into()
-            .map_err(|_| anyhow!("unexpected X25519 public key length"))?;
-        Ok(Self {
+    /// Constructs pairing keys from caller-supplied 32-byte Ed25519 node seed and X25519 secret.
+    pub fn from_seeds(node_seed: [u8; 32], eph_secret: [u8; 32]) -> Self {
+        let node_signing_key = SigningKey::from_bytes(&node_seed);
+        let eph_secret = Zeroizing::new(eph_secret);
+        let eph_public_bytes = x25519_public_from_secret(&eph_secret);
+        Self {
             node_signing_key,
-            eph_private,
+            eph_secret,
             eph_public_bytes,
-        })
+        }
+    }
+
+    /// Generates a fresh Ed25519 node signing key and an ephemeral X25519 pairing keypair.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn generate() -> Result<Self> {
+        let mut node_seed = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(&mut *node_seed);
+        let mut eph_secret = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(&mut *eph_secret);
+        Ok(Self::from_seeds(*node_seed, *eph_secret))
     }
 
     /// Returns the newly generated workstation node signing key.
@@ -145,12 +147,14 @@ impl RequesterPairingKeys {
     }
 
     /// Verifies the approver's Ed25519 transcript signature, derives the X25519+HKDF key,
-    /// decrypts the pairing handoff envelope, and validates the inner root key and `NodeGrant`.
-    pub fn decrypt_and_verify_handoff(
+    /// decrypts the pairing handoff envelope, and validates the inner root key and `NodeGrant`
+    /// using the supplied `now_unix_sec`.
+    pub fn decrypt_and_verify_handoff_at(
         self,
         pairing_id: &str,
         existing_user_pubkey: &[u8; 32],
         envelope: &PairingHandoffEnvelope,
+        now_unix_sec: u64,
     ) -> Result<VerifiedPairingHandoff> {
         if pairing_id.is_empty() {
             bail!("pairing_id cannot be empty");
@@ -185,7 +189,7 @@ impl RequesterPairingKeys {
             .context("approver Ed25519 signature verification failed on pairing handoff")?;
 
         let aead_key = derive_pairing_aead_key(
-            self.eph_private,
+            &self.eph_secret,
             &eph_pub_a,
             existing_user_pubkey,
             pairing_id,
@@ -200,13 +204,13 @@ impl RequesterPairingKeys {
         );
 
         let mut buf = Zeroizing::new(ciphertext);
-        let plaintext = aead_key
-            .open_in_place(
-                Nonce::assume_unique_for_key(nonce_bytes),
-                Aad::from(aad.as_slice()),
-                buf.as_mut_slice(),
-            )
-            .map_err(|_| anyhow!("pairing handoff AEAD decryption failed"))?;
+        let plaintext = chacha20_poly1305_open_in_place(
+            &aead_key,
+            &nonce_bytes,
+            aad.as_slice(),
+            buf.as_mut_slice(),
+        )
+        .map_err(|_| anyhow!("pairing handoff AEAD decryption failed"))?;
 
         let mut payload: PairingHandoffPayload =
             serde_json::from_slice(plaintext).context("failed to parse PairingHandoffPayload")?;
@@ -231,11 +235,7 @@ impl RequesterPairingKeys {
         let grant = NodeGrant::decode(grant_bytes.as_slice())
             .context("failed to decode NodeGrant protobuf in pairing handoff")?;
 
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        verify_node_grant(&grant, now_sec)
+        verify_node_grant(&grant, now_unix_sec)
             .context("pairing handoff NodeGrant verification failed")?;
 
         if grant.role != NodeRole::Client as i32 {
@@ -257,12 +257,29 @@ impl RequesterPairingKeys {
             operator_url: payload.operator_url,
         })
     }
+
+    /// Verifies the approver's Ed25519 transcript signature, derives the X25519+HKDF key,
+    /// decrypts the pairing handoff envelope, and validates the inner root key and `NodeGrant`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn decrypt_and_verify_handoff(
+        self,
+        pairing_id: &str,
+        existing_user_pubkey: &[u8; 32],
+        envelope: &PairingHandoffEnvelope,
+    ) -> Result<VerifiedPairingHandoff> {
+        let now_sec = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.decrypt_and_verify_handoff_at(pairing_id, existing_user_pubkey, envelope, now_sec)
+    }
 }
 
 /// Approver-side helper that mints a client `NodeGrant`, seals the user root key and config into
-/// an E2E-encrypted `PairingHandoffEnvelope`, and signs the handoff transcript with `user_sk`.
+/// an E2E-encrypted `PairingHandoffEnvelope`, and signs the handoff transcript with `user_sk`
+/// using caller-provided `now_unix_sec` and entropy.
 #[allow(clippy::too_many_arguments)]
-pub fn create_encrypted_pairing_handoff(
+pub fn create_encrypted_pairing_handoff_with_entropy(
     user_sk: &SigningKey,
     user_cert: Option<UserCert>,
     pairing_id: &str,
@@ -271,6 +288,9 @@ pub fn create_encrypted_pairing_handoff(
     requester_eph_x25519_pub: &[u8; 32],
     servers: Vec<String>,
     operator_url: Option<String>,
+    now_unix_sec: u64,
+    approver_eph_secret: [u8; 32],
+    nonce_bytes: [u8; AEAD_NONCE_LEN],
 ) -> Result<PairingHandoffEnvelope> {
     if pairing_id.is_empty() {
         bail!("pairing_id cannot be empty");
@@ -284,10 +304,6 @@ pub fn create_encrypted_pairing_handoff(
 
     let user_pubkey = user_sk.verifying_key().to_bytes();
     let verified_cert = user_cert.filter(|c| c.user_pubkey.as_slice() == user_pubkey.as_slice());
-    let now_sec = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
 
     let mut grant = NodeGrant {
         user_id: String::new(),
@@ -295,7 +311,7 @@ pub fn create_encrypted_pairing_handoff(
         node_id: node_id.to_string(),
         role: NodeRole::Client as i32,
         node_pubkey: requester_node_pubkey.to_vec(),
-        issued_at_unix_sec: now_sec,
+        issued_at_unix_sec: now_unix_sec,
         expires_at_unix_sec: 0,
         user_signature: Vec::new(),
         user_cert: verified_cert,
@@ -322,23 +338,11 @@ pub fn create_encrypted_pairing_handoff(
     payload.user_privkey_seed_b64.zeroize();
     drop(payload);
 
-    let rng = SystemRandom::new();
-    let eph_private = EphemeralPrivateKey::generate(&X25519, &rng)
-        .map_err(|_| anyhow!("failed to generate approver ephemeral X25519 keypair"))?;
-    let eph_public = eph_private
-        .compute_public_key()
-        .map_err(|_| anyhow!("failed to compute approver ephemeral X25519 public key"))?;
-    let eph_pub_a: [u8; 32] = eph_public
-        .as_ref()
-        .try_into()
-        .map_err(|_| anyhow!("unexpected X25519 public key length"))?;
-
-    let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
-    rng.fill(&mut nonce_bytes)
-        .map_err(|_| anyhow!("failed to generate random handoff nonce"))?;
+    let eph_secret = Zeroizing::new(approver_eph_secret);
+    let eph_pub_a = x25519_public_from_secret(&eph_secret);
 
     let aead_key = derive_pairing_aead_key(
-        eph_private,
+        &eph_secret,
         requester_eph_x25519_pub,
         &user_pubkey,
         pairing_id,
@@ -356,13 +360,7 @@ pub fn create_encrypted_pairing_handoff(
     seal_buf.extend_from_slice(&payload_bytes);
     payload_bytes.zeroize();
 
-    aead_key
-        .seal_in_place_append_tag(
-            Nonce::assume_unique_for_key(nonce_bytes),
-            Aad::from(aad.as_slice()),
-            &mut *seal_buf,
-        )
-        .map_err(|_| anyhow!("pairing handoff AEAD encryption failed"))?;
+    chacha20_poly1305_seal_in_place(&aead_key, &nonce_bytes, aad.as_slice(), &mut seal_buf);
 
     let sig_msg = pairing_signature_message(
         pairing_id,
@@ -381,30 +379,60 @@ pub fn create_encrypted_pairing_handoff(
     })
 }
 
+/// Approver-side helper that mints a client `NodeGrant`, seals the user root key and config into
+/// an E2E-encrypted `PairingHandoffEnvelope`, and signs the handoff transcript with `user_sk`.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+pub fn create_encrypted_pairing_handoff(
+    user_sk: &SigningKey,
+    user_cert: Option<UserCert>,
+    pairing_id: &str,
+    requester_node_name: &str,
+    requester_node_pubkey: &[u8; 32],
+    requester_eph_x25519_pub: &[u8; 32],
+    servers: Vec<String>,
+    operator_url: Option<String>,
+) -> Result<PairingHandoffEnvelope> {
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut eph_secret = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *eph_secret);
+    let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    create_encrypted_pairing_handoff_with_entropy(
+        user_sk,
+        user_cert,
+        pairing_id,
+        requester_node_name,
+        requester_node_pubkey,
+        requester_eph_x25519_pub,
+        servers,
+        operator_url,
+        now_sec,
+        *eph_secret,
+        nonce_bytes,
+    )
+}
+
 fn derive_pairing_aead_key(
-    eph_private: EphemeralPrivateKey,
+    eph_secret: &[u8; 32],
     peer_eph_pub: &[u8; 32],
     existing_user_pubkey: &[u8; 32],
     pairing_id: &str,
     eph_pub_a: &[u8; 32],
     eph_pub_b: &[u8; 32],
-) -> Result<LessSafeKey> {
-    let peer = UnparsedPublicKey::new(&X25519, peer_eph_pub);
+) -> Result<Zeroizing<[u8; 32]>> {
+    let shared = x25519_diffie_hellman(eph_secret, peer_eph_pub)?;
+    let prk = hkdf_sha256_extract(existing_user_pubkey, &*shared);
     let info = [
         DOMAIN_PAIR_HANDOFF,
         pairing_id.as_bytes(),
         eph_pub_a.as_slice(),
         eph_pub_b.as_slice(),
     ];
-    let key = agree_ephemeral(eph_private, &peer, |shared| {
-        let prk = Salt::new(HKDF_SHA256, existing_user_pubkey).extract(shared);
-        let okm = prk
-            .expand(&info, &CHACHA20_POLY1305)
-            .map_err(|_| anyhow!("HKDF expansion failed for pairing handoff"))?;
-        Ok::<_, anyhow::Error>(LessSafeKey::new(UnboundKey::from(okm)))
-    })
-    .map_err(|_| anyhow!("X25519 key agreement failed (invalid peer ephemeral key)"))??;
-    Ok(key)
+    Ok(hkdf_sha256_expand_32(&prk, &info))
 }
 
 fn pairing_signature_message(
@@ -507,7 +535,7 @@ fn validate_scrypt_params(params: ScryptParams) -> std::result::Result<(usize, u
     Ok((n, block_bytes))
 }
 
-/// Derives `dk_len` bytes using RFC 7914 `scrypt` backed by `ring` PBKDF2-HMAC-SHA256.
+/// Derives `dk_len` bytes using RFC 7914 `scrypt` backed by pure-Rust PBKDF2-HMAC-SHA256.
 pub fn scrypt_rfc7914(
     password: &[u8],
     salt: &[u8],
@@ -530,9 +558,8 @@ pub fn scrypt_rfc7914(
         .checked_mul(p as usize)
         .ok_or_else(|| anyhow!("scrypt working buffer size overflow"))?;
 
-    let one = NonZeroU32::new(1).expect("1 is non-zero");
     let mut b = Zeroizing::new(vec![0u8; b_bytes]);
-    pbkdf2_derive(PBKDF2_HMAC_SHA256, one, salt, password, &mut b);
+    pbkdf2_hmac_sha256(password, salt, 1, &mut b);
 
     let block_words = 32usize * (r as usize);
     let mut v = Zeroizing::new(vec![0u32; n * block_words]);
@@ -550,7 +577,7 @@ pub fn scrypt_rfc7914(
     }
 
     let mut dk = vec![0u8; dk_len];
-    pbkdf2_derive(PBKDF2_HMAC_SHA256, one, &b, password, &mut dk);
+    pbkdf2_hmac_sha256(password, &b, 1, &mut dk);
     Ok(dk)
 }
 
@@ -647,52 +674,48 @@ fn scrypt_ro_mix(x: &mut Vec<u32>, scratch: &mut Vec<u32>, v: &mut [u32], r: usi
     }
 }
 
-/// Encrypts `user_sk` under `passphrase` using RFC 7914 `scrypt` and ChaCha20-Poly1305.
-pub fn encrypt_recovery_vault(
-    user_sk: &SigningKey,
+/// Derives the 32-byte ChaCha20-Poly1305 vault key from `passphrase`, `salt`, and `params`.
+pub fn derive_recovery_vault_key(
     passphrase: &str,
+    salt: &[u8],
     params: ScryptParams,
-) -> Result<RecoveryVaultBlob> {
-    if passphrase.is_empty() {
-        bail!("recovery passphrase cannot be empty");
-    }
+) -> Result<Zeroizing<[u8; 32]>> {
     validate_scrypt_params(params).map_err(|e| anyhow!(e))?;
-
-    let rng = SystemRandom::new();
-    let mut salt = [0u8; 16];
-    rng.fill(&mut salt)
-        .map_err(|_| anyhow!("failed to generate random salt for recovery vault"))?;
-    let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
-    rng.fill(&mut nonce_bytes)
-        .map_err(|_| anyhow!("failed to generate random nonce for recovery vault"))?;
-
-    let key = Zeroizing::new(scrypt_rfc7914(
+    if !(16..=64).contains(&salt.len()) {
+        bail!("invalid salt length (expected 16..=64 bytes)");
+    }
+    let dk = Zeroizing::new(scrypt_rfc7914(
         passphrase.as_bytes(),
-        &salt,
+        salt,
         params.log_n,
         params.r,
         params.p,
         32,
     )?);
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&dk);
+    Ok(key)
+}
+
+/// Encrypts `user_sk` using a pre-derived 32-byte `scrypt` key, `salt`, and `nonce_bytes`.
+pub fn encrypt_recovery_vault_with_derived_key(
+    user_sk: &SigningKey,
+    derived_key: &[u8; 32],
+    params: ScryptParams,
+    salt: [u8; 16],
+    nonce_bytes: [u8; AEAD_NONCE_LEN],
+) -> Result<RecoveryVaultBlob> {
+    validate_scrypt_params(params).map_err(|e| anyhow!(e))?;
 
     let user_pubkey = user_sk.verifying_key().to_bytes();
     let aad = recovery_vault_aad(&user_pubkey, params, &salt);
-    let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key)
-        .map_err(|_| anyhow!("invalid recovery vault encryption key length"))?;
-    let aead_key = LessSafeKey::new(unbound);
 
     let mut seed = Zeroizing::new(user_sk.to_bytes());
     let mut buf = Zeroizing::new(Vec::with_capacity(32 + AEAD_TAG_LEN));
     buf.extend_from_slice(&*seed);
     seed.zeroize();
 
-    aead_key
-        .seal_in_place_append_tag(
-            Nonce::assume_unique_for_key(nonce_bytes),
-            Aad::from(aad.as_slice()),
-            &mut *buf,
-        )
-        .map_err(|_| anyhow!("recovery vault AEAD encryption failed"))?;
+    chacha20_poly1305_seal_in_place(derived_key, &nonce_bytes, aad.as_slice(), &mut buf);
 
     Ok(RecoveryVaultBlob {
         version: 1,
@@ -704,13 +727,50 @@ pub fn encrypt_recovery_vault(
     })
 }
 
-/// Decrypts a [`RecoveryVaultBlob`] with `passphrase` and verifies the resulting key matches
-/// `expected_user_pubkey`.
-pub fn decrypt_recovery_vault(
-    vault: &RecoveryVaultBlob,
-    expected_user_pubkey: &[u8; 32],
+/// Encrypts `user_sk` under `passphrase` using caller-provided `salt` and `nonce_bytes`.
+pub fn encrypt_recovery_vault_with_entropy(
+    user_sk: &SigningKey,
     passphrase: &str,
-) -> std::result::Result<SigningKey, VaultDecryptError> {
+    params: ScryptParams,
+    salt: [u8; 16],
+    nonce_bytes: [u8; AEAD_NONCE_LEN],
+) -> Result<RecoveryVaultBlob> {
+    if passphrase.is_empty() {
+        bail!("recovery passphrase cannot be empty");
+    }
+    let key = derive_recovery_vault_key(passphrase, &salt, params)?;
+    encrypt_recovery_vault_with_derived_key(user_sk, &key, params, salt, nonce_bytes)
+}
+
+/// Encrypts `user_sk` under `passphrase` using RFC 7914 `scrypt` and ChaCha20-Poly1305.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn encrypt_recovery_vault(
+    user_sk: &SigningKey,
+    passphrase: &str,
+    params: ScryptParams,
+) -> Result<RecoveryVaultBlob> {
+    if passphrase.is_empty() {
+        bail!("recovery passphrase cannot be empty");
+    }
+    validate_scrypt_params(params).map_err(|e| anyhow!(e))?;
+
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    encrypt_recovery_vault_with_entropy(user_sk, passphrase, params, salt, nonce_bytes)
+}
+
+struct ParsedRecoveryVault {
+    salt: Vec<u8>,
+    nonce: [u8; AEAD_NONCE_LEN],
+    ciphertext: Vec<u8>,
+}
+
+fn parse_and_validate_vault(
+    vault: &RecoveryVaultBlob,
+) -> std::result::Result<ParsedRecoveryVault, VaultDecryptError> {
     if vault.version != 1 {
         return Err(VaultDecryptError::InvalidFormat(format!(
             "unsupported vault version {}",
@@ -735,7 +795,7 @@ pub fn decrypt_recovery_vault(
 
     let nonce_vec = decode_base64_flexible(&vault.nonce_b64)
         .map_err(|e| VaultDecryptError::InvalidFormat(format!("invalid nonce_b64: {e}")))?;
-    let nonce_bytes: [u8; AEAD_NONCE_LEN] = nonce_vec.try_into().map_err(|_| {
+    let nonce: [u8; AEAD_NONCE_LEN] = nonce_vec.try_into().map_err(|_| {
         VaultDecryptError::InvalidFormat("invalid nonce_b64 length (expected 12 bytes)".to_string())
     })?;
 
@@ -747,35 +807,29 @@ pub fn decrypt_recovery_vault(
         )));
     }
 
-    if passphrase.is_empty() {
-        return Err(VaultDecryptError::WrongPassphrase);
-    }
+    Ok(ParsedRecoveryVault {
+        salt,
+        nonce,
+        ciphertext,
+    })
+}
 
-    let key = Zeroizing::new(
-        scrypt_rfc7914(
-            passphrase.as_bytes(),
-            &salt,
-            vault.kdf_params.log_n,
-            vault.kdf_params.r,
-            vault.kdf_params.p,
-            32,
-        )
-        .map_err(|e| VaultDecryptError::InvalidFormat(e.to_string()))?,
-    );
+fn open_recovery_vault_with_parsed(
+    vault: &RecoveryVaultBlob,
+    parsed: ParsedRecoveryVault,
+    expected_user_pubkey: &[u8; 32],
+    derived_key: &[u8; 32],
+) -> std::result::Result<SigningKey, VaultDecryptError> {
+    let aad = recovery_vault_aad(expected_user_pubkey, vault.kdf_params, &parsed.salt);
 
-    let aad = recovery_vault_aad(expected_user_pubkey, vault.kdf_params, &salt);
-    let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key)
-        .map_err(|_| VaultDecryptError::InvalidFormat("invalid KDF key length".to_string()))?;
-    let aead_key = LessSafeKey::new(unbound);
-
-    let mut buf = Zeroizing::new(ciphertext);
-    let plaintext = aead_key
-        .open_in_place(
-            Nonce::assume_unique_for_key(nonce_bytes),
-            Aad::from(aad.as_slice()),
-            buf.as_mut_slice(),
-        )
-        .map_err(|_| VaultDecryptError::WrongPassphrase)?;
+    let mut buf = Zeroizing::new(parsed.ciphertext);
+    let plaintext = chacha20_poly1305_open_in_place(
+        derived_key,
+        &parsed.nonce,
+        aad.as_slice(),
+        buf.as_mut_slice(),
+    )
+    .map_err(|_| VaultDecryptError::WrongPassphrase)?;
 
     let seed_slice: [u8; 32] = plaintext.try_into().map_err(|_| {
         VaultDecryptError::InvalidFormat(
@@ -793,6 +847,34 @@ pub fn decrypt_recovery_vault(
     }
 
     Ok(signing_key)
+}
+
+/// Decrypts a [`RecoveryVaultBlob`] using a pre-derived 32-byte `scrypt` key and verifies
+/// the resulting key matches `expected_user_pubkey`.
+pub fn decrypt_recovery_vault_with_derived_key(
+    vault: &RecoveryVaultBlob,
+    expected_user_pubkey: &[u8; 32],
+    derived_key: &[u8; 32],
+) -> std::result::Result<SigningKey, VaultDecryptError> {
+    let parsed = parse_and_validate_vault(vault)?;
+    open_recovery_vault_with_parsed(vault, parsed, expected_user_pubkey, derived_key)
+}
+
+/// Decrypts a [`RecoveryVaultBlob`] with `passphrase` and verifies the resulting key matches
+/// `expected_user_pubkey`.
+pub fn decrypt_recovery_vault(
+    vault: &RecoveryVaultBlob,
+    expected_user_pubkey: &[u8; 32],
+    passphrase: &str,
+) -> std::result::Result<SigningKey, VaultDecryptError> {
+    let parsed = parse_and_validate_vault(vault)?;
+    if passphrase.is_empty() {
+        return Err(VaultDecryptError::WrongPassphrase);
+    }
+
+    let key = derive_recovery_vault_key(passphrase, &parsed.salt, vault.kdf_params)
+        .map_err(|e| VaultDecryptError::InvalidFormat(e.to_string()))?;
+    open_recovery_vault_with_parsed(vault, parsed, expected_user_pubkey, &key)
 }
 
 fn recovery_vault_aad(user_pubkey: &[u8; 32], params: ScryptParams, salt: &[u8]) -> Vec<u8> {
@@ -843,6 +925,411 @@ fn decode_seed_32(b64: &str, label: &str) -> Result<Zeroizing<[u8; 32]>> {
     seed.copy_from_slice(&vec);
     vec.zeroize();
     Ok(seed)
+}
+
+fn x25519_public_from_secret(secret: &[u8; 32]) -> [u8; 32] {
+    MontgomeryPoint::mul_base_clamped(*secret).0
+}
+
+fn x25519_diffie_hellman(secret: &[u8; 32], peer_pub: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+    let shared = Zeroizing::new(MontgomeryPoint(*peer_pub).mul_clamped(*secret).0);
+    if bool::from(shared.ct_eq(&[0u8; 32])) {
+        bail!("X25519 key agreement failed (invalid peer ephemeral key)");
+    }
+    Ok(shared)
+}
+
+fn hmac_sha256_slices(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut k_block = Zeroizing::new([0u8; 64]);
+    if key.len() > 64 {
+        let hashed: [u8; 32] = Sha256::digest(key).into();
+        k_block[..32].copy_from_slice(&hashed);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = Zeroizing::new([0x36u8; 64]);
+    let mut opad = Zeroizing::new([0x5cu8; 64]);
+    for i in 0..64 {
+        ipad[i] ^= k_block[i];
+        opad[i] ^= k_block[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(&*ipad);
+    for part in parts {
+        inner.update(part);
+    }
+    let inner_digest = Zeroizing::new(<[u8; 32]>::from(inner.finalize()));
+
+    let mut outer = Sha256::new();
+    outer.update(&*opad);
+    outer.update(&*inner_digest);
+    outer.finalize().into()
+}
+
+fn hkdf_sha256_extract(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; 32]> {
+    let zero_salt = [0u8; 32];
+    let effective_salt = if salt.is_empty() { &zero_salt[..] } else { salt };
+    Zeroizing::new(hmac_sha256_slices(effective_salt, &[ikm]))
+}
+
+fn hkdf_sha256_expand_32(prk: &[u8; 32], info_parts: &[&[u8]]) -> Zeroizing<[u8; 32]> {
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(info_parts.len() + 1);
+    parts.extend_from_slice(info_parts);
+    parts.push(&[1u8]);
+    Zeroizing::new(hmac_sha256_slices(prk, &parts))
+}
+
+fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+    let mut block_idx = 1u32;
+    for chunk in out.chunks_mut(32) {
+        let count_be = block_idx.to_be_bytes();
+        let mut u = Zeroizing::new(hmac_sha256_slices(password, &[salt, &count_be]));
+        let mut t = Zeroizing::new(*u);
+        for _ in 1..iterations {
+            *u = hmac_sha256_slices(password, &[&*u]);
+            for (dst, src) in t.iter_mut().zip(u.iter()) {
+                *dst ^= *src;
+            }
+        }
+        chunk.copy_from_slice(&t[..chunk.len()]);
+        block_idx = block_idx.wrapping_add(1);
+    }
+}
+
+#[inline]
+fn chacha_qr(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    x[a] = x[a].wrapping_add(x[b]);
+    x[d] = (x[d] ^ x[a]).rotate_left(16);
+    x[c] = x[c].wrapping_add(x[d]);
+    x[b] = (x[b] ^ x[c]).rotate_left(12);
+    x[a] = x[a].wrapping_add(x[b]);
+    x[d] = (x[d] ^ x[a]).rotate_left(8);
+    x[c] = x[c].wrapping_add(x[d]);
+    x[b] = (x[b] ^ x[c]).rotate_left(7);
+}
+
+fn chacha20_ietf_block(key: &[u8; 32], counter: u32, nonce: &[u8; AEAD_NONCE_LEN]) -> [u8; 64] {
+    let mut state = [0u32; 16];
+    state[0] = 0x6170_7865;
+    state[1] = 0x3320_646e;
+    state[2] = 0x7962_2d32;
+    state[3] = 0x6b20_6574;
+    for i in 0..8 {
+        state[4 + i] = u32::from_le_bytes(key[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    state[12] = counter;
+    for i in 0..3 {
+        state[13 + i] = u32::from_le_bytes(nonce[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+
+    let mut x = state;
+    for _ in 0..10 {
+        chacha_qr(&mut x, 0, 4, 8, 12);
+        chacha_qr(&mut x, 1, 5, 9, 13);
+        chacha_qr(&mut x, 2, 6, 10, 14);
+        chacha_qr(&mut x, 3, 7, 11, 15);
+        chacha_qr(&mut x, 0, 5, 10, 15);
+        chacha_qr(&mut x, 1, 6, 11, 12);
+        chacha_qr(&mut x, 2, 7, 8, 13);
+        chacha_qr(&mut x, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u8; 64];
+    for i in 0..16 {
+        let word = x[i].wrapping_add(state[i]).to_le_bytes();
+        out[i * 4..i * 4 + 4].copy_from_slice(&word);
+    }
+    state.zeroize();
+    x.zeroize();
+    out
+}
+
+fn chacha20_ietf_xor_in_place(
+    key: &[u8; 32],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    initial_counter: u32,
+    data: &mut [u8],
+) {
+    let mut counter = initial_counter;
+    for chunk in data.chunks_mut(64) {
+        let mut ks = chacha20_ietf_block(key, counter, nonce);
+        counter = counter.wrapping_add(1);
+        for (b, k) in chunk.iter_mut().zip(ks.iter()) {
+            *b ^= *k;
+        }
+        ks.zeroize();
+    }
+}
+
+struct Poly1305State {
+    r: [u32; 5],
+    h: [u32; 5],
+    pad: [u32; 4],
+    buf: [u8; 16],
+    buf_len: usize,
+}
+
+impl Drop for Poly1305State {
+    fn drop(&mut self) {
+        self.r.zeroize();
+        self.h.zeroize();
+        self.pad.zeroize();
+        self.buf.zeroize();
+    }
+}
+
+impl Poly1305State {
+    fn new(otk: &[u8; 32]) -> Self {
+        let mut rb = [0u8; 16];
+        rb.copy_from_slice(&otk[..16]);
+        rb[3] &= 15;
+        rb[7] &= 15;
+        rb[11] &= 15;
+        rb[15] &= 15;
+        rb[4] &= 252;
+        rb[8] &= 252;
+        rb[12] &= 252;
+
+        let r0 = u32::from_le_bytes([rb[0], rb[1], rb[2], rb[3]]) & 0x03ff_ffff;
+        let r1 = (u32::from_le_bytes([rb[3], rb[4], rb[5], rb[6]]) >> 2) & 0x03ff_ffff;
+        let r2 = (u32::from_le_bytes([rb[6], rb[7], rb[8], rb[9]]) >> 4) & 0x03ff_ffff;
+        let r3 = (u32::from_le_bytes([rb[9], rb[10], rb[11], rb[12]]) >> 6) & 0x03ff_ffff;
+        let r4 = u32::from_le_bytes([rb[12], rb[13], rb[14], rb[15]]) >> 8;
+        rb.zeroize();
+
+        let pad = [
+            u32::from_le_bytes(otk[16..20].try_into().unwrap()),
+            u32::from_le_bytes(otk[20..24].try_into().unwrap()),
+            u32::from_le_bytes(otk[24..28].try_into().unwrap()),
+            u32::from_le_bytes(otk[28..32].try_into().unwrap()),
+        ];
+
+        Self {
+            r: [r0, r1, r2, r3, r4],
+            h: [0u32; 5],
+            pad,
+            buf: [0u8; 16],
+            buf_len: 0,
+        }
+    }
+
+    fn process_block(&mut self, block: &[u8; 16], hibit: u32) {
+        let t0 = u32::from_le_bytes([block[0], block[1], block[2], block[3]]) & 0x03ff_ffff;
+        let t1 = (u32::from_le_bytes([block[3], block[4], block[5], block[6]]) >> 2) & 0x03ff_ffff;
+        let t2 = (u32::from_le_bytes([block[6], block[7], block[8], block[9]]) >> 4) & 0x03ff_ffff;
+        let t3 = (u32::from_le_bytes([block[9], block[10], block[11], block[12]]) >> 6) & 0x03ff_ffff;
+        let t4 = (u32::from_le_bytes([block[12], block[13], block[14], block[15]]) >> 8) | hibit;
+
+        let h0 = u64::from(self.h[0] + t0);
+        let h1 = u64::from(self.h[1] + t1);
+        let h2 = u64::from(self.h[2] + t2);
+        let h3 = u64::from(self.h[3] + t3);
+        let h4 = u64::from(self.h[4] + t4);
+
+        let r0 = u64::from(self.r[0]);
+        let r1 = u64::from(self.r[1]);
+        let r2 = u64::from(self.r[2]);
+        let r3 = u64::from(self.r[3]);
+        let r4 = u64::from(self.r[4]);
+
+        let s1 = r1 * 5;
+        let s2 = r2 * 5;
+        let s3 = r3 * 5;
+        let s4 = r4 * 5;
+
+        let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+        let mut d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+        let mut d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+        let mut d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+        let mut d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+
+        let mut c = (d0 >> 26) as u32;
+        let mut nh0 = (d0 as u32) & 0x03ff_ffff;
+        d1 += u64::from(c);
+        c = (d1 >> 26) as u32;
+        let mut nh1 = (d1 as u32) & 0x03ff_ffff;
+        d2 += u64::from(c);
+        c = (d2 >> 26) as u32;
+        let nh2 = (d2 as u32) & 0x03ff_ffff;
+        d3 += u64::from(c);
+        c = (d3 >> 26) as u32;
+        let nh3 = (d3 as u32) & 0x03ff_ffff;
+        d4 += u64::from(c);
+        c = (d4 >> 26) as u32;
+        let nh4 = (d4 as u32) & 0x03ff_ffff;
+
+        nh0 += c * 5;
+        c = nh0 >> 26;
+        nh0 &= 0x03ff_ffff;
+        nh1 += c;
+
+        self.h = [nh0, nh1, nh2, nh3, nh4];
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        if self.buf_len > 0 {
+            let take = (16 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len == 16 {
+                let block = self.buf;
+                self.process_block(&block, 1 << 24);
+                self.buf_len = 0;
+            }
+        }
+
+        while data.len() >= 16 {
+            let block: [u8; 16] = data[..16].try_into().unwrap();
+            self.process_block(&block, 1 << 24);
+            data = &data[16..];
+        }
+
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+            self.buf_len = data.len();
+        }
+    }
+
+    fn update_pad16(&mut self, len: usize) {
+        let rem = len % 16;
+        if rem != 0 {
+            let zeros = [0u8; 16];
+            self.update(&zeros[..16 - rem]);
+        }
+    }
+
+    fn finish(mut self) -> [u8; AEAD_TAG_LEN] {
+        if self.buf_len > 0 {
+            let mut block = [0u8; 16];
+            block[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
+            block[self.buf_len] = 1;
+            self.process_block(&block, 0);
+            self.buf_len = 0;
+        }
+
+        let mut h = self.h;
+        let mut c = h[1] >> 26;
+        h[1] &= 0x03ff_ffff;
+        h[2] += c;
+        c = h[2] >> 26;
+        h[2] &= 0x03ff_ffff;
+        h[3] += c;
+        c = h[3] >> 26;
+        h[3] &= 0x03ff_ffff;
+        h[4] += c;
+        c = h[4] >> 26;
+        h[4] &= 0x03ff_ffff;
+        h[0] += c * 5;
+        c = h[0] >> 26;
+        h[0] &= 0x03ff_ffff;
+        h[1] += c;
+
+        // Propagate any carry out of h[1] so limbs stay canonical < 2^26 when h < p.
+        c = h[1] >> 26;
+        h[1] &= 0x03ff_ffff;
+        h[2] += c;
+        c = h[2] >> 26;
+        h[2] &= 0x03ff_ffff;
+        h[3] += c;
+        c = h[3] >> 26;
+        h[3] &= 0x03ff_ffff;
+        h[4] += c;
+
+        let mut g = [0u32; 5];
+        g[0] = h[0].wrapping_add(5);
+        c = g[0] >> 26;
+        g[0] &= 0x03ff_ffff;
+        g[1] = h[1].wrapping_add(c);
+        c = g[1] >> 26;
+        g[1] &= 0x03ff_ffff;
+        g[2] = h[2].wrapping_add(c);
+        c = g[2] >> 26;
+        g[2] &= 0x03ff_ffff;
+        g[3] = h[3].wrapping_add(c);
+        c = g[3] >> 26;
+        g[3] &= 0x03ff_ffff;
+        g[4] = h[4].wrapping_add(c).wrapping_sub(1 << 26);
+
+        let mask = (g[4] >> 31).wrapping_sub(1);
+        for i in 0..5 {
+            h[i] = (h[i] & !mask) | (g[i] & mask);
+        }
+
+        let w0 = h[0] | (h[1] << 26);
+        let w1 = (h[1] >> 6) | (h[2] << 20);
+        let w2 = (h[2] >> 12) | (h[3] << 14);
+        let w3 = (h[3] >> 18) | (h[4] << 8);
+
+        let mut f = u64::from(w0) + u64::from(self.pad[0]);
+        let out0 = f as u32;
+        f = u64::from(w1) + u64::from(self.pad[1]) + (f >> 32);
+        let out1 = f as u32;
+        f = u64::from(w2) + u64::from(self.pad[2]) + (f >> 32);
+        let out2 = f as u32;
+        f = u64::from(w3) + u64::from(self.pad[3]) + (f >> 32);
+        let out3 = f as u32;
+
+        let mut tag = [0u8; AEAD_TAG_LEN];
+        tag[0..4].copy_from_slice(&out0.to_le_bytes());
+        tag[4..8].copy_from_slice(&out1.to_le_bytes());
+        tag[8..12].copy_from_slice(&out2.to_le_bytes());
+        tag[12..16].copy_from_slice(&out3.to_le_bytes());
+        tag
+    }
+}
+
+fn compute_chacha20_poly1305_tag(
+    key: &[u8; 32],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> [u8; AEAD_TAG_LEN] {
+    let mut block0 = chacha20_ietf_block(key, 0, nonce);
+    let mut otk = Zeroizing::new([0u8; 32]);
+    otk.copy_from_slice(&block0[..32]);
+    block0.zeroize();
+
+    let mut poly = Poly1305State::new(&otk);
+    poly.update(aad);
+    poly.update_pad16(aad.len());
+    poly.update(ciphertext);
+    poly.update_pad16(ciphertext.len());
+    poly.update(&(aad.len() as u64).to_le_bytes());
+    poly.update(&(ciphertext.len() as u64).to_le_bytes());
+    poly.finish()
+}
+
+fn chacha20_poly1305_seal_in_place(
+    key: &[u8; 32],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    aad: &[u8],
+    buf: &mut Vec<u8>,
+) {
+    chacha20_ietf_xor_in_place(key, nonce, 1, buf.as_mut_slice());
+    let tag = compute_chacha20_poly1305_tag(key, nonce, aad, buf.as_slice());
+    buf.extend_from_slice(&tag);
+}
+
+fn chacha20_poly1305_open_in_place<'a>(
+    key: &[u8; 32],
+    nonce: &[u8; AEAD_NONCE_LEN],
+    aad: &[u8],
+    buf: &'a mut [u8],
+) -> Result<&'a mut [u8]> {
+    if buf.len() < AEAD_TAG_LEN {
+        bail!("AEAD ciphertext shorter than tag");
+    }
+    let ct_len = buf.len() - AEAD_TAG_LEN;
+    let (ct, tag) = buf.split_at_mut(ct_len);
+    let expected_tag = compute_chacha20_poly1305_tag(key, nonce, aad, ct);
+    if !bool::from(expected_tag.ct_eq(tag)) {
+        bail!("AEAD tag verification failed");
+    }
+    chacha20_ietf_xor_in_place(key, nonce, 1, ct);
+    Ok(ct)
 }
 
 #[cfg(test)]
@@ -1116,5 +1603,213 @@ mod tests {
         let default_blob = encrypt_recovery_vault(&user_sk, passphrase, default_params).unwrap();
         let default_recovered = decrypt_recovery_vault(&default_blob, &user_pk, passphrase).unwrap();
         assert_eq!(default_recovered.to_bytes(), user_sk.to_bytes());
+    }
+
+    #[test]
+    fn test_rfc8439_chacha20_poly1305_vector() {
+        // RFC 8439 Section 2.8.2 Test Vector
+        let key = hex::decode(
+            "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+        )
+        .unwrap();
+        let key: [u8; 32] = key.try_into().unwrap();
+        let nonce: [u8; 12] = hex::decode("070000004041424344454647")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let aad = hex::decode("50515253c0c1c2c3c4c5c6c7").unwrap();
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected_ct = hex::decode(
+            "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6\
+             3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36\
+             92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc\
+             3ff4def08e4b7a9de576d26586cec64b6116",
+        )
+        .unwrap();
+        let expected_tag = hex::decode("1ae10b594f09e26a7e902ecbd0600691").unwrap();
+
+        let mut buf = plaintext.to_vec();
+        chacha20_poly1305_seal_in_place(&key, &nonce, &aad, &mut buf);
+        assert_eq!(&buf[..plaintext.len()], expected_ct.as_slice());
+        assert_eq!(&buf[plaintext.len()..], expected_tag.as_slice());
+
+        let opened = chacha20_poly1305_open_in_place(&key, &nonce, &aad, &mut buf).unwrap();
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn test_rfc7748_x25519_and_rfc5869_hkdf_vectors() {
+        // RFC 7748 Section 6.1 Test Vector
+        let alice_priv: [u8; 32] = hex::decode(
+            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let alice_pub_expected: [u8; 32] = hex::decode(
+            "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        assert_eq!(x25519_public_from_secret(&alice_priv), alice_pub_expected);
+
+        let bob_priv: [u8; 32] = hex::decode(
+            "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let bob_pub_expected: [u8; 32] = hex::decode(
+            "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        assert_eq!(x25519_public_from_secret(&bob_priv), bob_pub_expected);
+
+        let shared_expected: [u8; 32] = hex::decode(
+            "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        assert_eq!(*x25519_diffie_hellman(&alice_priv, &bob_pub_expected).unwrap(), shared_expected);
+        assert_eq!(*x25519_diffie_hellman(&bob_priv, &alice_pub_expected).unwrap(), shared_expected);
+
+        // Low-order point (all-zero) must be rejected
+        assert!(x25519_diffie_hellman(&alice_priv, &[0u8; 32]).is_err());
+
+        // RFC 5869 Appendix A.1 Test Case 1 (first 32 bytes of OKM)
+        let ikm = [0x0bu8; 22];
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let prk = hkdf_sha256_extract(&salt, &ikm);
+        assert_eq!(
+            hex::encode(&*prk),
+            "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+        );
+        let okm = hkdf_sha256_expand_32(&prk, &[&info]);
+        assert_eq!(
+            hex::encode(&*okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        );
+    }
+
+    #[test]
+    fn test_pure_rust_crypto_cross_compat_with_ring() {
+        use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+        use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, X25519};
+        use ring::hkdf::{Salt, HKDF_SHA256};
+        use ring::rand::SystemRandom;
+
+        let key = [0x42u8; 32];
+        let nonce = [0x24u8; 12];
+        for aad_len in [0usize, 1, 15, 16, 17, 65] {
+            for pt_len in [0usize, 1, 15, 16, 17, 32, 114, 500] {
+                let aad: Vec<u8> = (0..aad_len).map(|i| i as u8).collect();
+                let pt: Vec<u8> = (0..pt_len).map(|i| (i.wrapping_mul(7)) as u8).collect();
+
+                // Pure-Rust seal -> ring open
+                let mut pure_buf = pt.clone();
+                chacha20_poly1305_seal_in_place(&key, &nonce, &aad, &mut pure_buf);
+                let ring_key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &key).unwrap());
+                let mut ring_open_buf = pure_buf.clone();
+                let opened = ring_key
+                    .open_in_place(
+                        Nonce::assume_unique_for_key(nonce),
+                        Aad::from(aad.as_slice()),
+                        &mut ring_open_buf,
+                    )
+                    .unwrap();
+                assert_eq!(opened, pt.as_slice());
+
+                // ring seal -> Pure-Rust open
+                let mut ring_buf = pt.clone();
+                ring_key
+                    .seal_in_place_append_tag(
+                        Nonce::assume_unique_for_key(nonce),
+                        Aad::from(aad.as_slice()),
+                        &mut ring_buf,
+                    )
+                    .unwrap();
+                assert_eq!(ring_buf, pure_buf);
+                let pure_opened =
+                    chacha20_poly1305_open_in_place(&key, &nonce, &aad, &mut ring_buf).unwrap();
+                assert_eq!(pure_opened, pt.as_slice());
+            }
+        }
+
+        // X25519 + HKDF-SHA256 cross-compat with ring
+        let rng = SystemRandom::new();
+        let ring_priv = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let ring_pub: [u8; 32] = ring_priv
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let pure_priv = [0x91u8; 32];
+        let pure_pub = x25519_public_from_secret(&pure_priv);
+        let salt = [0x55u8; 32];
+        let info_a = b"sshcast-pair-handoff-v1\x00";
+        let info_b = b"pair-id-123";
+
+        let ring_derived: Vec<u8> = agree_ephemeral(
+            ring_priv,
+            &UnparsedPublicKey::new(&X25519, &pure_pub),
+            |shared| {
+                let prk = Salt::new(HKDF_SHA256, &salt).extract(shared);
+                let info = [info_a.as_slice(), info_b.as_slice()];
+                let okm = prk
+                    .expand(&info, &CHACHA20_POLY1305)
+                    .unwrap();
+                let mut r_key = Vec::new();
+                // Seal a test block with ring's derived key
+                let less = LessSafeKey::new(UnboundKey::from(okm));
+                r_key.extend_from_slice(b"cross-compat-check");
+                less.seal_in_place_append_tag(
+                    Nonce::assume_unique_for_key([0x11u8; 12]),
+                    Aad::from(b"aad".as_slice()),
+                    &mut r_key,
+                )
+                .unwrap();
+                Ok::<_, anyhow::Error>(r_key)
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let shared = x25519_diffie_hellman(&pure_priv, &ring_pub).unwrap();
+        let prk = hkdf_sha256_extract(&salt, &*shared);
+        let pure_key = hkdf_sha256_expand_32(&prk, &[info_a.as_slice(), info_b.as_slice()]);
+        let mut ct = ring_derived;
+        let dec = chacha20_poly1305_open_in_place(&pure_key, &[0x11u8; 12], b"aad", &mut ct).unwrap();
+        assert_eq!(dec, b"cross-compat-check");
+    }
+
+    #[test]
+    fn test_recovery_vault_derived_key_split_roundtrip() {
+        let user_sk = SigningKey::from_bytes(&[0x66; 32]);
+        let user_pk = user_sk.verifying_key().to_bytes();
+        let params = ScryptParams {
+            log_n: 10,
+            r: 8,
+            p: 1,
+        };
+        let salt = [0x31u8; 16];
+        let nonce = [0x42u8; 12];
+        let passphrase = "split-worker-passphrase";
+
+        let dk = derive_recovery_vault_key(passphrase, &salt, params).unwrap();
+        let blob = encrypt_recovery_vault_with_derived_key(&user_sk, &dk, params, salt, nonce).unwrap();
+
+        // Standard decrypt_recovery_vault opens worker-encrypted blob
+        let rec1 = decrypt_recovery_vault(&blob, &user_pk, passphrase).unwrap();
+        assert_eq!(rec1.to_bytes(), user_sk.to_bytes());
+
+        // Split decrypt opens standard encrypted blob
+        let rec2 = decrypt_recovery_vault_with_derived_key(&blob, &user_pk, &dk).unwrap();
+        assert_eq!(rec2.to_bytes(), user_sk.to_bytes());
     }
 }

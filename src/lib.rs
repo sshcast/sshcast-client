@@ -10,7 +10,6 @@ pub mod gui;
 pub mod local_agent;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod operator;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod pairing;
 #[cfg(target_os = "macos")]
 pub mod mac_dialogs;
