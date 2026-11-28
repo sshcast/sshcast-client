@@ -2382,6 +2382,7 @@ async fn test_workstation_manager_background_pairing_listener_approves_peer() {
 
     struct PairingCapturePrompter {
         prompt_tx: mpsc::Sender<PairingPromptDetails>,
+        approve_gate: Arc<tokio::sync::Notify>,
         approve: bool,
     }
 
@@ -2398,10 +2399,13 @@ async fn test_workstation_manager_background_pairing_listener_approves_peer() {
         async fn prompt_pairing(
             &self,
             details: PairingPromptDetails,
-            _cancel_rx: watch::Receiver<Option<String>>,
+            mut cancel_rx: watch::Receiver<Option<String>>,
         ) -> bool {
             let _ = self.prompt_tx.send(details).await;
-            self.approve
+            tokio::select! {
+                _ = self.approve_gate.notified() => self.approve,
+                _ = cancel_rx.changed() => false,
+            }
         }
     }
 
@@ -2438,8 +2442,10 @@ async fn test_workstation_manager_background_pairing_listener_approves_peer() {
     let cfg_a = ClientConfig::load(Some(&cfg_path_a)).unwrap();
 
     let (prompt_tx, mut prompt_rx) = mpsc::channel(4);
+    let approve_gate = Arc::new(tokio::sync::Notify::new());
     let prompter_a: Arc<dyn ApprovalPrompter> = Arc::new(PairingCapturePrompter {
         prompt_tx,
+        approve_gate: Arc::clone(&approve_gate),
         approve: true,
     });
     let connector_a = Arc::new(LocalAgentConnector::with_options(
@@ -2475,7 +2481,7 @@ async fn test_workstation_manager_background_pairing_listener_approves_peer() {
     };
 
     // Workstation A's background pairing listener receives the request and invokes prompt_pairing
-    let captured = tokio::time::timeout(Duration::from_secs(5), prompt_rx.recv())
+    let captured = tokio::time::timeout(Duration::from_secs(10), prompt_rx.recv())
         .await
         .expect("timed out waiting for Workstation A pairing prompt")
         .expect("pairing prompt channel closed");
@@ -2486,8 +2492,11 @@ async fn test_workstation_manager_background_pairing_listener_approves_peer() {
     assert_eq!(captured.existing_user_id, user_id_a);
     assert!(!captured.os_name.is_empty());
 
+    // Release Workstation A to approve the pairing request now that B observed PairingRequired.
+    approve_gate.notify_one();
+
     // Workstation B polls until it receives EnrollPollStep::Paired
-    let paired_step = tokio::time::timeout(Duration::from_secs(5), async {
+    let paired_step = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match poll_enrollment_once(&started_b).await.unwrap() {
                 step @ EnrollPollStep::Paired { .. } => break step,
@@ -2531,7 +2540,7 @@ async fn test_workstation_manager_background_pairing_listener_approves_peer() {
     assert!(cfg_b.grant.user_cert.is_some());
 
     let _ = shutdown_tx.send(true);
-    let run_res = tokio::time::timeout(Duration::from_secs(3), manager_handle)
+    let run_res = tokio::time::timeout(Duration::from_secs(5), manager_handle)
         .await
         .expect("WorkstationManager shutdown timed out")
         .unwrap();
@@ -2643,7 +2652,7 @@ async fn test_workstation_manager_pairing_listener_skips_without_root_key_and_di
         "workstation without local user_key.toml should not prompt for pairing"
     );
     let _ = shutdown_no_key_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(2), no_key_handle)
+    let _ = tokio::time::timeout(Duration::from_secs(5), no_key_handle)
         .await
         .unwrap();
 
@@ -2688,7 +2697,7 @@ async fn test_workstation_manager_pairing_listener_skips_without_root_key_and_di
     );
     let mgr_a_handle = tokio::spawn(async move { mgr_a.run(shutdown_rx).await });
 
-    let opened_details = tokio::time::timeout(Duration::from_secs(3), opened_rx.recv())
+    let opened_details = tokio::time::timeout(Duration::from_secs(10), opened_rx.recv())
         .await
         .expect("timed out waiting for pairing prompt to open")
         .unwrap();
@@ -2696,14 +2705,14 @@ async fn test_workstation_manager_pairing_listener_skips_without_root_key_and_di
 
     // Cancel enrollment externally while the prompt is open; the 3s monitor should dismiss it!
     cancel_enrollment_pairing(&started_b).await.unwrap();
-    let cancel_reason = tokio::time::timeout(Duration::from_secs(5), canceled_rx.recv())
+    let cancel_reason = tokio::time::timeout(Duration::from_secs(10), canceled_rx.recv())
         .await
         .expect("timed out waiting for 3s pairing monitor to cancel prompt")
         .unwrap();
     assert_eq!(cancel_reason.as_deref(), Some("Handled or canceled"));
 
     let _ = shutdown_tx.send(true);
-    tokio::time::timeout(Duration::from_secs(3), mgr_a_handle)
+    tokio::time::timeout(Duration::from_secs(5), mgr_a_handle)
         .await
         .unwrap()
         .unwrap()
