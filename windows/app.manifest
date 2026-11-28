@@ -3,7 +3,7 @@
   <assemblyIdentity
     type="win32"
     name="net.sshcast.client"
-    version="0.1.3.0"
+    version="0.1.4.0"
   />
   <dependency>
     <dependentAssembly>
